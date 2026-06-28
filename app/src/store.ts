@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type { Review } from "./bindings/Review";
 import type { DiffData } from "./bindings/DiffData";
+import type { MirrorResult } from "./bindings/MirrorResult";
 import type { ProjectPlan } from "./bindings/ProjectPlan";
 import type { BatchVerdict } from "./bindings/BatchVerdict";
 
@@ -56,6 +57,9 @@ interface AppStore {
 
   /** Request changes on the active review (InReview -> Dispatched). */
   requestChanges: () => Promise<void>;
+
+  /** Mirror local comments for the active review to GitHub (explicit user action). */
+  mirrorComments: () => Promise<MirrorResult | null>;
 
   /** Refresh the active review to pick up state changes. */
   refreshActiveReview: () => Promise<void>;
@@ -193,6 +197,21 @@ export const useAppStore = create<AppStore>((set, get) => ({
       set({ activeReview: review });
     } catch (e: unknown) {
       set({ error: String(e) });
+    }
+  },
+
+  mirrorComments: async (): Promise<MirrorResult | null> => {
+    const { view } = get();
+    if (view.kind !== "diff") return null;
+
+    try {
+      const result = await invoke<MirrorResult>("mirror_comments", {
+        pr: view.pr,
+      });
+      return result;
+    } catch (e: unknown) {
+      set({ error: String(e) });
+      return null;
     }
   },
 

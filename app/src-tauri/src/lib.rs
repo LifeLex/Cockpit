@@ -52,6 +52,7 @@ pub fn run() {
             commands::get_review_diff,
             commands::add_comment,
             commands::request_changes,
+            commands::mirror_comments,
             commands::get_plan,
             commands::load_plan,
             commands::add_plan_comment,

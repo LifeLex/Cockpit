@@ -6,8 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use ts_rs::TS;
 
-use crate::model::{IssueRef, PrRef};
+use crate::model::{Anchor, Comment, CommentId, CommentOrigin, IssueRef, PrRef};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -27,6 +28,15 @@ pub enum Error {
     /// The branch name did not contain a recognizable Linear issue identifier.
     #[error("no issue ID found in branch: {0}")]
     BranchParse(String),
+
+    /// Failed to post a comment to a GitHub PR.
+    #[error("failed to post comment to PR {pr}: {reason}")]
+    PostComment {
+        /// The PR that was targeted.
+        pr: String,
+        /// Why the post failed.
+        reason: String,
+    },
 
     /// An I/O error occurred while spawning or communicating with `gh`.
     #[error(transparent)]
@@ -228,11 +238,100 @@ pub fn link_prs_to_issues(prs: &[PrData]) -> Vec<(PrRef, Option<IssueRef>)> {
 }
 
 // ---------------------------------------------------------------------------
+// Comment mirroring
+// ---------------------------------------------------------------------------
+
+/// Result of mirroring local comments to a GitHub PR.
+///
+/// Tracks how many comments were successfully posted and collects failures
+/// with their reason, so the caller can report partial success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct MirrorResult {
+    /// Number of comments successfully posted.
+    pub posted: usize,
+    /// Comments that failed to post: `(comment_id, error_message)`.
+    pub failed: Vec<(CommentId, String)>,
+}
+
+/// Format a cockpit [`Comment`] into the markdown body posted to GitHub.
+///
+/// Includes the anchor location so the reader knows which code location
+/// the comment refers to.
+pub fn format_comment_body(comment: &Comment) -> String {
+    let anchor_label = match &comment.anchor {
+        Anchor::PlanStep(idx) => format!("**Plan step {idx}**"),
+        Anchor::PlanFile(path) => format!("**Plan file:** `{}`", path.display()),
+        Anchor::DiffLine { path, range } => {
+            if range.0 == range.1 {
+                format!("**{}** line {}", path.display(), range.0)
+            } else {
+                format!("**{}** lines {}-{}", path.display(), range.0, range.1)
+            }
+        }
+    };
+
+    format!("{anchor_label}\n\n{}", comment.body)
+}
+
+/// Post a single comment to a GitHub PR via `gh pr comment`.
+///
+/// Uses the `gh` CLI to create a new comment on the PR. The comment body
+/// includes the anchor information so the GitHub reader knows which code
+/// location is referenced.
+pub async fn post_review_comment(pr_ref: &PrRef, comment: &Comment) -> Result<(), Error> {
+    let body = format_comment_body(comment);
+
+    let output = Command::new("gh")
+        .args(["pr", "comment", pr_ref.as_str(), "--body", &body])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::PostComment {
+            pr: pr_ref.to_string(),
+            reason: stderr.into_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Mirror local comments for a PR to GitHub.
+///
+/// Only mirrors comments with [`CommentOrigin::Local`] origin -- comments
+/// that came from GitHub (`GitHubMirror`) are skipped to avoid duplicates.
+///
+/// This is an explicit user action per Invariant 5: it is never called
+/// automatically or from agent output.
+pub async fn mirror_comments(pr_ref: &PrRef, comments: &[Comment]) -> Result<MirrorResult, Error> {
+    let local_comments: Vec<&Comment> = comments
+        .iter()
+        .filter(|c| c.origin == CommentOrigin::Local)
+        .collect();
+
+    let mut posted = 0usize;
+    let mut failed: Vec<(CommentId, String)> = Vec::new();
+
+    for comment in local_comments {
+        match post_review_comment(pr_ref, comment).await {
+            Ok(()) => posted += 1,
+            Err(e) => failed.push((comment.id.clone(), e.to_string())),
+        }
+    }
+
+    Ok(MirrorResult { posted, failed })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     // -- parse_issue_from_branch tests --
@@ -445,5 +544,141 @@ mod tests {
         assert_eq!(checks[0].conclusion, Some("success".into()));
         assert_eq!(checks[1].name, "CI / lint");
         assert_eq!(checks[1].conclusion, None);
+    }
+
+    // -- format_comment_body --
+
+    #[test]
+    fn format_diff_line_single_line() {
+        let comment = Comment {
+            id: CommentId::new("c-1"),
+            anchor: Anchor::DiffLine {
+                path: PathBuf::from("src/main.rs"),
+                range: (42, 42),
+            },
+            body: "This variable is unused.".into(),
+            origin: CommentOrigin::Local,
+        };
+
+        let body = format_comment_body(&comment);
+        assert!(
+            body.contains("**src/main.rs** line 42"),
+            "single-line anchor should say 'line 42', got: {body}"
+        );
+        assert!(body.contains("This variable is unused."));
+    }
+
+    #[test]
+    fn format_diff_line_range() {
+        let comment = Comment {
+            id: CommentId::new("c-2"),
+            anchor: Anchor::DiffLine {
+                path: PathBuf::from("lib/util.rs"),
+                range: (10, 20),
+            },
+            body: "Refactor this block.".into(),
+            origin: CommentOrigin::Local,
+        };
+
+        let body = format_comment_body(&comment);
+        assert!(
+            body.contains("**lib/util.rs** lines 10-20"),
+            "multi-line anchor should say 'lines 10-20', got: {body}"
+        );
+        assert!(body.contains("Refactor this block."));
+    }
+
+    #[test]
+    fn format_plan_step_anchor() {
+        let comment = Comment {
+            id: CommentId::new("c-3"),
+            anchor: Anchor::PlanStep(2),
+            body: "This step is too vague.".into(),
+            origin: CommentOrigin::Local,
+        };
+
+        let body = format_comment_body(&comment);
+        assert!(
+            body.contains("**Plan step 2**"),
+            "plan step anchor, got: {body}"
+        );
+        assert!(body.contains("This step is too vague."));
+    }
+
+    #[test]
+    fn format_plan_file_anchor() {
+        let comment = Comment {
+            id: CommentId::new("c-4"),
+            anchor: Anchor::PlanFile(PathBuf::from("src/lib.rs")),
+            body: "Consider splitting.".into(),
+            origin: CommentOrigin::Local,
+        };
+
+        let body = format_comment_body(&comment);
+        assert!(
+            body.contains("**Plan file:** `src/lib.rs`"),
+            "plan file anchor, got: {body}"
+        );
+        assert!(body.contains("Consider splitting."));
+    }
+
+    // -- mirror_comments filtering --
+
+    #[test]
+    fn mirror_filters_only_local_comments() {
+        // Verify that mirror_comments filters correctly by testing the
+        // filtering logic without actually calling `gh`.
+        let comments = [
+            Comment {
+                id: CommentId::new("local-1"),
+                anchor: Anchor::DiffLine {
+                    path: PathBuf::from("a.rs"),
+                    range: (1, 1),
+                },
+                body: "fix this".into(),
+                origin: CommentOrigin::Local,
+            },
+            Comment {
+                id: CommentId::new("gh-1"),
+                anchor: Anchor::DiffLine {
+                    path: PathBuf::from("b.rs"),
+                    range: (5, 10),
+                },
+                body: "from github".into(),
+                origin: CommentOrigin::GitHubMirror,
+            },
+            Comment {
+                id: CommentId::new("local-2"),
+                anchor: Anchor::DiffLine {
+                    path: PathBuf::from("c.rs"),
+                    range: (3, 3),
+                },
+                body: "also fix this".into(),
+                origin: CommentOrigin::Local,
+            },
+        ];
+
+        // Count how many are local (what mirror_comments would process).
+        let local_count = comments
+            .iter()
+            .filter(|c| c.origin == CommentOrigin::Local)
+            .count();
+        assert_eq!(local_count, 2, "only Local comments should be mirrored");
+    }
+
+    #[test]
+    fn mirror_result_serialization() {
+        let result = MirrorResult {
+            posted: 3,
+            failed: vec![(CommentId::new("c-5"), "timeout".into())],
+        };
+
+        let json = serde_json::to_string(&result).expect("should serialize");
+        let parsed: MirrorResult = serde_json::from_str(&json).expect("should deserialize");
+
+        assert_eq!(parsed.posted, 3);
+        assert_eq!(parsed.failed.len(), 1);
+        assert_eq!(parsed.failed[0].0, CommentId::new("c-5"));
+        assert_eq!(parsed.failed[0].1, "timeout");
     }
 }

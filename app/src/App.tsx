@@ -28,6 +28,7 @@ function App() {
   const navigateToFrontier = useAppStore((s) => s.navigateToFrontier);
   const addComment = useAppStore((s) => s.addComment);
   const requestChanges = useAppStore((s) => s.requestChanges);
+  const mirrorComments = useAppStore((s) => s.mirrorComments);
   const refreshActiveReview = useAppStore((s) => s.refreshActiveReview);
   const addPlanComment = useAppStore((s) => s.addPlanComment);
   const requestPlanChanges = useAppStore((s) => s.requestPlanChanges);
@@ -229,6 +230,7 @@ function App() {
           onBack={navigateToFrontier}
           onAddComment={addComment}
           onRequestChanges={requestChanges}
+          onMirrorComments={mirrorComments}
         />
       );
 

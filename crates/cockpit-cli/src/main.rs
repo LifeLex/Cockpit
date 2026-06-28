@@ -72,6 +72,14 @@ enum Command {
         /// PR number to restack.
         pr: u64,
     },
+    /// Mirror local comments for a PR to GitHub (explicit side effect per Invariant 5).
+    Mirror {
+        /// PR number.
+        pr: u64,
+        /// Show what would be posted without actually posting.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Kick off a Linear project: fetch issues, optionally plan, then spawn
     /// implementer agents for each frontier issue.
     Kickoff {
@@ -159,6 +167,7 @@ async fn main() -> Result<()> {
         Command::RequestChanges { pr } => run_request_changes(pr).await,
         Command::Start { port } => run_start(port).await,
         Command::Plan { action } => run_plan(action).await,
+        Command::Mirror { pr, dry_run } => run_mirror(pr, dry_run).await,
         Command::Restack { pr } => run_restack(pr).await,
         Command::Kickoff {
             project_id,
@@ -718,6 +727,75 @@ async fn run_plan_approve() -> Result<()> {
     store::save_plan_to_file(&updated_store, state_path).context("failed to save plan state")?;
 
     println!("Plan approved -- ready for batch implementation");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `cockpit mirror <pr> [--dry-run]`
+// ---------------------------------------------------------------------------
+
+/// Mirror local comments for a PR to GitHub.
+///
+/// This is an explicit user action (Invariant 5): mirroring comments to a
+/// public GitHub thread never happens automatically.
+async fn run_mirror(pr_num: u64, dry_run: bool) -> Result<()> {
+    let pr_ref = PrRef::new(format!("owner/repo#{pr_num}"));
+
+    // Load state from file.
+    let state_path = Path::new(store::STATE_FILE);
+    let store = store::load_from_file(state_path).context("failed to load state file")?;
+
+    // Look up the review.
+    let review = store
+        .get(&pr_ref)
+        .ok_or_else(|| anyhow::anyhow!("no review found for PR #{pr_num}"))?;
+
+    // Filter to local-only comments.
+    let local_comments: Vec<&Comment> = review
+        .comments
+        .iter()
+        .filter(|c| c.origin == CommentOrigin::Local)
+        .collect();
+
+    if local_comments.is_empty() {
+        println!("No local comments to mirror for PR #{pr_num}.");
+        return Ok(());
+    }
+
+    println!(
+        "{} local comment(s) to mirror for PR #{pr_num}:",
+        local_comments.len()
+    );
+    for comment in &local_comments {
+        let formatted = github::format_comment_body(comment);
+        println!();
+        println!("  --- Comment {} ---", comment.id);
+        for line in formatted.lines() {
+            println!("  {line}");
+        }
+    }
+
+    if dry_run {
+        println!();
+        println!("(dry run -- nothing posted)");
+        return Ok(());
+    }
+
+    println!();
+    println!("Posting to GitHub...");
+
+    let result = github::mirror_comments(&pr_ref, &review.comments)
+        .await
+        .context("failed to mirror comments")?;
+
+    println!("Posted:  {}", result.posted);
+    if !result.failed.is_empty() {
+        println!("Failed:  {}", result.failed.len());
+        for (comment_id, reason) in &result.failed {
+            println!("  {comment_id}: {reason}");
+        }
+    }
 
     Ok(())
 }

@@ -12,6 +12,8 @@ import type { Review } from "../bindings/Review";
 import type { DiffData } from "../bindings/DiffData";
 import type { GateState } from "../bindings/GateState";
 import type { Comment } from "../bindings/Comment";
+import type { CommentOrigin } from "../bindings/CommentOrigin";
+import type { MirrorResult } from "../bindings/MirrorResult";
 import type { Anchor } from "../bindings/Anchor";
 import { parseDiff, extractFilePaths } from "../diff-parser";
 import type { FileDiff } from "../diff-parser";
@@ -27,6 +29,7 @@ interface DiffViewProps {
     body: string,
   ) => Promise<void>;
   readonly onRequestChanges: () => Promise<void>;
+  readonly onMirrorComments: () => Promise<MirrorResult | null>;
 }
 
 function assertNever(x: never): never {
@@ -112,12 +115,18 @@ function fileComments(
   return comments.filter((c) => anchorPath(c.anchor) === filePath);
 }
 
+/** Check whether a comment origin is Local. */
+function isLocalOrigin(origin: CommentOrigin): boolean {
+  return origin === "Local";
+}
+
 export function DiffView({
   review,
   diff,
   onBack,
   onAddComment,
   onRequestChanges,
+  onMirrorComments,
 }: DiffViewProps) {
   const fileDiffs = useMemo(() => parseDiff(diff.raw), [diff.raw]);
   const filePaths = useMemo(() => extractFilePaths(diff.raw), [diff.raw]);
@@ -142,8 +151,27 @@ export function DiffView({
     [review.comments, selectedFile],
   );
 
+  const [mirrorResult, setMirrorResult] = useState<MirrorResult | null>(null);
+  const [mirroring, setMirroring] = useState(false);
+
+  const hasLocalComments = useMemo(
+    () => review.comments.some((c) => isLocalOrigin(c.origin)),
+    [review.comments],
+  );
+
   const canRequestChanges =
     review.gate_state === "InReview" && review.comments.length > 0;
+
+  const handleMirrorComments = useCallback(async () => {
+    setMirroring(true);
+    setMirrorResult(null);
+    try {
+      const result = await onMirrorComments();
+      setMirrorResult(result);
+    } finally {
+      setMirroring(false);
+    }
+  }, [onMirrorComments]);
 
   const handleAddComment = useCallback(async () => {
     const file = commentFile.trim() !== "" ? commentFile : selectedFile;
@@ -224,6 +252,22 @@ export function DiffView({
         )}
 
         <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          {hasLocalComments && (
+            <button
+              onClick={() => void handleMirrorComments()}
+              disabled={mirroring}
+              style={{
+                cursor: mirroring ? "wait" : "pointer",
+                padding: "4px 12px",
+                backgroundColor: "#607D8B",
+                color: "white",
+                border: "none",
+                borderRadius: 4,
+              }}
+            >
+              {mirroring ? "Mirroring..." : "Mirror to GitHub"}
+            </button>
+          )}
           {canRequestChanges && (
             <button
               onClick={() => void handleRequestChanges()}
@@ -242,6 +286,41 @@ export function DiffView({
           )}
         </div>
       </header>
+
+      {/* Mirror result banner */}
+      {mirrorResult !== null && (
+        <div
+          style={{
+            padding: "8px 24px",
+            borderBottom: "1px solid #333",
+            fontSize: 13,
+            backgroundColor:
+              mirrorResult.failed.length === 0 ? "#1B5E20" : "#BF360C",
+            color: "white",
+          }}
+        >
+          Mirrored: {mirrorResult.posted} posted
+          {mirrorResult.failed.length > 0 &&
+            `, ${String(mirrorResult.failed.length)} failed`}
+          <button
+            onClick={() => {
+              setMirrorResult(null);
+            }}
+            style={{
+              marginLeft: 12,
+              cursor: "pointer",
+              background: "transparent",
+              border: "1px solid rgba(255,255,255,0.5)",
+              color: "white",
+              borderRadius: 4,
+              padding: "2px 8px",
+              fontSize: 11,
+            }}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* File selector */}
       <nav

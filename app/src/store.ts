@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Review } from "./bindings/Review";
 import type { DiffData } from "./bindings/DiffData";
 import type { ProjectPlan } from "./bindings/ProjectPlan";
+import type { BatchVerdict } from "./bindings/BatchVerdict";
 
 /**
  * Navigation state discriminated union.
@@ -65,6 +66,24 @@ interface AppStore {
   requestPlanChanges: () => Promise<void>;
   approvePlan: () => Promise<void>;
   openPlan: () => Promise<void>;
+
+  /** Batch-approve preview results. */
+  readonly batchVerdicts: readonly [Review, BatchVerdict][] | null;
+
+  /** Whether the batch-approve panel is visible. */
+  readonly showBatchPanel: boolean;
+
+  /** Fetch batch-approve preview from the backend. */
+  fetchBatchApprovePreview: () => Promise<void>;
+
+  /** Approve a single review by PR ref (explicit user action). */
+  approveReview: (pr: string) => Promise<void>;
+
+  /** Approve all eligible reviews in the current batch preview. */
+  approveAllEligible: () => Promise<void>;
+
+  /** Toggle visibility of the batch-approve panel. */
+  toggleBatchPanel: () => void;
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
@@ -76,6 +95,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   view: { kind: "frontier" },
   activeReview: null,
   activeDiff: null,
+  batchVerdicts: null,
+  showBatchPanel: false,
 
   fetchReviews: async () => {
     set({ loading: true, error: null });
@@ -244,6 +265,56 @@ export const useAppStore = create<AppStore>((set, get) => ({
     } catch (e: unknown) {
       set({ error: String(e) });
     }
+  },
+
+  fetchBatchApprovePreview: async () => {
+    set({ loading: true, error: null });
+    try {
+      const results = await invoke<[Review, BatchVerdict][]>(
+        "batch_approve_preview",
+      );
+      set({ batchVerdicts: results, showBatchPanel: true, loading: false });
+    } catch (e: unknown) {
+      set({ error: String(e), loading: false });
+    }
+  },
+
+  approveReview: async (pr: string) => {
+    try {
+      await invoke<Review>("approve_review", { pr });
+      // Refresh after approval.
+      await get().fetchBatchApprovePreview();
+      await get().fetchFrontier();
+      await get().fetchReviews();
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  approveAllEligible: async () => {
+    const { batchVerdicts } = get();
+    if (batchVerdicts === null) return;
+
+    for (const [review, verdict] of batchVerdicts) {
+      if (verdict.kind === "Eligible") {
+        try {
+          await invoke<Review>("approve_review", { pr: review.pr });
+        } catch (e: unknown) {
+          set({ error: String(e) });
+          return;
+        }
+      }
+    }
+
+    // Refresh after all approvals.
+    await get().fetchBatchApprovePreview();
+    await get().fetchFrontier();
+    await get().fetchReviews();
+  },
+
+  toggleBatchPanel: () => {
+    const { showBatchPanel } = get();
+    set({ showBatchPanel: !showBatchPanel });
   },
 }));
 

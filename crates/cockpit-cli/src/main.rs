@@ -11,6 +11,7 @@ use clap::Parser;
 
 use cockpit_core::adapters::agent::{SessionMap, SpawnConfig};
 use cockpit_core::adapters::{github, linear};
+use cockpit_core::batch;
 use cockpit_core::dag;
 use cockpit_core::gate::Gated;
 use cockpit_core::hook_server::{self, HookState};
@@ -83,6 +84,19 @@ enum Command {
         #[arg(long, default_value = "19876")]
         port: u16,
     },
+    /// Evaluate frontier reviews for batch approval.
+    ///
+    /// By default shows a dry-run table of reviews and their verdicts.
+    /// Pass `--confirm` to actually approve all eligible reviews.
+    /// Per CLAUDE.md Invariant 5: batch-approve NEVER fires automatically.
+    BatchApprove {
+        /// Show what would be approved without approving (default).
+        #[arg(long)]
+        dry_run: bool,
+        /// Actually approve all eligible reviews (explicit user action).
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 /// Subcommands for the `comment` verb.
@@ -151,6 +165,7 @@ async fn main() -> Result<()> {
             skip_plan,
             port,
         } => run_kickoff(&project_id, skip_plan, port).await,
+        Command::BatchApprove { dry_run, confirm } => run_batch_approve(dry_run, confirm).await,
     }
 }
 
@@ -941,6 +956,122 @@ async fn run_kickoff(project_id: &str, skip_plan: bool, port: u16) -> Result<()>
     println!();
     println!("Hook server: http://127.0.0.1:{port}/hook/stop");
     println!("Start the hook server with: cockpit start --port {port}");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `cockpit batch-approve [--dry-run] [--confirm]`
+// ---------------------------------------------------------------------------
+
+/// Evaluate frontier reviews for batch approval and optionally approve them.
+///
+/// By default (or with `--dry-run`) this prints a table of verdicts without
+/// side effects. The `--confirm` flag is an explicit user action that
+/// approves all eligible reviews (Invariant 5: side effects require explicit
+/// confirmation).
+async fn run_batch_approve(dry_run: bool, confirm: bool) -> Result<()> {
+    if dry_run && confirm {
+        bail!("--dry-run and --confirm are mutually exclusive");
+    }
+
+    // Load state from file.
+    let state_path = Path::new(store::STATE_FILE);
+    let store = store::load_from_file(state_path).context("failed to load state file")?;
+
+    let config = batch::Config::default();
+    let results = batch::evaluate_frontier(&store, &config);
+
+    if results.is_empty() {
+        println!("No reviews in the frontier to evaluate.");
+        return Ok(());
+    }
+
+    // Print the verdict table.
+    println!("{:<30} {:<12} {:<10} Reasons", "PR", "State", "Verdict");
+    println!("{}", "-".repeat(80));
+
+    let mut eligible_count: usize = 0;
+    let mut ineligible_count: usize = 0;
+
+    for (review, verdict) in &results {
+        let (verdict_label, reasons) = match verdict {
+            batch::Verdict::Eligible { reasons } => {
+                eligible_count += 1;
+                ("ELIGIBLE", reasons.join("; "))
+            }
+            batch::Verdict::Ineligible { reasons } => {
+                ineligible_count += 1;
+                ("INELIGIBLE", reasons.join("; "))
+            }
+        };
+
+        println!(
+            "{:<30} {:<12} {:<10} {}",
+            review.pr,
+            format!("{:?}", review.gate_state),
+            verdict_label,
+            reasons
+        );
+    }
+
+    println!();
+    println!(
+        "Total: {} reviewed, {} eligible, {} ineligible",
+        results.len(),
+        eligible_count,
+        ineligible_count
+    );
+
+    // If --confirm, approve all eligible reviews.
+    if confirm {
+        if eligible_count == 0 {
+            println!("No eligible reviews to approve.");
+            return Ok(());
+        }
+
+        println!();
+        println!("Approving {eligible_count} eligible review(s)...");
+
+        let mut approved = 0usize;
+        for (review, verdict) in &results {
+            if !verdict.is_eligible() {
+                continue;
+            }
+
+            // Transition through open() if Reworked, then approve().
+            let mut transition_err: Option<String> = None;
+            store.update(&review.pr, |r| {
+                // If Reworked, open first to get to InReview.
+                if r.gate_state == GateState::Reworked {
+                    if let Err(e) = r.open() {
+                        transition_err = Some(format!("open failed for {}: {e}", review.pr));
+                        return;
+                    }
+                }
+                if let Err(e) = r.approve() {
+                    transition_err = Some(format!("approve failed for {}: {e}", review.pr));
+                    return;
+                }
+                approved += 1;
+            });
+
+            if let Some(err_msg) = transition_err {
+                eprintln!("  Warning: {err_msg}");
+            } else {
+                println!("  Approved: {}", review.pr);
+            }
+        }
+
+        // Persist the updated state.
+        store::save_to_file(&store, state_path).context("failed to save state file")?;
+
+        println!();
+        println!("Approved {approved}/{eligible_count} reviews.");
+    } else {
+        println!();
+        println!("Dry run -- no changes made. Pass --confirm to approve eligible reviews.");
+    }
 
     Ok(())
 }

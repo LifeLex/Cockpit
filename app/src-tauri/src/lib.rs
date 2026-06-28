@@ -58,6 +58,8 @@ pub fn run() {
             commands::plan_request_changes,
             commands::plan_approve,
             commands::plan_open,
+            commands::batch_approve_preview,
+            commands::approve_review,
         ])
         .run(tauri::generate_context!())
         // INVARIANT: if Tauri fails to start there is nothing to recover —

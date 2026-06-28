@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tauri::State;
 
+use cockpit_core::batch;
 use cockpit_core::gate::Gated;
 use cockpit_core::model::{
     Anchor, Comment, CommentId, CommentOrigin, DiffData, GateState, PlanDoc, PrRef, ProjectPlan,
@@ -269,5 +270,62 @@ pub fn plan_open(state: State<'_, Arc<AppState>>) -> Result<ProjectPlan, Command
 
     state.plan.get().ok_or_else(|| CommandError {
         message: "Plan disappeared after update".into(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Batch-approve commands
+// ---------------------------------------------------------------------------
+
+/// Preview batch-approve verdicts for all frontier reviews (dry-run only).
+///
+/// Returns a list of `(Review, Verdict)` pairs. The frontend uses this to
+/// show a modal/panel with verdicts; the actual approval happens through
+/// individual `approve_review` calls from the UI (Invariant 5: side effects
+/// require explicit confirmation).
+#[tauri::command]
+pub fn batch_approve_preview(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<(Review, batch::Verdict)>, CommandError> {
+    let config = batch::Config::default();
+    let results = batch::evaluate_frontier(&state.reviews, &config);
+    Ok(results)
+}
+
+/// Approve a single review by PR reference string (`InReview` -> `Approved`).
+///
+/// If the review is in `Reworked` state, it is first opened to `InReview`
+/// before approving. This is used by the batch-approve UI to approve
+/// individual eligible reviews (explicit user action per Invariant 5).
+#[tauri::command]
+pub fn approve_review(state: State<'_, Arc<AppState>>, pr: String) -> Result<Review, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+
+    let mut transition_err: Option<cockpit_core::gate::Error> = None;
+    let found = state.reviews.update(&pr_ref, |review| {
+        // Transition Reworked -> InReview first if needed.
+        if review.gate_state == GateState::Reworked
+            && let Err(e) = review.open()
+        {
+            transition_err = Some(e);
+            return;
+        }
+        if let Err(e) = review.approve() {
+            transition_err = Some(e);
+        }
+    });
+
+    if !found {
+        return Err(CommandError {
+            message: format!("Review not found: {pr}"),
+        });
+    }
+
+    if let Some(e) = transition_err {
+        return Err(CommandError::from(e));
+    }
+
+    state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
     })
 }

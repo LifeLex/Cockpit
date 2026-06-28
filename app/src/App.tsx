@@ -4,6 +4,7 @@ import { useAppStore } from "./store";
 import { ReviewCard } from "./components/ReviewCard";
 import { DiffView } from "./components/DiffView";
 import { PlanView } from "./components/PlanView";
+import { BatchApprovePanel } from "./components/BatchApprovePanel";
 
 function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
@@ -32,6 +33,14 @@ function App() {
   const requestPlanChanges = useAppStore((s) => s.requestPlanChanges);
   const approvePlan = useAppStore((s) => s.approvePlan);
   const openPlan = useAppStore((s) => s.openPlan);
+  const batchVerdicts = useAppStore((s) => s.batchVerdicts);
+  const showBatchPanel = useAppStore((s) => s.showBatchPanel);
+  const fetchBatchApprovePreview = useAppStore(
+    (s) => s.fetchBatchApprovePreview,
+  );
+  const approveReview = useAppStore((s) => s.approveReview);
+  const approveAllEligible = useAppStore((s) => s.approveAllEligible);
+  const toggleBatchPanel = useAppStore((s) => s.toggleBatchPanel);
 
   useEffect(() => {
     void fetchReviews();
@@ -119,10 +128,50 @@ function App() {
           )}
 
           <section>
-            <h2>Frontier ({frontier.length})</h2>
-            <p style={{ color: "#888", fontSize: 14 }}>
-              Reviews ready for deep-review (not stale)
-            </p>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <div>
+                <h2>Frontier ({frontier.length})</h2>
+                <p style={{ color: "#888", fontSize: 14 }}>
+                  Reviews ready for deep-review (not stale)
+                </p>
+              </div>
+              {frontier.length > 0 && (
+                <button
+                  onClick={() => {
+                    void fetchBatchApprovePreview();
+                  }}
+                  style={{
+                    padding: "8px 16px",
+                    cursor: "pointer",
+                    backgroundColor: "#4CAF50",
+                    color: "white",
+                    border: "none",
+                    borderRadius: 4,
+                    fontWeight: "bold",
+                  }}
+                >
+                  Batch Approve
+                </button>
+              )}
+            </div>
+
+            {showBatchPanel && batchVerdicts !== null && (
+              <BatchApprovePanel
+                verdicts={batchVerdicts}
+                onApprove={approveReview}
+                onApproveAll={() => {
+                  void approveAllEligible();
+                }}
+                onClose={toggleBatchPanel}
+              />
+            )}
+
             {loading && <p>Loading...</p>}
             {frontier.map((review) => (
               <ReviewCard

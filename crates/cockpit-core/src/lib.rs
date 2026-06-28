@@ -12,6 +12,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod model;
 
 pub mod adapters;
+pub mod batch;
 pub mod dag;
 pub mod gate;
 pub mod kickoff;

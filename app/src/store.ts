@@ -10,13 +10,14 @@ import type { BatchVerdict } from "./bindings/BatchVerdict";
  * Navigation state discriminated union.
  *
  * The app is either showing the frontier list, reviewing a specific PR's diff,
- * or viewing the project plan. Using a tagged union (not optional fields)
- * makes exhaustive switching possible.
+ * viewing the project plan, or viewing the stack dependency graph. Using a
+ * tagged union (not optional fields) makes exhaustive switching possible.
  */
 type ViewState =
   | { readonly kind: "frontier" }
   | { readonly kind: "diff"; readonly pr: string }
-  | { readonly kind: "plan" };
+  | { readonly kind: "plan" }
+  | { readonly kind: "stacks" };
 
 interface AppStore {
   readonly reviews: readonly Review[];
@@ -46,6 +47,9 @@ interface AppStore {
 
   /** Navigate back to the frontier list. */
   navigateToFrontier: () => void;
+
+  /** Navigate to the stack dependency view. */
+  navigateToStacks: () => void;
 
   /** Add an anchored comment to the active review. */
   addComment: (
@@ -161,6 +165,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
     });
     void get().fetchReviews();
     void get().fetchFrontier();
+  },
+
+  navigateToStacks: () => {
+    set({
+      view: { kind: "stacks" },
+      activeReview: null,
+      activeDiff: null,
+    });
+    void get().fetchReviews();
   },
 
   addComment: async (

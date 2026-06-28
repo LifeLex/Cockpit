@@ -16,10 +16,11 @@ use cockpit_core::gate::Gated;
 use cockpit_core::hook_server::{self, HookState};
 use cockpit_core::model::{
     Anchor, Artifact, Comment, CommentId, CommentOrigin, DiffData, GateState, IssueRef, PrRef,
-    ProjectRef, Review, ReviewId,
+    ProjectPlan, ProjectRef, Review, ReviewId,
 };
+use cockpit_core::plan_parser;
 use cockpit_core::prompt::{self, ReworkInput};
-use cockpit_core::store::{self, ReviewStore};
+use cockpit_core::store::{self, PlanStore, ReviewStore};
 
 // ---------------------------------------------------------------------------
 // CLI structure
@@ -59,6 +60,11 @@ enum Command {
         #[arg(long, default_value = "19876")]
         port: u16,
     },
+    /// Manage the project plan (plan gate).
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
 }
 
 /// Subcommands for the `comment` verb.
@@ -79,6 +85,33 @@ enum CommentAction {
     },
 }
 
+/// Subcommands for the `plan` verb.
+#[derive(clap::Subcommand)]
+enum PlanAction {
+    /// Load a plan document from a file.
+    Load {
+        /// Path to the plan markdown file.
+        file: String,
+        /// Linear project ID for the plan.
+        #[arg(long, default_value = "default")]
+        project: String,
+    },
+    /// Show the current plan.
+    Show,
+    /// Add a comment to the plan.
+    Comment {
+        /// Anchor: "step:N" for a plan step, "file:path" for a file.
+        #[arg(long)]
+        anchor: String,
+        /// Comment body.
+        body: String,
+    },
+    /// Request changes on the plan (dispatch planner agent).
+    RequestChanges,
+    /// Approve the current plan.
+    Approve,
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -93,6 +126,7 @@ async fn main() -> Result<()> {
         Command::Comment { action } => run_comment(action).await,
         Command::RequestChanges { pr } => run_request_changes(pr).await,
         Command::Start { port } => run_start(port).await,
+        Command::Plan { action } => run_plan(action).await,
     }
 }
 
@@ -429,6 +463,227 @@ async fn run_request_changes(pr_num: u64) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// `cockpit plan <action>`
+// ---------------------------------------------------------------------------
+
+/// Dispatch plan subcommands.
+async fn run_plan(action: PlanAction) -> Result<()> {
+    match action {
+        PlanAction::Load { file, project } => run_plan_load(&file, &project).await,
+        PlanAction::Show => run_plan_show().await,
+        PlanAction::Comment { anchor, body } => run_plan_comment(&anchor, &body).await,
+        PlanAction::RequestChanges => run_plan_request_changes().await,
+        PlanAction::Approve => run_plan_approve().await,
+    }
+}
+
+/// Load a plan document from a file, parse it, and store it.
+async fn run_plan_load(file: &str, project_id: &str) -> Result<()> {
+    let raw = std::fs::read_to_string(file)
+        .with_context(|| format!("failed to read plan file: {file}"))?;
+
+    let doc = plan_parser::parse(&raw).context("failed to parse plan document")?;
+
+    let plan = ProjectPlan {
+        project: ProjectRef::new(project_id),
+        doc: doc.clone(),
+        gate_state: GateState::Pending,
+        comments: vec![],
+        agent: None,
+    };
+
+    let plan_store = PlanStore::new();
+    plan_store.set(plan);
+
+    let state_path = Path::new(store::PLAN_STATE_FILE);
+    store::save_plan_to_file(&plan_store, state_path).context("failed to save plan state")?;
+
+    println!("Plan loaded: {}", doc.summary);
+    println!("Steps:  {}", doc.steps.len());
+    println!("Files:  {}", doc.files.len());
+    println!("Risks:  {}", doc.risks.len());
+    println!("State:  {:?}", GateState::Pending);
+
+    Ok(())
+}
+
+/// Show the current plan.
+async fn run_plan_show() -> Result<()> {
+    let state_path = Path::new(store::PLAN_STATE_FILE);
+    let plan_store = store::load_plan_from_file(state_path).context("failed to load plan state")?;
+
+    let plan = plan_store
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("no plan loaded; use `cockpit plan load <file>` first"))?;
+
+    println!("Plan: {}", plan.doc.summary);
+    println!("State: {:?}", plan.gate_state);
+    println!("Project: {}", plan.project);
+    println!();
+
+    println!("Steps ({}):", plan.doc.steps.len());
+    for step in &plan.doc.steps {
+        println!("  {}. {}", step.index + 1, step.title);
+        if !step.description.is_empty() {
+            for line in step.description.lines() {
+                println!("     {line}");
+            }
+        }
+    }
+
+    println!();
+    println!("Files ({}):", plan.doc.files.len());
+    for file in &plan.doc.files {
+        println!("  - {}", file.display());
+    }
+
+    println!();
+    println!("Risks ({}):", plan.doc.risks.len());
+    if plan.doc.risks.is_empty() {
+        println!("  (none)");
+    } else {
+        for risk in &plan.doc.risks {
+            println!("  - {risk}");
+        }
+    }
+
+    if !plan.comments.is_empty() {
+        println!();
+        println!("Comments ({}):", plan.comments.len());
+        for (i, comment) in plan.comments.iter().enumerate() {
+            let anchor_text = prompt::render_anchor(&comment.anchor, Some(&plan.doc));
+            println!("  {}. [{}] {}", i + 1, anchor_text, comment.body);
+        }
+    }
+
+    Ok(())
+}
+
+/// Add a comment to the plan.
+async fn run_plan_comment(anchor_str: &str, body: &str) -> Result<()> {
+    let anchor =
+        plan_parser::parse_plan_anchor(anchor_str).context("failed to parse anchor string")?;
+
+    let state_path = Path::new(store::PLAN_STATE_FILE);
+    let plan_store = store::load_plan_from_file(state_path).context("failed to load plan state")?;
+
+    if plan_store.get().is_none() {
+        bail!("no plan loaded; use `cockpit plan load <file>` first");
+    }
+
+    plan_store.update(|plan| {
+        let comment_num = plan.comments.len() + 1;
+        let comment = Comment {
+            id: CommentId::new(format!("pc-{comment_num}")),
+            anchor,
+            body: body.to_string(),
+            origin: CommentOrigin::Local,
+        };
+        plan.comments.push(comment);
+
+        // Transition Pending -> InReview if needed.
+        if plan.gate_state == GateState::Pending {
+            // INVARIANT: Pending -> InReview is always a legal transition.
+            plan.gate_state = GateState::InReview;
+        }
+    });
+
+    store::save_plan_to_file(&plan_store, state_path).context("failed to save plan state")?;
+
+    let plan = plan_store.get().expect("plan was just updated; must exist");
+    let anchor_text = prompt::render_anchor(
+        &plan.comments.last().expect("just pushed a comment").anchor,
+        Some(&plan.doc),
+    );
+    println!("Comment added: [{anchor_text}] {body}");
+    println!("State: {:?}", plan.gate_state);
+    println!("Total comments: {}", plan.comments.len());
+
+    Ok(())
+}
+
+/// Request changes on the plan: assemble prompt and spawn planner agent.
+async fn run_plan_request_changes() -> Result<()> {
+    let state_path = Path::new(store::PLAN_STATE_FILE);
+    let plan_store = store::load_plan_from_file(state_path).context("failed to load plan state")?;
+
+    let mut plan = plan_store
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("no plan loaded; use `cockpit plan load <file>` first"))?;
+
+    // Transition InReview -> Dispatched (enforces >= 1 comment).
+    plan.request_changes()
+        .map_err(|e| anyhow::anyhow!("cannot request changes: {e}"))?;
+
+    // Assemble the rework prompt (plan gate: no approved_plan, artifact is Plan).
+    let artifact = Artifact::Plan(plan.doc.clone());
+    let input = ReworkInput {
+        intent: plan.project.as_str(),
+        approved_plan: None,
+        artifact: &artifact,
+        comments: &plan.comments,
+    };
+    let assembled_prompt = prompt::assemble_rework(&input);
+
+    println!("Prompt hash: {}", assembled_prompt.hash);
+
+    // Spawn the planner agent.
+    let session_map = SessionMap::new();
+    let hook_url = "http://127.0.0.1:19876/hook/stop";
+    let config = SpawnConfig::default();
+
+    // Use the current directory as the worktree for plan-gate agents.
+    let worktree = env::current_dir().context("failed to get current directory")?;
+
+    let agent_run = cockpit_core::adapters::agent::spawn_agent(
+        &worktree,
+        &assembled_prompt,
+        cockpit_core::model::AgentMode::Plan,
+        plan.project.as_str(),
+        &session_map,
+        hook_url,
+        &config,
+    )
+    .await
+    .context("failed to spawn planner agent")?;
+
+    println!("Agent PID: {}", agent_run.pid);
+
+    // Store the agent run on the plan.
+    plan.agent = Some(agent_run);
+
+    // Persist the updated plan.
+    let updated_store = PlanStore::new();
+    updated_store.set(plan);
+    store::save_plan_to_file(&updated_store, state_path).context("failed to save plan state")?;
+
+    println!("Dispatched -- waiting for planner agent to complete");
+
+    Ok(())
+}
+
+/// Approve the current plan.
+async fn run_plan_approve() -> Result<()> {
+    let state_path = Path::new(store::PLAN_STATE_FILE);
+    let plan_store = store::load_plan_from_file(state_path).context("failed to load plan state")?;
+
+    let mut plan = plan_store
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("no plan loaded; use `cockpit plan load <file>` first"))?;
+
+    plan.approve()
+        .map_err(|e| anyhow::anyhow!("cannot approve plan: {e}"))?;
+
+    let updated_store = PlanStore::new();
+    updated_store.set(plan);
+    store::save_plan_to_file(&updated_store, state_path).context("failed to save plan state")?;
+
+    println!("Plan approved -- ready for batch implementation");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -437,10 +692,10 @@ mod tests {
     use super::*;
     use cockpit_core::gate::Gated;
     use cockpit_core::model::{
-        Anchor, Comment, CommentId, CommentOrigin, DiffData, GateState, IssueRef, PrRef, Review,
-        ReviewId,
+        Anchor, Comment, CommentId, CommentOrigin, DiffData, GateState, IssueRef, PlanDoc,
+        PlanStep, PrRef, ProjectPlan, ProjectRef, Review, ReviewId,
     };
-    use cockpit_core::store::ReviewStore;
+    use cockpit_core::store::{PlanStore, ReviewStore};
 
     /// Build a minimal `Review` at the given state.
     fn make_review(pr_num: u64, state: GateState) -> Review {
@@ -563,5 +818,185 @@ mod tests {
             matches!(err, cockpit_core::gate::Error::NoComments),
             "expected NoComments, got {err:?}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Plan gate tests
+    // ---------------------------------------------------------------
+
+    fn make_plan_doc() -> PlanDoc {
+        PlanDoc {
+            summary: "Build a thing".into(),
+            steps: vec![
+                PlanStep {
+                    index: 0,
+                    title: "Step one".into(),
+                    description: "Do something".into(),
+                },
+                PlanStep {
+                    index: 1,
+                    title: "Step two".into(),
+                    description: "Do more".into(),
+                },
+            ],
+            files: vec![
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("src/main.rs"),
+            ],
+            risks: vec!["migration needed".into()],
+            raw: "# Plan: Build a thing\n\n## Steps\n\n1. Step one\n   Do something\n\n2. Step two\n   Do more\n\n## Files\n\n- src/lib.rs\n- src/main.rs\n\n## Risks\n\n- migration needed\n".into(),
+        }
+    }
+
+    fn make_project_plan(state: GateState) -> ProjectPlan {
+        ProjectPlan {
+            project: ProjectRef::new("proj-1"),
+            doc: make_plan_doc(),
+            gate_state: state,
+            comments: vec![],
+            agent: None,
+        }
+    }
+
+    fn make_plan_comment(id: &str, anchor: Anchor) -> Comment {
+        Comment {
+            id: CommentId::new(id),
+            anchor,
+            body: "fix this step".into(),
+            origin: CommentOrigin::Local,
+        }
+    }
+
+    #[test]
+    fn plan_gate_full_cycle() {
+        let mut plan = make_project_plan(GateState::Pending);
+
+        // Pending -> InReview
+        plan.open().unwrap();
+        assert_eq!(plan.gate_state(), GateState::InReview);
+
+        // Add a comment
+        plan.comments
+            .push(make_plan_comment("pc-1", Anchor::PlanStep(0)));
+        assert_eq!(plan.comments().len(), 1);
+
+        // InReview -> Dispatched
+        plan.request_changes().unwrap();
+        assert_eq!(plan.gate_state(), GateState::Dispatched);
+
+        // Dispatched -> Reworked (comments cleared per Invariant 4)
+        plan.mark_reworked().unwrap();
+        assert_eq!(plan.gate_state(), GateState::Reworked);
+        assert!(plan.comments().is_empty(), "comments cleared on Reworked");
+
+        // Reworked -> InReview
+        plan.open().unwrap();
+        assert_eq!(plan.gate_state(), GateState::InReview);
+
+        // InReview -> Approved
+        plan.approve().unwrap();
+        assert_eq!(plan.gate_state(), GateState::Approved);
+    }
+
+    #[test]
+    fn plan_comment_anchors() {
+        let plan = make_project_plan(GateState::InReview);
+
+        let step_comment = make_plan_comment("pc-1", Anchor::PlanStep(0));
+        let file_comment = make_plan_comment("pc-2", Anchor::PlanFile(PathBuf::from("src/lib.rs")));
+
+        // Verify anchors render correctly.
+        let step_anchor = prompt::render_anchor(&step_comment.anchor, Some(&plan.doc));
+        assert_eq!(step_anchor, "plan step 0: Step one");
+
+        let file_anchor = prompt::render_anchor(&file_comment.anchor, Some(&plan.doc));
+        assert_eq!(file_anchor, "plan file: src/lib.rs");
+    }
+
+    #[test]
+    fn plan_prompt_assembly() {
+        let mut plan = make_project_plan(GateState::InReview);
+        plan.comments
+            .push(make_plan_comment("pc-1", Anchor::PlanStep(0)));
+        plan.comments.push(Comment {
+            id: CommentId::new("pc-2"),
+            anchor: Anchor::PlanFile(PathBuf::from("src/lib.rs")),
+            body: "consider splitting".into(),
+            origin: CommentOrigin::Local,
+        });
+
+        let artifact = Artifact::Plan(plan.doc.clone());
+        let input = ReworkInput {
+            intent: "Build a reusable widget framework",
+            approved_plan: None, // plan gate: no approved plan
+            artifact: &artifact,
+            comments: &plan.comments,
+        };
+
+        let result = prompt::assemble_rework(&input);
+
+        // No "Approved Plan" section in plan-gate prompts.
+        assert!(
+            !result.text.contains("## Approved Plan"),
+            "plan-gate prompt should not have an Approved Plan section"
+        );
+
+        // Artifact section should contain the plan raw text.
+        assert!(
+            result.text.contains("## Current Artifact"),
+            "prompt should have Current Artifact section"
+        );
+        assert!(
+            result.text.contains(&plan.doc.raw),
+            "prompt should contain the plan raw text"
+        );
+
+        // Comments section should contain rendered anchors.
+        assert!(
+            result.text.contains("plan step 0: Step one"),
+            "prompt should contain rendered step anchor"
+        );
+        assert!(
+            result.text.contains("plan file: src/lib.rs"),
+            "prompt should contain rendered file anchor"
+        );
+
+        // Should have a scope guard.
+        assert!(
+            result.text.contains("## Scope Guard"),
+            "prompt should have Scope Guard section"
+        );
+
+        // Hash should be valid.
+        assert_eq!(result.hash.len(), 64);
+    }
+
+    #[test]
+    fn plan_approve_from_in_review() {
+        let mut plan = make_project_plan(GateState::InReview);
+
+        // Can approve directly from InReview (no comments needed for approval).
+        plan.approve().unwrap();
+        assert_eq!(plan.gate_state(), GateState::Approved);
+    }
+
+    #[test]
+    fn plan_store_round_trip_with_comments() {
+        let plan_store = PlanStore::new();
+        let mut plan = make_project_plan(GateState::InReview);
+        plan.comments
+            .push(make_plan_comment("pc-1", Anchor::PlanStep(0)));
+        plan_store.set(plan);
+
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let path = dir.path().join("plan.json");
+
+        store::save_plan_to_file(&plan_store, &path).expect("save should succeed");
+        let loaded = store::load_plan_from_file(&path).expect("load should succeed");
+
+        let got = loaded.get().expect("plan should be present");
+        assert_eq!(got.gate_state, GateState::InReview);
+        assert_eq!(got.comments.len(), 1);
+        assert_eq!(got.doc.steps.len(), 2);
     }
 }

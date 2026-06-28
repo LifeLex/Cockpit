@@ -30,9 +30,10 @@
 //! ```
 
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::model::{PlanDoc, PlanStep};
+use crate::gate::Gated;
+use crate::model::{PlanDoc, PlanStep, ProjectPlan};
 
 /// Errors from parsing a structured plan document.
 #[derive(Debug, thiserror::Error)]
@@ -135,6 +136,77 @@ pub fn render(doc: &PlanDoc) -> String {
     }
 
     out
+}
+
+/// Parse a plan anchor string into an [`Anchor`].
+///
+/// Accepted formats:
+/// - `"step:N"` — produces `Anchor::PlanStep(N)` (zero-based index).
+/// - `"file:path/to/file"` — produces `Anchor::PlanFile(path)`.
+pub fn parse_plan_anchor(s: &str) -> Result<crate::model::Anchor, Error> {
+    if let Some(rest) = s.strip_prefix("step:") {
+        let idx: usize = rest.parse().map_err(|_| Error::InvalidStep {
+            line: 0,
+            reason: format!("invalid step index: {rest:?}"),
+        })?;
+        Ok(crate::model::Anchor::PlanStep(idx))
+    } else if let Some(rest) = s.strip_prefix("file:") {
+        let path = rest.trim();
+        if path.is_empty() {
+            return Err(Error::InvalidStep {
+                line: 0,
+                reason: "empty file path in anchor".into(),
+            });
+        }
+        Ok(crate::model::Anchor::PlanFile(PathBuf::from(path)))
+    } else {
+        Err(Error::InvalidStep {
+            line: 0,
+            reason: format!(
+                "unrecognized anchor format: {s:?}; expected \"step:N\" or \"file:path\""
+            ),
+        })
+    }
+}
+
+/// Reconcile a plan after the planner agent completes.
+///
+/// Re-reads and re-parses the plan document from the given path, updates the
+/// `ProjectPlan`'s `doc` field with the fresh parse, and transitions the gate
+/// to `Reworked` (which also clears ephemeral comments per Invariant 4).
+///
+/// This is the plan-gate counterpart of the diff-gate's git reconciliation.
+pub fn reconcile_plan(plan: &mut ProjectPlan, plan_path: &Path) -> Result<(), ReconcileError> {
+    let raw = std::fs::read_to_string(plan_path).map_err(|source| ReconcileError::ReadFailed {
+        path: plan_path.to_path_buf(),
+        source,
+    })?;
+    let doc = parse(&raw).map_err(ReconcileError::ParseFailed)?;
+    plan.doc = doc;
+    plan.mark_reworked()
+        .map_err(ReconcileError::TransitionFailed)?;
+    Ok(())
+}
+
+/// Errors from plan reconciliation.
+#[derive(Debug, thiserror::Error)]
+pub enum ReconcileError {
+    /// The plan file could not be read from disk.
+    #[error("failed to read plan file at {path}: {source}")]
+    ReadFailed {
+        /// Path that was being read.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// The plan file could not be parsed after the agent's edits.
+    #[error("failed to parse updated plan: {0}")]
+    ParseFailed(Error),
+
+    /// The gate state transition failed (e.g. plan was not in Dispatched state).
+    #[error("gate transition failed: {0}")]
+    TransitionFailed(crate::gate::Error),
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +703,170 @@ mod tests {
             vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")]
         );
         assert_eq!(doc.risks, vec!["Some risk".to_owned()]);
+    }
+
+    // -- parse_plan_anchor ---------------------------------------------------
+
+    #[test]
+    fn parse_plan_anchor_step() {
+        let anchor = parse_plan_anchor("step:0").expect("should parse step:0");
+        assert_eq!(anchor, Anchor::PlanStep(0));
+    }
+
+    #[test]
+    fn parse_plan_anchor_step_large() {
+        let anchor = parse_plan_anchor("step:42").expect("should parse step:42");
+        assert_eq!(anchor, Anchor::PlanStep(42));
+    }
+
+    #[test]
+    fn parse_plan_anchor_file() {
+        let anchor = parse_plan_anchor("file:src/lib.rs").expect("should parse file anchor");
+        assert_eq!(anchor, Anchor::PlanFile(PathBuf::from("src/lib.rs")));
+    }
+
+    #[test]
+    fn parse_plan_anchor_file_with_spaces() {
+        let anchor = parse_plan_anchor("file: src/lib.rs ").expect("should trim file path");
+        assert_eq!(anchor, Anchor::PlanFile(PathBuf::from("src/lib.rs")));
+    }
+
+    #[test]
+    fn parse_plan_anchor_invalid_format() {
+        let err = parse_plan_anchor("invalid").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidStep { .. }),
+            "expected InvalidStep, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_plan_anchor_empty_file() {
+        let err = parse_plan_anchor("file:").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidStep { .. }),
+            "expected InvalidStep for empty file, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_plan_anchor_non_numeric_step() {
+        let err = parse_plan_anchor("step:abc").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidStep { .. }),
+            "expected InvalidStep for non-numeric step, got {err:?}"
+        );
+    }
+
+    // -- reconcile_plan -----------------------------------------------------
+
+    #[test]
+    fn reconcile_plan_updates_doc() {
+        use crate::model::{GateState, ProjectPlan, ProjectRef};
+
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let plan_path = dir.path().join("plan.md");
+
+        let raw = "\
+# Plan: Updated plan
+
+## Steps
+
+1. New step
+   New description.
+
+## Files
+
+- src/new.rs
+
+## Risks
+
+- No risks
+";
+        std::fs::write(&plan_path, raw).expect("should write plan file");
+
+        // Start with a plan in Dispatched state (ready for reconcile).
+        let mut plan = ProjectPlan {
+            project: ProjectRef::new("proj-1"),
+            doc: PlanDoc {
+                summary: "Old plan".into(),
+                steps: vec![],
+                files: vec![],
+                risks: vec![],
+                raw: String::new(),
+            },
+            gate_state: GateState::Dispatched,
+            comments: vec![],
+            agent: None,
+        };
+
+        reconcile_plan(&mut plan, &plan_path).expect("reconcile should succeed");
+
+        assert_eq!(plan.doc.summary, "Updated plan");
+        assert_eq!(plan.doc.steps.len(), 1);
+        assert_eq!(plan.doc.steps[0].title, "New step");
+        assert_eq!(plan.doc.files, vec![PathBuf::from("src/new.rs")]);
+        assert_eq!(plan.gate_state, GateState::Reworked);
+    }
+
+    #[test]
+    fn reconcile_plan_wrong_state() {
+        use crate::model::{GateState, ProjectPlan, ProjectRef};
+
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let plan_path = dir.path().join("plan.md");
+        std::fs::write(
+            &plan_path,
+            "# Plan: X\n\n## Steps\n\n1. A\n   B\n\n## Files\n\n- f\n\n## Risks\n",
+        )
+        .expect("should write");
+
+        // Plan is in InReview, not Dispatched — reconcile should fail.
+        let mut plan = ProjectPlan {
+            project: ProjectRef::new("proj-1"),
+            doc: PlanDoc {
+                summary: "Old".into(),
+                steps: vec![],
+                files: vec![],
+                risks: vec![],
+                raw: String::new(),
+            },
+            gate_state: GateState::InReview,
+            comments: vec![],
+            agent: None,
+        };
+
+        let err = reconcile_plan(&mut plan, &plan_path).unwrap_err();
+        assert!(
+            matches!(err, ReconcileError::TransitionFailed(_)),
+            "expected TransitionFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_plan_missing_file() {
+        use crate::model::{GateState, ProjectPlan, ProjectRef};
+
+        let mut plan = ProjectPlan {
+            project: ProjectRef::new("proj-1"),
+            doc: PlanDoc {
+                summary: "Old".into(),
+                steps: vec![],
+                files: vec![],
+                risks: vec![],
+                raw: String::new(),
+            },
+            gate_state: GateState::Dispatched,
+            comments: vec![],
+            agent: None,
+        };
+
+        let err =
+            reconcile_plan(&mut plan, std::path::Path::new("/nonexistent/plan.md")).unwrap_err();
+        assert!(
+            matches!(err, ReconcileError::ReadFailed { .. }),
+            "expected ReadFailed, got {err:?}"
+        );
     }
 
     // -- multi-line description preserved ------------------------------------

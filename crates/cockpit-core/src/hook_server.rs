@@ -73,7 +73,7 @@ pub struct StopHookResponse {
 ///
 /// Consumers (CLI or Tauri) receive this and perform reconciliation on the
 /// corresponding reviewed object.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CompletionEvent {
     /// The session ID that completed.
     pub session_id: String,

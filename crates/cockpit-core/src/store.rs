@@ -174,6 +174,7 @@ mod tests {
             pr: PrRef::new(format!("owner/repo#{pr_num}")),
             branch: format!("alejandro/test-{pr_num}"),
             base: "main".into(),
+            base_sha: "000".into(),
             worktree: PathBuf::from(format!("/tmp/wt-{pr_num}")),
             gate_state: GateState::Pending,
             diff: DiffData { raw: String::new() },

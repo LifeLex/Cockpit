@@ -4,4 +4,5 @@
 //! functions; the caller (the loop, the CLI) owns the `Repository` handle.
 
 pub mod git;
+pub mod github;
 pub mod linear;

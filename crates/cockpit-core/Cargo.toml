@@ -12,6 +12,7 @@ git2.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

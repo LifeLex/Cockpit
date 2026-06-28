@@ -15,6 +15,7 @@ pub mod adapters;
 pub mod dag;
 pub mod gate;
 pub mod prompt;
+pub mod store;
 
 pub mod hook_server;
 

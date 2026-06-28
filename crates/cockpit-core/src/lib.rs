@@ -12,10 +12,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod model;
 
 pub mod adapters;
+pub mod gate;
 pub mod prompt;
 
 // Modules land here as the plan progresses:
-//   pub mod gate;        // T0.3 — the Gated trait + state machine
 //   pub mod hook_server; // T1.3 — axum Stop-hook listener
 
 #[cfg(test)]

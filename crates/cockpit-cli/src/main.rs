@@ -20,6 +20,7 @@ use cockpit_core::model::{
 };
 use cockpit_core::plan_parser;
 use cockpit_core::prompt::{self, ReworkInput};
+use cockpit_core::restack;
 use cockpit_core::store::{self, PlanStore, ReviewStore};
 
 // ---------------------------------------------------------------------------
@@ -64,6 +65,11 @@ enum Command {
     Plan {
         #[command(subcommand)]
         action: PlanAction,
+    },
+    /// Restack a stale PR onto its parent's new head.
+    Restack {
+        /// PR number to restack.
+        pr: u64,
     },
 }
 
@@ -127,6 +133,7 @@ async fn main() -> Result<()> {
         Command::RequestChanges { pr } => run_request_changes(pr).await,
         Command::Start { port } => run_start(port).await,
         Command::Plan { action } => run_plan(action).await,
+        Command::Restack { pr } => run_restack(pr).await,
     }
 }
 
@@ -679,6 +686,77 @@ async fn run_plan_approve() -> Result<()> {
     store::save_plan_to_file(&updated_store, state_path).context("failed to save plan state")?;
 
     println!("Plan approved -- ready for batch implementation");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `cockpit restack <pr>`
+// ---------------------------------------------------------------------------
+
+/// Restack a stale PR onto its parent's new head, spawning the
+/// conflict-resolver agent if the rebase has conflicts.
+async fn run_restack(pr_num: u64) -> Result<()> {
+    let pr_ref = PrRef::new(format!("owner/repo#{pr_num}"));
+
+    // Load state from file.
+    let state_path = Path::new(store::STATE_FILE);
+    let store = store::load_from_file(state_path).context("failed to load state file")?;
+
+    // Look up the review.
+    let mut review = store
+        .get(&pr_ref)
+        .ok_or_else(|| anyhow::anyhow!("no review found for PR #{pr_num}"))?;
+
+    if !review.stale {
+        bail!("PR #{pr_num} is not stale; nothing to restack");
+    }
+
+    // Determine parent branch from the review's `base` field.
+    let parent_branch = review.base.clone();
+    let worktree_path = review.worktree.clone();
+
+    // Open the repo (current directory).
+    let repo = git2::Repository::discover(".").context("not inside a git repository")?;
+
+    let session_map = SessionMap::new();
+    let hook_url = "http://127.0.0.1:19876/hook/stop";
+    let config = SpawnConfig::default();
+
+    let outcome = restack::restack_or_resolve(
+        &repo,
+        &mut review,
+        &parent_branch,
+        &worktree_path,
+        &session_map,
+        hook_url,
+        &config,
+    )
+    .await
+    .context("restack failed")?;
+
+    match outcome {
+        restack::Outcome::Clean => {
+            println!("PR #{pr_num} restacked cleanly onto {parent_branch}");
+            println!("Stale flag cleared");
+        }
+        restack::Outcome::ConflictDispatched => {
+            let agent = review.agent.as_ref().expect(
+                // INVARIANT: ConflictDispatched always sets review.agent.
+                "agent must be set after ConflictDispatched",
+            );
+            println!("PR #{pr_num} has conflicts restacking onto {parent_branch}");
+            println!("Conflict-resolver agent spawned (PID: {})", agent.pid);
+        }
+    }
+
+    // Persist the updated review.
+    store.update(&pr_ref, |r| {
+        r.base_sha = review.base_sha.clone();
+        r.stale = review.stale;
+        r.agent = review.agent.clone();
+    });
+    store::save_to_file(&store, state_path).context("failed to save state file")?;
 
     Ok(())
 }

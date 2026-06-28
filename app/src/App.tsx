@@ -4,6 +4,7 @@ import { useAppStore } from "./store";
 import { ReviewCard } from "./components/ReviewCard";
 import { DiffView } from "./components/DiffView";
 import { PlanView } from "./components/PlanView";
+import { StackView } from "./components/StackView";
 
 function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
@@ -25,6 +26,7 @@ function App() {
   const navigateToDiff = useAppStore((s) => s.navigateToDiff);
   const navigateToPlan = useAppStore((s) => s.navigateToPlan);
   const navigateToFrontier = useAppStore((s) => s.navigateToFrontier);
+  const navigateToStacks = useAppStore((s) => s.navigateToStacks);
   const addComment = useAppStore((s) => s.addComment);
   const requestChanges = useAppStore((s) => s.requestChanges);
   const refreshActiveReview = useAppStore((s) => s.refreshActiveReview);
@@ -59,64 +61,91 @@ function App() {
     [navigateToDiff],
   );
 
+  /** Style for the active tab in the navigation bar. */
+  const activeTabStyle = (color: string) =>
+    ({
+      padding: "8px 20px",
+      cursor: "pointer",
+      border: "1px solid #444",
+      borderBottom: `2px solid ${color}`,
+      backgroundColor: "#1e1e1e",
+      color,
+      fontWeight: "bold",
+      borderRadius: "4px 4px 0 0",
+    }) as const;
+
+  /** Style for an inactive tab in the navigation bar. */
+  const inactiveTabStyle = {
+    padding: "8px 20px",
+    cursor: "pointer",
+    border: "1px solid #444",
+    borderBottom: "none",
+    backgroundColor: "transparent",
+    color: "#888",
+    fontWeight: "normal",
+    borderRadius: "4px 4px 0 0",
+  } as const;
+
+  /** Render the tab navigation bar with the given active tab highlighted. */
+  const renderNav = (active: "frontier" | "plan" | "stacks") => (
+    <nav
+      style={{
+        display: "flex",
+        gap: 0,
+        marginBottom: 24,
+        borderBottom: "1px solid #444",
+      }}
+    >
+      <button
+        onClick={active !== "frontier" ? navigateToFrontier : undefined}
+        style={
+          active === "frontier" ? activeTabStyle("#2196F3") : inactiveTabStyle
+        }
+      >
+        Reviews ({reviews.length})
+      </button>
+      <button
+        onClick={active !== "plan" ? navigateToPlan : undefined}
+        style={
+          active === "plan" ? activeTabStyle("#9C27B0") : inactiveTabStyle
+        }
+      >
+        Plan {plan != null ? "(loaded)" : ""}
+      </button>
+      <button
+        onClick={active !== "stacks" ? navigateToStacks : undefined}
+        style={
+          active === "stacks" ? activeTabStyle("#009688") : inactiveTabStyle
+        }
+      >
+        Stacks
+      </button>
+    </nav>
+  );
+
+  /** Error banner shown when an error is present. */
+  const errorBanner =
+    error != null ? (
+      <div
+        style={{
+          color: "#f44336",
+          padding: 12,
+          marginBottom: 16,
+          border: "1px solid #f44336",
+          borderRadius: 4,
+        }}
+      >
+        {error}
+      </div>
+    ) : null;
+
   switch (view.kind) {
     case "frontier":
       return (
         <main style={{ padding: 24, maxWidth: 900, margin: "0 auto" }}>
           <h1 style={{ marginBottom: 16 }}>Cockpit</h1>
-
-          <nav
-            style={{
-              display: "flex",
-              gap: 0,
-              marginBottom: 24,
-              borderBottom: "1px solid #444",
-            }}
-          >
-            <button
-              style={{
-                padding: "8px 20px",
-                cursor: "pointer",
-                border: "1px solid #444",
-                borderBottom: "2px solid #2196F3",
-                backgroundColor: "#1e1e1e",
-                color: "#2196F3",
-                fontWeight: "bold",
-                borderRadius: "4px 4px 0 0",
-              }}
-            >
-              Reviews ({reviews.length})
-            </button>
-            <button
-              onClick={navigateToPlan}
-              style={{
-                padding: "8px 20px",
-                cursor: "pointer",
-                border: "1px solid #444",
-                borderBottom: "none",
-                backgroundColor: "transparent",
-                color: "#888",
-                fontWeight: "normal",
-                borderRadius: "4px 4px 0 0",
-              }}
-            >
-              Plan {plan != null ? "(loaded)" : ""}
-            </button>
-          </nav>
-
-          {error != null && (
-            <div
-              style={{
-                color: "#f44336",
-                padding: 12,
-                marginBottom: 16,
-                border: "1px solid #f44336",
-                borderRadius: 4,
-              }}
-            >
-              {error}
-            </div>
-          )}
+          {renderNav("frontier")}
+          {errorBanner}
 
           <section>
             <h2>Frontier ({frontier.length})</h2>
@@ -187,59 +216,8 @@ function App() {
       return (
         <main style={{ padding: 24, maxWidth: 900, margin: "0 auto" }}>
           <h1 style={{ marginBottom: 16 }}>Cockpit</h1>
-
-          <nav
-            style={{
-              display: "flex",
-              gap: 0,
-              marginBottom: 24,
-              borderBottom: "1px solid #444",
-            }}
-          >
-            <button
-              onClick={navigateToFrontier}
-              style={{
-                padding: "8px 20px",
-                cursor: "pointer",
-                border: "1px solid #444",
-                borderBottom: "none",
-                backgroundColor: "transparent",
-                color: "#888",
-                fontWeight: "normal",
-                borderRadius: "4px 4px 0 0",
-              }}
-            >
-              Reviews ({reviews.length})
-            </button>
-            <button
-              style={{
-                padding: "8px 20px",
-                cursor: "pointer",
-                border: "1px solid #444",
-                borderBottom: "2px solid #9C27B0",
-                backgroundColor: "#1e1e1e",
-                color: "#9C27B0",
-                fontWeight: "bold",
-                borderRadius: "4px 4px 0 0",
-              }}
-            >
-              Plan {plan != null ? "(loaded)" : ""}
-            </button>
-          </nav>
-
-          {error != null && (
-            <div
-              style={{
-                color: "#f44336",
-                padding: 12,
-                marginBottom: 16,
-                border: "1px solid #f44336",
-                borderRadius: 4,
-              }}
-            >
-              {error}
-            </div>
-          )}
+          {renderNav("plan")}
+          {errorBanner}
 
           {plan != null ? (
             <PlanView
@@ -266,6 +244,24 @@ function App() {
               </p>
             </div>
           )}
+        </main>
+      );
+
+    case "stacks":
+      return (
+        <main style={{ padding: 24, maxWidth: 900, margin: "0 auto" }}>
+          <h1 style={{ marginBottom: 16 }}>Cockpit</h1>
+          {renderNav("stacks")}
+          {errorBanner}
+
+          <section>
+            <h2>Stack Dependencies</h2>
+            <p style={{ color: "#888", fontSize: 14, marginBottom: 16 }}>
+              Review dependency graph — click a node to view its diff
+            </p>
+            {loading && <p>Loading...</p>}
+            <StackView reviews={reviews} onViewDiff={handleViewDiff} />
+          </section>
         </main>
       );
 

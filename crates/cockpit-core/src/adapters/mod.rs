@@ -3,4 +3,5 @@
 //! Each adapter has its own typed error enum. Adapters are stateless
 //! functions; the caller (the loop, the CLI) owns the `Repository` handle.
 
+pub mod agent;
 pub mod git;

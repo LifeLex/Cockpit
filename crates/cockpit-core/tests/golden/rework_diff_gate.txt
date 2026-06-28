@@ -1,0 +1,29 @@
+## Intent
+
+Implement the widget system for the dashboard
+
+## Approved Plan
+
+# Widget Plan
+
+1. Define widget trait
+2. Add button widget
+
+## Current Artifact
+
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,6 +10,8 @@
++fn new_function() {}
+
+## Comments
+
+1. [src/main.rs:10-15] This function needs error handling
+
+2. [src/lib.rs:42-42] Missing doc comment on public method
+
+## Scope Guard
+
+Address only the comments above. Don't refactor unrelated code. Don't weaken or delete tests. If a comment is wrong or impossible, stop and say so.
+

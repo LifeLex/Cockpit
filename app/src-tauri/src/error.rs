@@ -53,6 +53,14 @@ impl From<cockpit_core::plan_parser::Error> for CommandError {
     }
 }
 
+impl From<cockpit_core::adapters::github::Error> for CommandError {
+    fn from(e: cockpit_core::adapters::github::Error) -> Self {
+        Self {
+            message: e.to_string(),
+        }
+    }
+}
+
 impl From<std::io::Error> for CommandError {
     fn from(e: std::io::Error) -> Self {
         Self {

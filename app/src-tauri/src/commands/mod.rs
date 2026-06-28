@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tauri::State;
 
+use cockpit_core::adapters::github::{self, MirrorResult};
 use cockpit_core::gate::Gated;
 use cockpit_core::model::{
     Anchor, Comment, CommentId, CommentOrigin, DiffData, GateState, PlanDoc, PrRef, ProjectPlan,
@@ -152,6 +153,35 @@ pub fn request_changes(
     state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
         message: format!("Review not found: {pr}"),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Comment mirroring
+// ---------------------------------------------------------------------------
+
+/// Mirror local comments for a review to GitHub.
+///
+/// Only mirrors comments with [`CommentOrigin::Local`] origin to avoid
+/// duplicating comments that came from GitHub. This is an explicit user
+/// action (Invariant 5: mirroring comments to a public GitHub thread
+/// never happens automatically).
+#[tauri::command]
+pub async fn mirror_comments(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+) -> Result<MirrorResult, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    let result = github::mirror_comments(&pr_ref, &review.comments)
+        .await
+        .map_err(|e| CommandError {
+            message: e.to_string(),
+        })?;
+
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

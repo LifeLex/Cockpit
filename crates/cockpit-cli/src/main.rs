@@ -71,6 +71,18 @@ enum Command {
         /// PR number to restack.
         pr: u64,
     },
+    /// Kick off a Linear project: fetch issues, optionally plan, then spawn
+    /// implementer agents for each frontier issue.
+    Kickoff {
+        /// Linear project ID.
+        project_id: String,
+        /// Skip the plan gate and go directly to batch implementation.
+        #[arg(long)]
+        skip_plan: bool,
+        /// Hook server port for agent completion callbacks.
+        #[arg(long, default_value = "19876")]
+        port: u16,
+    },
 }
 
 /// Subcommands for the `comment` verb.
@@ -134,6 +146,11 @@ async fn main() -> Result<()> {
         Command::Start { port } => run_start(port).await,
         Command::Plan { action } => run_plan(action).await,
         Command::Restack { pr } => run_restack(pr).await,
+        Command::Kickoff {
+            project_id,
+            skip_plan,
+            port,
+        } => run_kickoff(&project_id, skip_plan, port).await,
     }
 }
 
@@ -757,6 +774,173 @@ async fn run_restack(pr_num: u64) -> Result<()> {
         r.agent = review.agent.clone();
     });
     store::save_to_file(&store, state_path).context("failed to save state file")?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `cockpit kickoff <project-id>`
+// ---------------------------------------------------------------------------
+
+/// Kick off a Linear project: fetch issues, optionally run the plan gate,
+/// then spawn implementer agents for each frontier issue.
+async fn run_kickoff(project_id: &str, skip_plan: bool, port: u16) -> Result<()> {
+    let api_key = env::var("LINEAR_API_KEY").context(
+        "LINEAR_API_KEY env var is required.\n\
+         Set it to your Linear personal API key:\n  \
+         export LINEAR_API_KEY=lin_api_...",
+    )?;
+
+    let project = ProjectRef::new(project_id);
+    let client = reqwest::Client::new();
+
+    // 1. Fetch issues and compute the frontier.
+    println!("Fetching issues from Linear...");
+    let (data, frontier) =
+        cockpit_core::kickoff::fetch_and_compute_frontier(&client, &api_key, &project)
+            .await
+            .context("failed to fetch project issues from Linear")?;
+
+    println!("Project: {project}");
+    println!("Issues:  {}", data.issues.len());
+    println!("Frontier: {} issues ready", frontier.len());
+
+    if frontier.is_empty() {
+        bail!("no frontier issues found — all issues have unmet dependencies");
+    }
+
+    for issue in &frontier {
+        print_issue_detail(issue, &data);
+    }
+
+    // 2. Build the DAG for parent/child wiring.
+    let issue_dag = linear::build_issue_dag(&data);
+
+    // 3. Handle the plan gate.
+    if skip_plan {
+        println!();
+        println!("Plan gate: skipped (--skip-plan)");
+    } else {
+        println!();
+        println!("Plan gate: creating project plan...");
+
+        // Create a plan in Pending state. The user must approve it
+        // via `cockpit plan approve` before the batch is built
+        // (Invariant 5: side effects require explicit confirmation).
+        let plan = ProjectPlan {
+            project: project.clone(),
+            doc: cockpit_core::model::PlanDoc {
+                summary: format!("Plan for project {project}"),
+                steps: vec![],
+                files: vec![],
+                risks: vec![],
+                raw: String::new(),
+            },
+            gate_state: GateState::Pending,
+            comments: vec![],
+            agent: None,
+        };
+
+        let plan_store = cockpit_core::store::PlanStore::new();
+        plan_store.set(plan);
+
+        let plan_path = Path::new(cockpit_core::store::PLAN_STATE_FILE);
+        cockpit_core::store::save_plan_to_file(&plan_store, plan_path)
+            .context("failed to save plan state")?;
+
+        println!("Plan created in Pending state.");
+        println!("Review the plan with: cockpit plan show");
+        println!("Approve with:         cockpit plan approve");
+        println!();
+        println!("After plan approval, re-run: cockpit kickoff {project_id} --skip-plan");
+        return Ok(());
+    }
+
+    // 4. Build reviews for frontier issues.
+    let worktree_base = PathBuf::from(".cockpit/worktrees");
+    let reviews = cockpit_core::kickoff::build_reviews_for_frontier(
+        &frontier,
+        &data,
+        &issue_dag,
+        &worktree_base,
+        "main",
+    );
+
+    println!();
+    println!("Reviews to create: {}", reviews.len());
+    for review in &reviews {
+        let parent_info = if review.parents.is_empty() {
+            String::from("base: main")
+        } else {
+            format!("base: {} (stacked)", review.base)
+        };
+        println!("  {} -> {} [{}]", review.issue, review.branch, parent_info);
+    }
+
+    // 5. Save reviews to the store.
+    let state_path = Path::new(cockpit_core::store::STATE_FILE);
+    let store =
+        cockpit_core::store::load_from_file(state_path).context("failed to load state file")?;
+
+    for review in &reviews {
+        store.insert(review.clone());
+    }
+
+    cockpit_core::store::save_to_file(&store, state_path).context("failed to save state file")?;
+
+    println!();
+    println!("State saved to: {}", state_path.display());
+
+    // 6. Create worktrees and spawn agents.
+    let repo = git2::Repository::discover(".").context("not inside a git repository")?;
+    let session_map = cockpit_core::adapters::agent::SessionMap::new();
+    let spawn_config = cockpit_core::adapters::agent::SpawnConfig::default();
+    let hook_url = format!("http://127.0.0.1:{port}/hook/stop");
+
+    let kickoff_config = cockpit_core::kickoff::KickoffConfig {
+        http_client: &client,
+        api_key: &api_key,
+        worktree_base: &worktree_base,
+        repo: &repo,
+        session_map: &session_map,
+        hook_url: &hook_url,
+        spawn_config: &spawn_config,
+    };
+
+    println!();
+    println!("Creating worktrees and spawning implementer agents...");
+
+    let mut mutable_reviews = reviews;
+    cockpit_core::kickoff::spawn_batch(&mut mutable_reviews, &kickoff_config, &project)
+        .await
+        .context("failed to spawn batch")?;
+
+    // 7. Update store with agent runs.
+    for review in &mutable_reviews {
+        store.update(&review.pr, |r| {
+            r.base_sha = review.base_sha.clone();
+            r.agent = review.agent.clone();
+        });
+    }
+
+    cockpit_core::store::save_to_file(&store, state_path)
+        .context("failed to save state file after spawning agents")?;
+
+    println!();
+    println!("Batch kickoff complete!");
+    println!("Reviews created: {}", mutable_reviews.len());
+    for review in &mutable_reviews {
+        if let Some(agent) = &review.agent {
+            println!(
+                "  {} -> PID {} ({})",
+                review.issue, agent.pid, review.branch
+            );
+        }
+    }
+
+    println!();
+    println!("Hook server: http://127.0.0.1:{port}/hook/stop");
+    println!("Start the hook server with: cockpit start --port {port}");
 
     Ok(())
 }

@@ -44,3 +44,19 @@ impl From<cockpit_core::adapters::agent::Error> for CommandError {
         }
     }
 }
+
+impl From<cockpit_core::plan_parser::Error> for CommandError {
+    fn from(e: cockpit_core::plan_parser::Error) -> Self {
+        Self {
+            message: e.to_string(),
+        }
+    }
+}
+
+impl From<std::io::Error> for CommandError {
+    fn from(e: std::io::Error) -> Self {
+        Self {
+            message: e.to_string(),
+        }
+    }
+}

@@ -6,7 +6,7 @@ use tokio::sync::broadcast;
 
 use cockpit_core::adapters::agent::SessionMap;
 use cockpit_core::hook_server::CompletionEvent;
-use cockpit_core::store::ReviewStore;
+use cockpit_core::store::{PlanStore, ReviewStore};
 
 /// Holds core handles shared across the Tauri app.
 ///
@@ -15,6 +15,8 @@ use cockpit_core::store::ReviewStore;
 pub struct AppState {
     /// In-memory store of active reviews.
     pub reviews: ReviewStore,
+    /// In-memory store for the optional project plan.
+    pub plan: PlanStore,
     /// Maps agent session IDs to their reviewed objects.
     ///
     /// Used by the hook server and agent dispatch in later phases.
@@ -33,6 +35,7 @@ impl AppState {
     pub fn new_with_completion_tx(completion_tx: broadcast::Sender<CompletionEvent>) -> Self {
         Self {
             reviews: ReviewStore::new(),
+            plan: PlanStore::new(),
             sessions: SessionMap::new(),
             completion_tx,
         }

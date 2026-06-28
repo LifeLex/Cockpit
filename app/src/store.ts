@@ -2,20 +2,24 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type { Review } from "./bindings/Review";
 import type { DiffData } from "./bindings/DiffData";
+import type { ProjectPlan } from "./bindings/ProjectPlan";
 
 /**
  * Navigation state discriminated union.
  *
- * The app is either showing the frontier list or reviewing a specific PR's diff.
- * Using a tagged union (not optional fields) makes exhaustive switching possible.
+ * The app is either showing the frontier list, reviewing a specific PR's diff,
+ * or viewing the project plan. Using a tagged union (not optional fields)
+ * makes exhaustive switching possible.
  */
 type ViewState =
   | { readonly kind: "frontier" }
-  | { readonly kind: "diff"; readonly pr: string };
+  | { readonly kind: "diff"; readonly pr: string }
+  | { readonly kind: "plan" };
 
 interface AppStore {
   readonly reviews: readonly Review[];
   readonly frontier: readonly Review[];
+  readonly plan: ProjectPlan | null;
   readonly loading: boolean;
   readonly error: string | null;
 
@@ -35,6 +39,9 @@ interface AppStore {
   /** Navigate to the diff view for a specific PR. */
   navigateToDiff: (pr: string) => Promise<void>;
 
+  /** Navigate to the plan view. */
+  navigateToPlan: () => void;
+
   /** Navigate back to the frontier list. */
   navigateToFrontier: () => void;
 
@@ -51,11 +58,19 @@ interface AppStore {
 
   /** Refresh the active review to pick up state changes. */
   refreshActiveReview: () => Promise<void>;
+
+  fetchPlan: () => Promise<void>;
+  loadPlan: (file: string, project: string) => Promise<void>;
+  addPlanComment: (anchor: string, body: string) => Promise<void>;
+  requestPlanChanges: () => Promise<void>;
+  approvePlan: () => Promise<void>;
+  openPlan: () => Promise<void>;
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
   reviews: [],
   frontier: [],
+  plan: null,
   loading: false,
   error: null,
   view: { kind: "frontier" },
@@ -84,7 +99,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
   openReview: async (pr: string) => {
     try {
       await invoke("open_review", { pr });
-      // Refresh after mutation.
       const reviews = await invoke<Review[]>("list_reviews");
       const frontier = await invoke<Review[]>("get_frontier");
       set({ reviews, frontier });
@@ -96,7 +110,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
   navigateToDiff: async (pr: string) => {
     set({ loading: true, error: null });
     try {
-      // Open the review (transitions Pending/Reworked -> InReview)
       const review = await invoke<Review>("open_review", { pr });
       const diff = await invoke<DiffData>("get_review_diff", { pr });
       set({
@@ -110,13 +123,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
+  navigateToPlan: () => {
+    set({ view: { kind: "plan" } });
+    void get().fetchPlan();
+  },
+
   navigateToFrontier: () => {
     set({
       view: { kind: "frontier" },
       activeReview: null,
       activeDiff: null,
     });
-    // Refresh lists after returning from a diff view.
     void get().fetchReviews();
     void get().fetchFrontier();
   },
@@ -166,6 +183,64 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const review = await invoke<Review>("get_review", { pr: view.pr });
       const diff = await invoke<DiffData>("get_review_diff", { pr: view.pr });
       set({ activeReview: review, activeDiff: diff });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  fetchPlan: async () => {
+    try {
+      const plan = await invoke<ProjectPlan | null>("get_plan");
+      set({ plan });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  loadPlan: async (file: string, project: string) => {
+    set({ loading: true, error: null });
+    try {
+      const plan = await invoke<ProjectPlan>("load_plan", { file, project });
+      set({ plan, loading: false });
+    } catch (e: unknown) {
+      set({ error: String(e), loading: false });
+    }
+  },
+
+  addPlanComment: async (anchor: string, body: string) => {
+    try {
+      const plan = await invoke<ProjectPlan>("add_plan_comment", {
+        anchor,
+        body,
+      });
+      set({ plan });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  requestPlanChanges: async () => {
+    try {
+      const plan = await invoke<ProjectPlan>("plan_request_changes");
+      set({ plan });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  approvePlan: async () => {
+    try {
+      const plan = await invoke<ProjectPlan>("plan_approve");
+      set({ plan });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  openPlan: async () => {
+    try {
+      const plan = await invoke<ProjectPlan>("plan_open");
+      set({ plan });
     } catch (e: unknown) {
       set({ error: String(e) });
     }

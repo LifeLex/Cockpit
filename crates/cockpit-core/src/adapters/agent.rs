@@ -104,6 +104,18 @@ impl SessionMap {
         let map = self.inner.lock().expect("session map lock poisoned");
         map.get(session_id).cloned()
     }
+
+    /// Find the session ID for a given reviewed object.
+    ///
+    /// Returns `None` if no session is registered for that object.
+    /// If multiple sessions exist for the same object (shouldn't happen in
+    /// normal operation), returns an arbitrary one.
+    pub fn find_by_object(&self, object_id: &str) -> Option<String> {
+        let map = self.inner.lock().expect("session map lock poisoned");
+        map.iter()
+            .find(|(_, entry)| entry.object_id == object_id)
+            .map(|(session_id, _)| session_id.clone())
+    }
 }
 
 impl Default for SessionMap {

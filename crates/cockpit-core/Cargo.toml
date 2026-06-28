@@ -20,3 +20,5 @@ axum.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 http.workspace = true
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["net"] }

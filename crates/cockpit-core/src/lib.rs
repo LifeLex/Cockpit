@@ -9,8 +9,9 @@
 /// Crate version, surfaced for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod model;
+
 // Modules land here as the plan progresses:
-//   pub mod model;       // T0.2 — domain types + newtypes
 //   pub mod gate;        // T0.3 — the Gated trait + state machine
 //   pub mod adapters;    // T0.4–T0.6 — linear, github, git, agent
 //   pub mod prompt;      // T1.1 — deterministic prompt assembly

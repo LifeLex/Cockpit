@@ -49,6 +49,9 @@ pub fn run() {
             commands::get_frontier,
             commands::get_review,
             commands::open_review,
+            commands::get_review_diff,
+            commands::add_comment,
+            commands::request_changes,
         ])
         .run(tauri::generate_context!())
         // INVARIANT: if Tauri fails to start there is nothing to recover —

@@ -4,6 +4,7 @@ import type { GateState } from "../bindings/GateState";
 interface ReviewCardProps {
   readonly review: Review;
   readonly onOpen?: (pr: string) => void;
+  readonly onViewDiff?: (pr: string) => void;
 }
 
 function assertNever(x: never): never {
@@ -44,7 +45,7 @@ function gateStateColor(state: GateState): string {
   }
 }
 
-export function ReviewCard({ review, onOpen }: ReviewCardProps) {
+export function ReviewCard({ review, onOpen, onViewDiff }: ReviewCardProps) {
   const canOpen =
     review.gate_state === "Pending" || review.gate_state === "Reworked";
 
@@ -109,6 +110,16 @@ export function ReviewCard({ review, onOpen }: ReviewCardProps) {
             style={{ marginLeft: 8, cursor: "pointer" }}
           >
             Open for Review
+          </button>
+        )}
+        {onViewDiff != null && (
+          <button
+            onClick={() => {
+              onViewDiff(review.pr);
+            }}
+            style={{ marginLeft: 8, cursor: "pointer" }}
+          >
+            View Diff
           </button>
         )}
       </div>

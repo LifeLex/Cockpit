@@ -16,8 +16,7 @@ pub mod dag;
 pub mod gate;
 pub mod prompt;
 
-// Modules land here as the plan progresses:
-//   pub mod hook_server; // T1.3 — axum Stop-hook listener
+pub mod hook_server;
 
 #[cfg(test)]
 mod tests {

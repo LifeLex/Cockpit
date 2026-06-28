@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cockpit-core", "crates/cockpit-cli"]
+members = ["crates/cockpit-core", "crates/cockpit-cli", "app/src-tauri"]
 
 [workspace.package]
 edition = "2024"
@@ -22,3 +22,6 @@ clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 tower = "0.5"
 http = "1"
+tauri = "2"
+tauri-build = "2"
+ts-rs = { version = "10", features = ["serde-compat"] }

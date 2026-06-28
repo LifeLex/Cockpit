@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 // ---------------------------------------------------------------------------
 // Newtype IDs
@@ -21,7 +22,8 @@ macro_rules! newtype_id {
         $name:ident
     ) => {
         $(#[doc = $doc])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+        #[ts(export, export_to = "../../../app/src/bindings/")]
         pub struct $name(String);
 
         impl $name {
@@ -75,7 +77,8 @@ newtype_id! {
 
 /// The shared gate state that drives the review loop for both [`ProjectPlan`]
 /// and [`Review`]. See `SPEC.md` §7 for the transition table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub enum GateState {
     /// Awaiting first review.
     Pending,
@@ -90,7 +93,8 @@ pub enum GateState {
 }
 
 /// Which mode the spawned agent runs in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub enum AgentMode {
     /// Produce or revise the project plan.
     Plan,
@@ -103,7 +107,8 @@ pub enum AgentMode {
 }
 
 /// Where a comment originated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub enum CommentOrigin {
     /// Created locally inside cockpit.
     Local,
@@ -115,7 +120,8 @@ pub enum CommentOrigin {
 ///
 /// Anchors are ephemeral — they reference the *current* artifact version only
 /// and are cleared together with comments on `Reworked`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub enum Anchor {
     /// A step in the project plan, by zero-based index.
     PlanStep(usize),
@@ -134,7 +140,8 @@ pub enum Anchor {
 ///
 /// Using an enum makes illegal states unrepresentable: a reviewed object holds
 /// exactly one artifact kind, never both or neither.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub enum Artifact {
     /// A project plan document.
     Plan(PlanDoc),
@@ -147,7 +154,8 @@ pub enum Artifact {
 // ---------------------------------------------------------------------------
 
 /// A single step inside a project plan, used as a comment anchor target.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub struct PlanStep {
     /// Zero-based index in the plan's step list.
     pub index: usize,
@@ -158,7 +166,8 @@ pub struct PlanStep {
 }
 
 /// Parsed project-plan document. See `SPEC.md` §6.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub struct PlanDoc {
     /// One-line summary of the plan.
     pub summary: String,
@@ -176,16 +185,18 @@ pub struct PlanDoc {
 ///
 /// Will be fleshed out when the GitHub adapter (T0.5) and the diff-gate UI
 /// (T4.3) need real structure.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub struct DiffData {
     /// Raw unified-diff text.
     pub raw: String,
 }
 
-/// An ephemeral review comment. Lives for one review → rework cycle and is
+/// An ephemeral review comment. Lives for one review -> rework cycle and is
 /// cleared on `Reworked`. No `resolved` flag, no durable SHA anchoring
 /// (Invariant 4).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub struct Comment {
     /// Locally-unique comment identifier.
     pub id: CommentId,
@@ -198,7 +209,8 @@ pub struct Comment {
 }
 
 /// A running or completed agent process.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub struct AgentRun {
     /// OS process ID of the spawned agent.
     pub pid: u32,
@@ -208,6 +220,7 @@ pub struct AgentRun {
     ///
     /// `SystemTime` rather than `Instant` because it must be serializable and
     /// meaningful across process boundaries.
+    #[ts(type = "{ secs_since_epoch: number; nanos_since_epoch: number }")]
     pub started_at: SystemTime,
     /// Hash of the assembled prompt, for dedup / audit.
     pub prompt_hash: String,
@@ -218,7 +231,8 @@ pub struct AgentRun {
 /// The optional project-level plan, reviewed at the plan gate.
 ///
 /// One per project. When approved, triggers implementation of the full batch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub struct ProjectPlan {
     /// Which Linear project this plan belongs to.
     pub project: ProjectRef,
@@ -236,7 +250,8 @@ pub struct ProjectPlan {
 ///
 /// Reviews form a DAG via `parents` / `children`, mirroring the Linear issue
 /// dependency graph and the git branch stack.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub struct Review {
     /// Locally-unique review identifier.
     pub id: ReviewId,

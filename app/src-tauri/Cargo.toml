@@ -1,0 +1,15 @@
+[package]
+name = "cockpit-app"
+version = "0.0.0"
+edition.workspace = true
+
+[dependencies]
+tauri.workspace = true
+cockpit-core = { path = "../../crates/cockpit-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true

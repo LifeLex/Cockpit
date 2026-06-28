@@ -35,6 +35,13 @@ branch: string,
  */
 base: string, 
 /**
+ * OID of the base branch tip when this review was created or last restacked.
+ *
+ * Used as the fork point for `restack`: only commits after this OID belong
+ * to this review's branch. Updated after each successful restack.
+ */
+base_sha: string, 
+/**
  * Path to the git worktree on disk.
  */
 worktree: string, 

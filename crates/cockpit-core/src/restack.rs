@@ -5,13 +5,138 @@
 //! `Reworked`, each descendant is rebased onto the new base in dependency
 //! order. See `SPEC.md` §13.
 //!
+//! On rebase conflict, the conflict-resolver agent (`AgentMode::Restack`) is
+//! spawned to resolve it. See `SPEC.md` §10.
+//!
 //! The git-level cherry-pick lives in `adapters::git::restack`; this module
 //! provides the graph-level helpers that operate on `&mut [Review]`.
 
+use std::path::Path;
+
 use git2::{Oid, Repository};
 
-use crate::adapters::git;
-use crate::model::{Review, ReviewId};
+use crate::adapters::{agent, git};
+use crate::model::{AgentMode, Artifact, Review, ReviewId};
+use crate::prompt::{self, AssembledPrompt, ReworkInput};
+
+// ---------------------------------------------------------------------------
+// Error
+// ---------------------------------------------------------------------------
+
+/// Errors from restack operations.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Underlying git operation failed.
+    #[error(transparent)]
+    Git(#[from] git::Error),
+
+    /// Agent spawn or tracking failed.
+    #[error(transparent)]
+    Agent(#[from] agent::Error),
+
+    /// The review is not stale; restack is unnecessary.
+    #[error("review {0} is not stale")]
+    NotStale(ReviewId),
+}
+
+// ---------------------------------------------------------------------------
+// Outcome
+// ---------------------------------------------------------------------------
+
+/// Outcome of a restack attempt via [`restack_or_resolve`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Rebase completed cleanly; stale flag cleared.
+    Clean,
+    /// Rebase had conflicts; conflict-resolver agent dispatched.
+    ConflictDispatched,
+}
+
+// ---------------------------------------------------------------------------
+// Conflict-resolver prompt
+// ---------------------------------------------------------------------------
+
+/// Assemble a conflict-resolution prompt for a stale review.
+///
+/// The prompt tells the agent which branches conflicted and asks it
+/// to resolve the rebase conflicts in the worktree.
+pub fn assemble_conflict_prompt(review: &Review, parent_branch: &str) -> AssembledPrompt {
+    let input = ReworkInput {
+        intent: &format!(
+            "Resolve rebase conflicts: branch '{}' needs to be rebased onto '{}'.",
+            review.branch, parent_branch
+        ),
+        approved_plan: None,
+        artifact: &Artifact::Diff(review.diff.clone()),
+        comments: &[], // no comments for conflict resolution
+    };
+    prompt::assemble_rework(&input)
+}
+
+// ---------------------------------------------------------------------------
+// Restack-or-resolve
+// ---------------------------------------------------------------------------
+
+/// Attempt to restack a review, spawning the conflict-resolver on failure.
+///
+/// If the review is not stale, returns [`Error::NotStale`].
+///
+/// On a clean rebase, clears the stale flag and updates `base_sha`.
+/// On conflict, assembles a conflict-resolution prompt and spawns the
+/// conflict-resolver agent (`AgentMode::Restack`).
+///
+/// The `worktree_path` is the directory where the agent will run (typically
+/// the review's worktree). It is passed separately because the caller
+/// may have a real worktree on disk even though the review's `.worktree`
+/// field could be a placeholder in tests.
+pub async fn restack_or_resolve(
+    repo: &Repository,
+    review: &mut Review,
+    parent_branch: &str,
+    worktree_path: &Path,
+    session_map: &agent::SessionMap,
+    hook_url: &str,
+    spawn_config: &agent::SpawnConfig,
+) -> Result<Outcome, Error> {
+    if !review.stale {
+        return Err(Error::NotStale(review.id.clone()));
+    }
+
+    // 1. Try git restack.
+    let fork_point = Oid::from_str(&review.base_sha).ok();
+    let clean = git::restack(repo, &review.branch, parent_branch, fork_point)?;
+
+    if clean {
+        // Update base_sha to the current tip of the parent branch.
+        let base = repo
+            .find_branch(parent_branch, git2::BranchType::Local)
+            .map_err(|_| git::Error::BranchNotFound(parent_branch.to_string()))?;
+        let base_tip = base.get().peel_to_commit().map_err(git::Error::from)?;
+        review.base_sha = base_tip.id().to_string();
+        review.clear_stale();
+        return Ok(Outcome::Clean);
+    }
+
+    // 2. On conflict, assemble prompt and spawn conflict-resolver.
+    let prompt = assemble_conflict_prompt(review, parent_branch);
+    let agent_run = agent::spawn_agent(
+        worktree_path,
+        &prompt,
+        AgentMode::Restack,
+        review.id.as_str(),
+        session_map,
+        hook_url,
+        spawn_config,
+    )
+    .await?;
+
+    review.agent = Some(agent_run);
+    Ok(Outcome::ConflictDispatched)
+}
+
+// ---------------------------------------------------------------------------
+// Graph helpers
+// ---------------------------------------------------------------------------
 
 /// Mark all descendants of a review as stale.
 ///
@@ -49,6 +174,9 @@ pub fn mark_descendants_stale(reviews: &mut [Review], parent_id: &ReviewId) {
 /// Returns `Ok(true)` if the rebase completed cleanly (clears `stale`),
 /// `Ok(false)` if there were conflicts (`stale` remains; the caller should
 /// dispatch the conflict-resolver agent).
+///
+/// For an async version that automatically spawns the conflict-resolver on
+/// conflict, see [`restack_or_resolve`].
 pub fn restack_review(
     repo: &Repository,
     review: &mut Review,
@@ -388,5 +516,212 @@ mod tests {
         let order = dependency_order(&reviews, &ReviewId::new("a"));
 
         assert!(order.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Conflict-resolver dispatch tests (T3.2)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn restack_clean_clears_stale_via_resolve() {
+        let (repo, dir) = scratch_repo();
+
+        // Create branch-a from main.
+        create_branch(&repo, "branch-a");
+        checkout(&repo, "branch-a");
+        commit_file(&repo, "a.txt", b"a content\n", "commit on a");
+
+        // Record fork point for branch-b.
+        let b_fork = branch_tip(&repo, "branch-a");
+
+        // Create branch-b from branch-a.
+        create_branch(&repo, "branch-b");
+        checkout(&repo, "branch-b");
+        commit_file(&repo, "b.txt", b"b content\n", "commit on b");
+
+        // Rework branch-a.
+        checkout(&repo, "branch-a");
+        commit_file(&repo, "a2.txt", b"a2\n", "rework on a");
+
+        // Create a stale review for branch-b.
+        let mut review = make_review("b", "branch-b", "branch-a", &["a"], &[]);
+        review.base_sha = b_fork.to_string();
+        review.mark_stale();
+
+        let session_map = agent::SessionMap::new();
+        let config = agent::SpawnConfig {
+            command: "echo".into(),
+            base_args: vec![],
+            tail_args: vec![],
+        };
+
+        let outcome = restack_or_resolve(
+            &repo,
+            &mut review,
+            "branch-a",
+            dir.path(),
+            &session_map,
+            "http://localhost:9999/hook/stop",
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Clean);
+        assert!(!review.stale, "stale should be cleared after clean restack");
+        assert!(
+            review.agent.is_none(),
+            "no agent should be spawned on clean restack"
+        );
+
+        // base_sha should be updated to the new branch-a tip.
+        let a_tip = branch_tip(&repo, "branch-a");
+        assert_eq!(review.base_sha, a_tip.to_string());
+    }
+
+    #[tokio::test]
+    async fn restack_conflict_dispatches_agent() {
+        let (repo, dir) = scratch_repo();
+
+        // branch-a modifies base.txt.
+        create_branch(&repo, "branch-a");
+        checkout(&repo, "branch-a");
+        commit_file(&repo, "base.txt", b"modified by a\n", "a modifies base");
+
+        // branch-b also modifies base.txt (from original main).
+        let b_fork = branch_tip(&repo, "main");
+        checkout(&repo, "main");
+        create_branch(&repo, "branch-b");
+        checkout(&repo, "branch-b");
+        commit_file(
+            &repo,
+            "base.txt",
+            b"modified by b (conflict)\n",
+            "b modifies base",
+        );
+
+        // Create a stale review.
+        let mut review = make_review("b", "branch-b", "branch-a", &["a"], &[]);
+        review.base_sha = b_fork.to_string();
+        review.worktree = dir.path().to_path_buf();
+        review.mark_stale();
+
+        let session_map = agent::SessionMap::new();
+        let config = agent::SpawnConfig {
+            command: "echo".into(),
+            base_args: vec![],
+            tail_args: vec![],
+        };
+
+        let outcome = restack_or_resolve(
+            &repo,
+            &mut review,
+            "branch-a",
+            dir.path(),
+            &session_map,
+            "http://localhost:9999/hook/stop",
+            &config,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::ConflictDispatched);
+        assert!(review.stale, "stale should remain on conflict");
+        assert!(
+            review.agent.is_some(),
+            "agent should be spawned on conflict"
+        );
+
+        let agent_run = review.agent.as_ref().unwrap();
+        assert_eq!(agent_run.mode, AgentMode::Restack);
+        assert!(agent_run.pid > 0);
+
+        // Verify session registered.
+        let entry = session_map
+            .find_by_object(review.id.as_str())
+            .expect("session should be registered for the review");
+        let session_entry = session_map.get(&entry).unwrap();
+        assert_eq!(session_entry.mode, AgentMode::Restack);
+    }
+
+    #[test]
+    fn conflict_prompt_assembly() {
+        let review = make_review("b", "branch-b", "branch-a", &["a"], &[]);
+
+        let prompt = assemble_conflict_prompt(&review, "branch-a");
+
+        assert!(
+            prompt.text.contains("branch-b"),
+            "prompt should mention the review's branch"
+        );
+        assert!(
+            prompt.text.contains("branch-a"),
+            "prompt should mention the parent branch"
+        );
+        assert!(
+            prompt.text.contains("Resolve rebase conflicts"),
+            "prompt should describe the conflict resolution intent"
+        );
+        // Scope guard from SPEC.md §9 must be present.
+        assert!(
+            prompt.text.contains("Don't weaken or delete tests"),
+            "prompt should contain the scope guard"
+        );
+        assert!(!prompt.hash.is_empty(), "prompt hash should be computed");
+        assert_eq!(
+            prompt.hash.len(),
+            64,
+            "SHA-256 hex digest should be 64 chars"
+        );
+    }
+
+    #[test]
+    fn outcome_derives() {
+        // Verify Debug, Clone, PartialEq, Eq derives work.
+        let a = Outcome::Clean;
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(format!("{a:?}"), "Clean");
+
+        let c = Outcome::ConflictDispatched;
+        let d = c.clone();
+        assert_eq!(c, d);
+        assert_ne!(a, c);
+    }
+
+    #[tokio::test]
+    async fn restack_not_stale_errors() {
+        let (repo, dir) = scratch_repo();
+
+        create_branch(&repo, "branch-a");
+        create_branch(&repo, "branch-b");
+
+        // Review is NOT stale.
+        let mut review = make_review("b", "branch-b", "branch-a", &["a"], &[]);
+        assert!(!review.stale);
+
+        let session_map = agent::SessionMap::new();
+        let config = agent::SpawnConfig {
+            command: "echo".into(),
+            base_args: vec![],
+            tail_args: vec![],
+        };
+
+        let err = restack_or_resolve(
+            &repo,
+            &mut review,
+            "branch-a",
+            dir.path(),
+            &session_map,
+            "http://localhost:9999/hook/stop",
+            &config,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, Error::NotStale(ref id) if id == &ReviewId::new("b")),
+            "expected NotStale error, got {err:?}"
+        );
     }
 }

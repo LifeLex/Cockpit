@@ -236,6 +236,7 @@ mod tests {
             pr: PrRef::new("owner/repo#1"),
             branch: "alejandro/test".into(),
             base: "main".into(),
+            base_sha: "000".into(),
             worktree: PathBuf::from("/tmp/wt"),
             gate_state: state,
             diff: DiffData { raw: String::new() },

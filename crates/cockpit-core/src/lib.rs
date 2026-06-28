@@ -16,6 +16,7 @@ pub mod dag;
 pub mod gate;
 pub mod plan_parser;
 pub mod prompt;
+pub mod restack;
 pub mod store;
 
 pub mod hook_server;

@@ -1,14 +1,14 @@
-//! Git adapter — worktree management via `git2`.
+//! Git adapter — worktree management and restack via `git2`.
 //!
-//! Provides `ensure_worktree`, `reconcile`, and `prune_worktree` for the
-//! review lifecycle. Restack is stubbed until Phase 3.
+//! Provides `ensure_worktree`, `reconcile`, `prune_worktree`, and `restack`
+//! for the review lifecycle.
 //!
 //! All operations are synchronous and short-lived. The caller can wrap in
 //! `spawn_blocking` if needed in an async context.
 
 use std::path::Path;
 
-use git2::{BranchType, Repository, WorktreeAddOptions, WorktreePruneOptions};
+use git2::{BranchType, Oid, Repository, WorktreeAddOptions, WorktreePruneOptions};
 
 /// Errors from git worktree operations.
 #[derive(Debug, thiserror::Error)]
@@ -25,15 +25,20 @@ pub enum Error {
     #[error("HEAD is detached in worktree at {0}")]
     DetachedHead(std::path::PathBuf),
 
-    /// Restack is not yet implemented (Phase 3).
-    #[error("restack is not yet implemented (Phase 3)")]
-    RestackNotImplemented,
-
     /// Rebase hit conflicts.
     #[error("rebase hit conflicts in {count} files")]
     RebaseConflict {
         /// Number of files with conflicts.
         count: usize,
+    },
+
+    /// No common ancestor found between the branch and its base.
+    #[error("no merge base found between `{branch}` and `{base}`")]
+    NoMergeBase {
+        /// The branch being restacked.
+        branch: String,
+        /// The target base branch.
+        base: String,
     },
 
     /// Underlying git2 error.
@@ -100,9 +105,183 @@ pub fn prune_worktree(repo: &Repository, worktree_name: &str) -> Result<(), Erro
     Ok(())
 }
 
-/// Restack a worktree onto a new base. **Not yet implemented (Phase 3).**
-pub fn restack(_repo: &Repository, _worktree_path: &Path, _new_base: &str) -> Result<(), Error> {
-    Err(Error::RestackNotImplemented)
+/// Rebase a branch onto a new base.
+///
+/// This is the core restack operation: after a parent branch is reworked,
+/// each descendant branch needs to be rebased onto the parent's new HEAD.
+///
+/// `fork_point` is the OID where the branch originally forked from its
+/// parent. Only commits after this point are replayed. If `None`, the
+/// merge-base between the branch and `new_base_branch` is used (correct
+/// for the first restack level, but callers doing chained restacks should
+/// pass the explicit fork point).
+///
+/// Uses `git rebase --onto`-style semantics:
+/// 1. Identify the fork point (the boundary between inherited and own commits).
+/// 2. Collect commits from fork_point..branch_tip (the branch's own commits).
+/// 3. Cherry-pick each commit (using proper 3-way merge with each commit's
+///    parent as the ancestor) onto the new base.
+/// 4. If any cherry-pick has conflicts, abort and return `Ok(false)`.
+/// 5. If all clean, move the branch ref and return `Ok(true)`.
+///
+/// The branch ref is only updated on success — on conflict it remains at its
+/// original position.
+pub fn restack(
+    repo: &Repository,
+    branch_name: &str,
+    new_base_branch: &str,
+    fork_point: Option<Oid>,
+) -> Result<bool, Error> {
+    let branch = repo
+        .find_branch(branch_name, BranchType::Local)
+        .map_err(|_| Error::BranchNotFound(branch_name.to_string()))?;
+    let branch_tip = branch.get().peel_to_commit()?;
+    let branch_tip_oid = branch_tip.id();
+
+    let base_branch = repo
+        .find_branch(new_base_branch, BranchType::Local)
+        .map_err(|_| Error::BranchNotFound(new_base_branch.to_string()))?;
+    let base_tip = base_branch.get().peel_to_commit()?;
+    let base_tip_oid = base_tip.id();
+
+    // Determine the fork point: either explicit or computed via merge-base.
+    let fork_oid = match fork_point {
+        Some(oid) => oid,
+        None => repo
+            .merge_base(branch_tip_oid, base_tip_oid)
+            .map_err(|_| Error::NoMergeBase {
+                branch: branch_name.to_string(),
+                base: new_base_branch.to_string(),
+            })?,
+    };
+
+    // If the branch is already based on (or at) the new base tip, nothing to do.
+    if fork_oid == base_tip_oid {
+        return Ok(true);
+    }
+
+    // Collect the branch's own commits (fork_point..branch_tip) in ancestor-first order.
+    let commits = collect_commits(repo, fork_oid, branch_tip_oid)?;
+
+    if commits.is_empty() {
+        // Branch has no unique commits — just move the ref to the new base.
+        let ref_name = format!("refs/heads/{branch_name}");
+        repo.reference(
+            &ref_name,
+            base_tip_oid,
+            true,
+            &format!("restack: fast-forward {branch_name} to {new_base_branch}"),
+        )?;
+        return Ok(true);
+    }
+
+    // Cherry-pick each commit onto the new base.
+    let result = cherry_pick_chain(repo, &commits, base_tip_oid)?;
+
+    match result {
+        CherryPickResult::Clean(new_tip_oid) => {
+            // Update the branch ref to point at the new tip.
+            let ref_name = format!("refs/heads/{branch_name}");
+            repo.reference(
+                &ref_name,
+                new_tip_oid,
+                true,
+                &format!("restack: rebase {branch_name} onto {new_base_branch}"),
+            )?;
+            Ok(true)
+        }
+        CherryPickResult::Conflict => {
+            // Branch ref is untouched — we never moved it. Nothing to roll back.
+            Ok(false)
+        }
+    }
+}
+
+/// Result of attempting to cherry-pick a chain of commits.
+enum CherryPickResult {
+    /// All commits applied cleanly; the OID is the new tip.
+    Clean(Oid),
+    /// At least one commit had conflicts.
+    Conflict,
+}
+
+/// Collect commits in the range `(base..tip]`, returned in ancestor-first order.
+///
+/// Walks from `tip` back to (but not including) `base`, then reverses.
+fn collect_commits(repo: &Repository, base: Oid, tip: Oid) -> Result<Vec<Oid>, Error> {
+    let mut commits = Vec::new();
+    let mut current = tip;
+
+    loop {
+        if current == base {
+            break;
+        }
+        commits.push(current);
+        let commit = repo.find_commit(current)?;
+        // Only follow first parent (linear history).
+        if commit.parent_count() == 0 {
+            break;
+        }
+        current = commit.parent_id(0)?;
+    }
+
+    commits.reverse();
+    Ok(commits)
+}
+
+/// Cherry-pick a sequence of commits onto `onto_oid`, without moving any branch ref.
+///
+/// Each cherry-pick is a proper 3-way merge: the commit's parent tree is the
+/// ancestor, the current state is "ours", and the commit's tree is "theirs".
+/// This correctly handles restacking through multiple levels because each
+/// commit's diff is computed relative to its own parent, not relative to
+/// some shared ancestor.
+///
+/// Returns the OID of the final commit if all picks were clean, or `Conflict`
+/// if any pick produced merge conflicts.
+fn cherry_pick_chain(
+    repo: &Repository,
+    commits: &[Oid],
+    onto_oid: Oid,
+) -> Result<CherryPickResult, Error> {
+    let mut current_oid = onto_oid;
+
+    for &commit_oid in commits {
+        let commit = repo.find_commit(commit_oid)?;
+        let current_commit = repo.find_commit(current_oid)?;
+
+        // Proper cherry-pick: 3-way merge using the commit's parent tree
+        // as the common ancestor. This isolates each commit's diff so it
+        // applies cleanly regardless of how the base was rebased.
+        let parent = commit.parent(0)?;
+        let ancestor_tree = parent.tree()?;
+        let our_tree = current_commit.tree()?;
+        let their_tree = commit.tree()?;
+
+        let mut index = repo.merge_trees(&ancestor_tree, &our_tree, &their_tree, None)?;
+
+        if index.has_conflicts() {
+            return Ok(CherryPickResult::Conflict);
+        }
+
+        // Write the merged tree.
+        let tree_oid = index.write_tree_to(repo)?;
+        let tree = repo.find_tree(tree_oid)?;
+
+        // Create the replayed commit (preserving author and message).
+        let new_oid = repo.commit(
+            None, // don't update any ref yet
+            &commit.author(),
+            &commit.committer(),
+            commit.message().unwrap_or(""),
+            &tree,
+            &[&current_commit],
+        )?;
+
+        current_oid = new_oid;
+    }
+
+    Ok(CherryPickResult::Clean(current_oid))
 }
 
 // ---------------------------------------------------------------------------
@@ -262,13 +441,314 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Restack tests
+    // ------------------------------------------------------------------
+
+    /// Helper: create a file, stage it, and commit.
+    fn commit_file(repo: &Repository, path: &str, content: &[u8], message: &str) -> git2::Oid {
+        let full_path = repo.workdir().unwrap().join(path);
+        std::fs::write(&full_path, content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(path)).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+            .unwrap()
+    }
+
+    /// Helper: create a scratch repo with an initial commit that has a real
+    /// file, so cherry-picks have something to diff against. Returns the
+    /// repo with HEAD on `main`.
+    fn scratch_repo_with_file() -> (Repository, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create an initial commit with a file. Scoped to drop borrows
+        // before we return `repo`.
+        {
+            let file_path = dir.path().join("base.txt");
+            std::fs::write(&file_path, b"line 1\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("base.txt")).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("test", "test@test.com").unwrap();
+            repo.commit(Some("refs/heads/main"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+        }
+
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+
+        (repo, dir)
+    }
+
+    /// Helper: create a branch at the current HEAD.
+    fn create_branch_at_head(repo: &Repository, name: &str) {
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch(name, &head, false).unwrap();
+    }
+
+    /// Helper: switch HEAD to a branch.
+    fn checkout_branch(repo: &Repository, name: &str) {
+        let refname = format!("refs/heads/{name}");
+        repo.set_head(&refname).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+    }
+
+    /// Helper: get the tip OID of a branch.
+    fn branch_tip(repo: &Repository, name: &str) -> git2::Oid {
+        repo.find_branch(name, BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id()
+    }
+
+    /// Helper: collect commit messages from tip back to (but not including)
+    /// the given stop OID.
+    fn commit_messages_since(repo: &Repository, tip: Oid, stop: Oid) -> Vec<String> {
+        let mut msgs = Vec::new();
+        let mut current = tip;
+        loop {
+            if current == stop {
+                break;
+            }
+            let commit = repo.find_commit(current).unwrap();
+            msgs.push(commit.message().unwrap_or("").to_string());
+            if commit.parent_count() == 0 {
+                break;
+            }
+            current = commit.parent_id(0).unwrap();
+        }
+        msgs.reverse();
+        msgs
+    }
+
     #[test]
-    fn restack_returns_not_implemented() {
-        let (repo, dir) = scratch_repo();
-        let err = restack(&repo, dir.path(), "main").unwrap_err();
+    fn restack_clean_rebase() {
+        let (repo, _dir) = scratch_repo_with_file();
+
+        // Create branch-a from main.
+        create_branch_at_head(&repo, "branch-a");
+        checkout_branch(&repo, "branch-a");
+        commit_file(&repo, "a.txt", b"a content\n", "commit on a");
+
+        // Record where branch-b will fork from branch-a.
+        let b_fork = branch_tip(&repo, "branch-a");
+
+        // Create branch-b from branch-a.
+        create_branch_at_head(&repo, "branch-b");
+        checkout_branch(&repo, "branch-b");
+        commit_file(&repo, "b.txt", b"b content\n", "commit on b");
+
+        // Now "rework" branch-a: add another commit.
+        checkout_branch(&repo, "branch-a");
+        commit_file(&repo, "a2.txt", b"a2 content\n", "rework on a");
+
+        // Restack branch-b onto branch-a's new head.
+        let clean = restack(&repo, "branch-b", "branch-a", Some(b_fork)).unwrap();
+        assert!(clean, "rebase should be clean");
+
+        // branch-b should now be based on branch-a's new tip.
+        let a_tip = branch_tip(&repo, "branch-a");
+        let b_tip = branch_tip(&repo, "branch-b");
+
+        // branch-b's parent chain should go through branch-a's tip.
+        let b_commit = repo.find_commit(b_tip).unwrap();
+        assert_eq!(
+            b_commit.parent_id(0).unwrap(),
+            a_tip,
+            "branch-b's parent should be branch-a's tip after restack"
+        );
+
+        // The commit message from branch-b's own commit should be preserved.
+        assert_eq!(b_commit.message().unwrap(), "commit on b");
+
+        // branch-b should have the files from a, a's rework, and b.
+        let b_tree = b_commit.tree().unwrap();
+        assert!(b_tree.get_name("a.txt").is_some(), "a.txt should exist");
+        assert!(b_tree.get_name("a2.txt").is_some(), "a2.txt should exist");
+        assert!(b_tree.get_name("b.txt").is_some(), "b.txt should exist");
+    }
+
+    #[test]
+    fn restack_three_pr_stack() {
+        let (repo, _dir) = scratch_repo_with_file();
+
+        // Build stack: main → branch-a → branch-b → branch-c.
+        create_branch_at_head(&repo, "branch-a");
+        checkout_branch(&repo, "branch-a");
+        commit_file(&repo, "a.txt", b"a content\n", "commit on a");
+
+        // Record fork points BEFORE creating children.
+        let b_fork = branch_tip(&repo, "branch-a");
+
+        create_branch_at_head(&repo, "branch-b");
+        checkout_branch(&repo, "branch-b");
+        commit_file(&repo, "b.txt", b"b content\n", "commit on b");
+
+        let c_fork = branch_tip(&repo, "branch-b");
+
+        create_branch_at_head(&repo, "branch-c");
+        checkout_branch(&repo, "branch-c");
+        commit_file(&repo, "c.txt", b"c content\n", "commit on c");
+
+        // Rework branch-a.
+        checkout_branch(&repo, "branch-a");
+        commit_file(&repo, "a-rework.txt", b"rework\n", "rework on a");
+
+        // Restack b onto a (fork_point = old a tip = b_fork).
+        let clean_b = restack(&repo, "branch-b", "branch-a", Some(b_fork)).unwrap();
+        assert!(clean_b, "restack b onto a should be clean");
+
+        // Restack c onto b (fork_point = old b tip = c_fork).
+        let clean_c = restack(&repo, "branch-c", "branch-b", Some(c_fork)).unwrap();
+        assert!(clean_c, "restack c onto b should be clean");
+
+        // Verify chain integrity.
+        let a_tip = branch_tip(&repo, "branch-a");
+        let b_tip = branch_tip(&repo, "branch-b");
+        let c_tip = branch_tip(&repo, "branch-c");
+
+        // c -> b -> a chain
+        let c_commit = repo.find_commit(c_tip).unwrap();
+        assert_eq!(c_commit.parent_id(0).unwrap(), b_tip);
+
+        let b_commit = repo.find_commit(b_tip).unwrap();
+        assert_eq!(b_commit.parent_id(0).unwrap(), a_tip);
+
+        // All files should be in c's tree.
+        let c_tree = c_commit.tree().unwrap();
+        for name in &["base.txt", "a.txt", "a-rework.txt", "b.txt", "c.txt"] {
+            assert!(
+                c_tree.get_name(name).is_some(),
+                "{name} should exist in branch-c's tree"
+            );
+        }
+
+        // Verify commit messages are preserved in order.
+        let main_oid = branch_tip(&repo, "main");
+        let c_msgs = commit_messages_since(&repo, c_tip, main_oid);
+        assert_eq!(
+            c_msgs,
+            vec!["commit on a", "rework on a", "commit on b", "commit on c",]
+        );
+    }
+
+    #[test]
+    fn restack_with_conflict() {
+        let (repo, _dir) = scratch_repo_with_file();
+
+        // branch-a modifies base.txt.
+        create_branch_at_head(&repo, "branch-a");
+        checkout_branch(&repo, "branch-a");
+        commit_file(&repo, "base.txt", b"modified by a\n", "a modifies base");
+
+        // branch-b also modifies base.txt (from original main).
+        let b_fork = branch_tip(&repo, "main");
+        checkout_branch(&repo, "main");
+        create_branch_at_head(&repo, "branch-b");
+        checkout_branch(&repo, "branch-b");
+        commit_file(
+            &repo,
+            "base.txt",
+            b"modified by b (conflict)\n",
+            "b modifies base",
+        );
+
+        let original_b_tip = branch_tip(&repo, "branch-b");
+
+        // Restack branch-b onto branch-a should conflict.
+        let clean = restack(&repo, "branch-b", "branch-a", Some(b_fork)).unwrap();
+        assert!(!clean, "rebase should report conflict");
+
+        // Branch should be untouched.
+        let after_b_tip = branch_tip(&repo, "branch-b");
+        assert_eq!(
+            original_b_tip, after_b_tip,
+            "branch-b should be unchanged after conflict"
+        );
+    }
+
+    #[test]
+    fn restack_no_op() {
+        let (repo, _dir) = scratch_repo_with_file();
+
+        // branch-a is based on main and has one commit.
+        create_branch_at_head(&repo, "branch-a");
+        checkout_branch(&repo, "branch-a");
+        commit_file(&repo, "a.txt", b"a\n", "commit on a");
+
+        let original_tip = branch_tip(&repo, "branch-a");
+
+        // Restack branch-a onto main (already up to date) — merge-base works.
+        let clean = restack(&repo, "branch-a", "main", None).unwrap();
+        assert!(clean, "no-op restack should return true");
+
+        // Tip should be unchanged.
+        assert_eq!(
+            branch_tip(&repo, "branch-a"),
+            original_tip,
+            "branch should not change on no-op restack"
+        );
+    }
+
+    #[test]
+    fn restack_branch_not_found() {
+        let (repo, _dir) = scratch_repo_with_file();
+        let err = restack(&repo, "nonexistent", "main", None).unwrap_err();
         assert!(
-            matches!(err, Error::RestackNotImplemented),
-            "expected RestackNotImplemented, got {err:?}"
+            matches!(err, Error::BranchNotFound(_)),
+            "expected BranchNotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn restack_base_not_found() {
+        let (repo, _dir) = scratch_repo_with_file();
+        create_branch_at_head(&repo, "branch-a");
+        let err = restack(&repo, "branch-a", "nonexistent", None).unwrap_err();
+        assert!(
+            matches!(err, Error::BranchNotFound(_)),
+            "expected BranchNotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn restack_without_fork_point_uses_merge_base() {
+        let (repo, _dir) = scratch_repo_with_file();
+
+        // Simple case: branch-a from main, rework main, restack branch-a.
+        // merge-base works fine here because the history hasn't been rewritten.
+        create_branch_at_head(&repo, "branch-a");
+        checkout_branch(&repo, "branch-a");
+        commit_file(&repo, "a.txt", b"a\n", "commit on a");
+
+        // Add a commit to main.
+        checkout_branch(&repo, "main");
+        commit_file(&repo, "main2.txt", b"main2\n", "second main commit");
+
+        // Restack branch-a onto main (merge-base computed automatically).
+        let clean = restack(&repo, "branch-a", "main", None).unwrap();
+        assert!(clean, "restack should be clean");
+
+        // branch-a should now be on top of main's new tip.
+        let main_tip = branch_tip(&repo, "main");
+        let a_tip = branch_tip(&repo, "branch-a");
+        let a_commit = repo.find_commit(a_tip).unwrap();
+        assert_eq!(
+            a_commit.parent_id(0).unwrap(),
+            main_tip,
+            "branch-a should be rebased onto main's new tip"
         );
     }
 

@@ -24,6 +24,7 @@ fn make_test_review(worktree: PathBuf) -> Review {
         pr: PrRef::new("owner/repo#1"),
         branch: "alejandro/test-1-feature".into(),
         base: "main".into(),
+        base_sha: "000".into(),
         worktree,
         gate_state: GateState::Pending,
         diff: DiffData {

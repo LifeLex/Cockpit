@@ -248,6 +248,11 @@ pub struct Review {
     pub branch: String,
     /// Base branch — either `main` or a parent review's branch (stacked).
     pub base: String,
+    /// OID of the base branch tip when this review was created or last restacked.
+    ///
+    /// Used as the fork point for `restack`: only commits after this OID belong
+    /// to this review's branch. Updated after each successful restack.
+    pub base_sha: String,
     /// Path to the git worktree on disk.
     pub worktree: PathBuf,
     /// Current gate state in the review loop.
@@ -284,6 +289,7 @@ mod tests {
             pr: PrRef::new(format!("owner/repo#{id}")),
             branch: format!("alejandro/{id}"),
             base: "main".into(),
+            base_sha: "000".into(),
             worktree: PathBuf::from(format!("/tmp/wt-{id}")),
             gate_state: GateState::Pending,
             diff: DiffData { raw: String::new() },

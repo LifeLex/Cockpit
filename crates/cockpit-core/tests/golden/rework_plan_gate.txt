@@ -1,0 +1,21 @@
+## Intent
+
+Build a reusable widget framework
+
+## Current Artifact
+
+# Widget Plan
+
+1. Define widget trait
+2. Add button widget
+
+## Comments
+
+1. [plan step 0: Define widget trait] This step is too vague, add detail
+
+2. [plan file: src/widget.rs] Consider splitting into two files
+
+## Scope Guard
+
+Address only the comments above. Don't refactor unrelated code. Don't weaken or delete tests. If a comment is wrong or impossible, stop and say so.
+

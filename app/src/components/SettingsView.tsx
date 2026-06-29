@@ -83,10 +83,10 @@ export function SettingsView() {
   return (
     <div className="mx-auto max-w-2xl px-6 py-8">
       <div className="mb-6 flex items-center gap-3">
-        <Settings className="h-6 w-6 text-text-secondary" />
+        <Settings className="h-6 w-6 text-muted-foreground" />
         <div>
-          <h1 className="text-xl font-semibold text-text-primary">Settings</h1>
-          <p className="text-sm text-text-secondary">
+          <h1 className="text-xl font-semibold text-foreground">Settings</h1>
+          <p className="text-sm text-muted-foreground">
             Configure credentials, repository path, and agent settings.
           </p>
         </div>

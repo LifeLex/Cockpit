@@ -284,17 +284,17 @@ export function DiffView({
   return (
     <div className="flex flex-col h-screen">
       {/* Header */}
-      <header className="px-6 py-3 border-b border-border flex items-center gap-4 shrink-0 bg-surface-1">
+      <header className="px-6 py-3 border-b border-border flex items-center gap-4 shrink-0 bg-card">
         <button
           onClick={onBack}
-          className="px-3 py-1 rounded bg-surface-2 hover:bg-surface-3 text-text-secondary cursor-pointer"
+          className="px-3 py-1 rounded bg-muted hover:bg-accent text-muted-foreground cursor-pointer"
         >
           Back
         </button>
 
         <strong>PR {review.pr}</strong>
-        <span className="text-text-secondary">{review.branch}</span>
-        <span className="text-text-secondary">Issue: {review.issue}</span>
+        <span className="text-muted-foreground">{review.branch}</span>
+        <span className="text-muted-foreground">Issue: {review.issue}</span>
 
         <span
           className={`px-2 py-0.5 rounded text-xs font-bold text-white ${gateStateBgClass(review.gate_state)}`}
@@ -319,7 +319,7 @@ export function DiffView({
             className={
               diffMode === "split"
                 ? "px-3 py-1 text-xs bg-accent text-white border-none cursor-pointer"
-                : "px-3 py-1 text-xs bg-surface-2 text-text-secondary border-none cursor-pointer hover:bg-surface-3"
+                : "px-3 py-1 text-xs bg-muted text-muted-foreground border-none cursor-pointer hover:bg-accent"
             }
           >
             Split
@@ -329,7 +329,7 @@ export function DiffView({
             className={
               diffMode === "unified"
                 ? "px-3 py-1 text-xs bg-accent text-white border-none cursor-pointer"
-                : "px-3 py-1 text-xs bg-surface-2 text-text-secondary border-none cursor-pointer hover:bg-surface-3"
+                : "px-3 py-1 text-xs bg-muted text-muted-foreground border-none cursor-pointer hover:bg-accent"
             }
           >
             Unified
@@ -341,7 +341,7 @@ export function DiffView({
             <button
               onClick={() => void handleMirrorComments()}
               disabled={mirroring}
-              className="px-3 py-1 rounded bg-surface-2 hover:bg-surface-3 text-white border-none cursor-pointer disabled:cursor-wait"
+              className="px-3 py-1 rounded bg-muted hover:bg-accent text-white border-none cursor-pointer disabled:cursor-wait"
             >
               {mirroring ? "Mirroring..." : "Mirror to GitHub"}
             </button>
@@ -385,14 +385,14 @@ export function DiffView({
       <div className="flex flex-1 min-h-0">
         {/* File tree sidebar */}
         {sidebarOpen && (
-          <aside className="w-60 shrink-0 bg-surface-1 border-r border-border flex flex-col">
+          <aside className="w-60 shrink-0 bg-card border-r border-border flex flex-col">
             <div className="px-3 py-2 border-b border-border flex items-center justify-between">
-              <span className="text-xs font-semibold text-text-secondary">
+              <span className="text-xs font-semibold text-muted-foreground">
                 Files ({String(filePaths.length)})
               </span>
               <button
                 onClick={() => { setSidebarOpen(false); }}
-                className="text-text-muted hover:text-text-secondary text-xs cursor-pointer bg-transparent border-none"
+                className="text-muted-foreground hover:text-muted-foreground text-xs cursor-pointer bg-transparent border-none"
                 title="Hide file tree (m)"
               >
                 &laquo;
@@ -411,18 +411,18 @@ export function DiffView({
                     onClick={() => { setSelectedFile(path); }}
                     className={
                       isActive
-                        ? "w-full text-left px-3 py-1.5 flex items-center gap-2 text-xs bg-surface-2 border-l-2 border-l-accent cursor-pointer border-y-0 border-r-0"
-                        : "w-full text-left px-3 py-1.5 flex items-center gap-2 text-xs bg-transparent border-l-2 border-l-transparent cursor-pointer hover:bg-surface-2 border-y-0 border-r-0"
+                        ? "w-full text-left px-3 py-1.5 flex items-center gap-2 text-xs bg-muted border-l-2 border-l-primary cursor-pointer border-y-0 border-r-0"
+                        : "w-full text-left px-3 py-1.5 flex items-center gap-2 text-xs bg-transparent border-l-2 border-l-transparent cursor-pointer hover:bg-muted border-y-0 border-r-0"
                     }
                   >
                     <span className={`${indicator.className} w-4 text-center shrink-0`}>
                       {indicator.label}
                     </span>
-                    <span className="text-text-primary truncate flex-1" title={path}>
+                    <span className="text-foreground truncate flex-1" title={path}>
                       {path}
                     </span>
                     {(counts.additions > 0 || counts.deletions > 0) && (
-                      <span className="shrink-0 text-[10px] text-text-muted">
+                      <span className="shrink-0 text-[10px] text-muted-foreground">
                         {counts.additions > 0 && (
                           <span className="text-success">+{String(counts.additions)}</span>
                         )}
@@ -436,7 +436,7 @@ export function DiffView({
                 );
               })}
               {filePaths.length === 0 && (
-                <span className="px-3 py-2 text-text-muted text-xs block">
+                <span className="px-3 py-2 text-muted-foreground text-xs block">
                   No files in diff
                 </span>
               )}
@@ -448,7 +448,7 @@ export function DiffView({
         {!sidebarOpen && (
           <button
             onClick={() => { setSidebarOpen(true); }}
-            className="w-6 shrink-0 bg-surface-1 border-r border-border flex items-center justify-center cursor-pointer hover:bg-surface-2 border-y-0 border-l-0 text-text-muted hover:text-text-secondary"
+            className="w-6 shrink-0 bg-card border-r border-border flex items-center justify-center cursor-pointer hover:bg-muted border-y-0 border-l-0 text-muted-foreground hover:text-muted-foreground"
             title="Show file tree (m)"
           >
             &raquo;
@@ -472,7 +472,7 @@ export function DiffView({
               }}
             />
           ) : (
-            <div className="flex items-center justify-center h-full text-text-muted">
+            <div className="flex items-center justify-center h-full text-muted-foreground">
               No diff available
             </div>
           )}
@@ -484,7 +484,7 @@ export function DiffView({
         <h3 className="m-0 mb-2 text-sm">
           Comments
           {commentsForFile.length > 0 && (
-            <span className="text-text-muted font-normal">
+            <span className="text-muted-foreground font-normal">
               {" "}
               ({commentsForFile.length} on {selectedFile})
             </span>
@@ -497,9 +497,9 @@ export function DiffView({
           return (
             <div
               key={comment.id}
-              className="p-3 mb-2 bg-surface-1 border-l-[3px] border-l-accent rounded text-sm"
+              className="p-3 mb-2 bg-card border-l-[3px] border-l-primary rounded text-sm"
             >
-              <div className="text-text-muted text-[11px] mb-1">
+              <div className="text-muted-foreground text-[11px] mb-1">
                 {range !== null
                   ? `Lines ${String(range[0])}-${String(range[1])}`
                   : "File-level"}
@@ -513,7 +513,7 @@ export function DiffView({
 
         {/* All comments (other files) summary */}
         {review.comments.length > commentsForFile.length && (
-          <div className="text-text-muted text-xs mb-2">
+          <div className="text-muted-foreground text-xs mb-2">
             + {review.comments.length - commentsForFile.length} comment
             {review.comments.length - commentsForFile.length !== 1
               ? "s"
@@ -526,7 +526,7 @@ export function DiffView({
         {review.gate_state === "InReview" && (
           <div className="flex gap-2 items-end flex-wrap mt-2 pt-2 border-t border-border">
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-text-muted">File</label>
+              <label className="text-[11px] text-muted-foreground">File</label>
               <input
                 type="text"
                 value={commentFile}
@@ -534,12 +534,12 @@ export function DiffView({
                   setCommentFile(e.target.value);
                 }}
                 placeholder={selectedFile}
-                className="w-[200px] bg-surface-2 text-text-secondary border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
+                className="w-[200px] bg-muted text-muted-foreground border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
               />
             </div>
 
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-text-muted">Lines</label>
+              <label className="text-[11px] text-muted-foreground">Lines</label>
               <div className="flex gap-1">
                 <input
                   type="number"
@@ -548,9 +548,9 @@ export function DiffView({
                   onChange={(e) => {
                     setCommentLineStart(Number(e.target.value));
                   }}
-                  className="w-[60px] bg-surface-2 text-text-secondary border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
+                  className="w-[60px] bg-muted text-muted-foreground border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
                 />
-                <span className="text-text-muted self-center">-</span>
+                <span className="text-muted-foreground self-center">-</span>
                 <input
                   type="number"
                   min={1}
@@ -558,13 +558,13 @@ export function DiffView({
                   onChange={(e) => {
                     setCommentLineEnd(Number(e.target.value));
                   }}
-                  className="w-[60px] bg-surface-2 text-text-secondary border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
+                  className="w-[60px] bg-muted text-muted-foreground border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
                 />
               </div>
             </div>
 
             <div className="flex flex-col gap-1 flex-1">
-              <label className="text-[11px] text-text-muted">Comment</label>
+              <label className="text-[11px] text-muted-foreground">Comment</label>
               <div className="flex gap-2">
                 <input
                   type="text"
@@ -578,7 +578,7 @@ export function DiffView({
                     }
                   }}
                   placeholder="Add a review comment..."
-                  className="flex-1 bg-surface-2 text-text-secondary border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
+                  className="flex-1 bg-muted text-muted-foreground border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
                 />
                 <button
                   onClick={() => void handleAddComment()}

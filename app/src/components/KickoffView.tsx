@@ -43,10 +43,10 @@ export function KickoffView() {
   return (
     <div className="mx-auto max-w-2xl px-6 py-8">
       <div className="mb-6 flex items-center gap-3">
-        <Rocket className="h-6 w-6 text-text-secondary" />
+        <Rocket className="h-6 w-6 text-muted-foreground" />
         <div>
-          <h1 className="text-xl font-semibold text-text-primary">Kickoff</h1>
-          <p className="text-sm text-text-secondary">
+          <h1 className="text-xl font-semibold text-foreground">Kickoff</h1>
+          <p className="text-sm text-muted-foreground">
             Fetch issues from Linear, compute the frontier, and create reviews.
           </p>
         </div>
@@ -145,17 +145,17 @@ export function KickoffView() {
 
             {kickoffResult.reviews.length > 0 && (
               <div className="border-t border-border pt-4">
-                <h3 className="mb-2 text-sm font-medium text-text-secondary">
+                <h3 className="mb-2 text-sm font-medium text-muted-foreground">
                   Created Reviews
                 </h3>
                 <ul className="flex flex-col gap-1">
                   {kickoffResult.reviews.map((review) => (
                     <li
                       key={review.id}
-                      className="rounded-md bg-surface-2 px-3 py-2 text-sm text-text-primary"
+                      className="rounded-md bg-muted px-3 py-2 text-sm text-foreground"
                     >
                       <span className="font-medium">{review.pr}</span>
-                      <span className="ml-2 text-text-muted">
+                      <span className="ml-2 text-muted-foreground">
                         {review.branch}
                       </span>
                     </li>
@@ -179,10 +179,10 @@ function StatCard({ value, label }: StatCardProps) {
   return (
     <div
       className={cn(
-        "rounded-lg border border-border bg-surface-2 px-4 py-3 text-center",
+        "rounded-lg border border-border bg-muted px-4 py-3 text-center",
       )}
     >
-      <p className="text-2xl font-semibold text-text-primary">{value}</p>
+      <p className="text-2xl font-semibold text-foreground">{value}</p>
       <p className="text-xs text-muted-foreground">{label}</p>
     </div>
   );

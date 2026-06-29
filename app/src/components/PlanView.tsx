@@ -95,7 +95,7 @@ function CommentList({ comments }: CommentListProps) {
       {comments.map((c) => (
         <li
           key={c.id}
-          className="px-2 py-1 mb-1 bg-surface-2 border-l-[3px] border-l-warning rounded-sm text-[13px]"
+          className="px-2 py-1 mb-1 bg-muted border-l-[3px] border-l-warning rounded-sm text-[13px]"
         >
           {c.body}
         </li>
@@ -128,8 +128,8 @@ function CommentForm({ defaultAnchor, onSubmit, onCancel }: CommentFormProps) {
   };
 
   return (
-    <div className="mt-1 p-2 bg-surface-1 rounded border border-border">
-      <div className="text-xs text-text-muted mb-1">
+    <div className="mt-1 p-2 bg-card rounded border border-border">
+      <div className="text-xs text-muted-foreground mb-1">
         Anchor: <code>{defaultAnchor}</code>
       </div>
       <textarea
@@ -138,7 +138,7 @@ function CommentForm({ defaultAnchor, onSubmit, onCancel }: CommentFormProps) {
           setBody(e.target.value);
         }}
         placeholder="Add a comment..."
-        className="w-full min-h-[60px] bg-surface-2 text-text-primary border border-border rounded p-2 text-[13px] resize-y box-border"
+        className="w-full min-h-[60px] bg-muted text-foreground border border-border rounded p-2 text-[13px] resize-y box-border"
       />
       <div className="mt-1 flex gap-2">
         <button
@@ -181,7 +181,7 @@ function StepItem({
   const [commenting, setCommenting] = useState(false);
 
   return (
-    <li className="mb-2 p-2 bg-surface-1 rounded border border-border">
+    <li className="mb-2 p-2 bg-card rounded border border-border">
       <div
         className="flex justify-between items-start cursor-pointer"
         onClick={() => {
@@ -193,13 +193,13 @@ function StepItem({
             {stepIndex + 1}. {title}
           </strong>
         </div>
-        <span className="text-text-muted text-xs">
+        <span className="text-muted-foreground text-xs">
           {expanded ? "[-]" : "[+]"}
         </span>
       </div>
 
       {expanded && description.length > 0 && (
-        <p className="mt-2 ml-4 text-text-secondary text-[13px] whitespace-pre-wrap">
+        <p className="mt-2 ml-4 text-muted-foreground text-[13px] whitespace-pre-wrap">
           {description}
         </p>
       )}
@@ -211,7 +211,7 @@ function StepItem({
           onClick={() => {
             setCommenting(true);
           }}
-          className="mt-1 text-xs cursor-pointer text-text-muted bg-transparent border-none underline"
+          className="mt-1 text-xs cursor-pointer text-muted-foreground bg-transparent border-none underline"
         >
           + Comment on step {stepIndex + 1}
         </button>
@@ -253,7 +253,7 @@ function FileItem({
   const [commenting, setCommenting] = useState(false);
 
   return (
-    <li className="mb-1 px-2 py-1 bg-surface-1 rounded border border-border">
+    <li className="mb-1 px-2 py-1 bg-card rounded border border-border">
       <code className="text-[13px]">{filePath}</code>
 
       <CommentList comments={comments} />
@@ -263,7 +263,7 @@ function FileItem({
           onClick={() => {
             setCommenting(true);
           }}
-          className="ml-2 text-xs cursor-pointer text-text-muted bg-transparent border-none underline"
+          className="ml-2 text-xs cursor-pointer text-muted-foreground bg-transparent border-none underline"
         >
           + Comment
         </button>
@@ -394,7 +394,7 @@ export function PlanView({
     <div>
       {/* Header */}
       <div className="flex justify-between items-center mb-4">
-        <h2 className="m-0 text-text-primary">Plan: {doc.summary}</h2>
+        <h2 className="m-0 text-foreground">Plan: {doc.summary}</h2>
         <span
           className={`px-3 py-1 rounded text-xs font-bold text-white ${gateStateBgClass(gateState)}`}
         >
@@ -402,7 +402,7 @@ export function PlanView({
         </span>
       </div>
 
-      <div className="text-text-muted text-[13px] mb-4">
+      <div className="text-muted-foreground text-[13px] mb-4">
         Project: {plan.project}
         {plan.agent != null && (
           <span className="ml-3 text-warning">
@@ -413,7 +413,7 @@ export function PlanView({
 
       {/* Steps */}
       <section className="mb-6">
-        <h3 className="text-text-primary mb-2">
+        <h3 className="text-foreground mb-2">
           Steps ({String(doc.steps.length)})
         </h3>
         <ol className="list-none m-0 p-0">
@@ -433,7 +433,7 @@ export function PlanView({
 
       {/* Files */}
       <section className="mb-6">
-        <h3 className="text-text-primary mb-2">
+        <h3 className="text-foreground mb-2">
           Files ({String(doc.files.length)})
         </h3>
         <ul className="list-none m-0 p-0">
@@ -452,7 +452,7 @@ export function PlanView({
       {/* Risks */}
       {doc.risks.length > 0 && (
         <section className="mb-6">
-          <h3 className="text-text-primary mb-2">
+          <h3 className="text-foreground mb-2">
             Risks ({String(doc.risks.length)})
           </h3>
           <ul className="m-0 pl-5">

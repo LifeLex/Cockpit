@@ -228,8 +228,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
   navigateToDiff: async (pr: string) => {
     set({ loading: true, error: null });
     try {
-      const review = await invoke<Review>("open_review", { pr });
       const diff = await invoke<DiffData>("get_review_diff", { pr });
+      const reviews = get().reviews;
+      const review = reviews.find((r) => r.pr === pr) ?? null;
       set({
         view: { kind: "diff", pr },
         activeReview: review,

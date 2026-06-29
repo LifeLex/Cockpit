@@ -16,14 +16,14 @@ export function EmptyState({
   onAction,
 }: EmptyStateProps) {
   return (
-    <div className="flex flex-col items-center justify-center rounded-xl border border-border/50 bg-surface-1 px-8 py-12 text-center">
+    <div className="flex flex-col items-center justify-center rounded-xl border border-border/50 bg-card px-8 py-12 text-center">
       <span className="text-5xl" role="img" aria-label={title}>
         {icon}
       </span>
-      <h3 className="mt-4 text-base font-semibold text-text-primary">
+      <h3 className="mt-4 text-base font-semibold text-foreground">
         {title}
       </h3>
-      <p className="mt-1.5 max-w-sm text-sm text-text-muted">
+      <p className="mt-1.5 max-w-sm text-sm text-muted-foreground">
         {description}
       </p>
       {actionLabel !== undefined && onAction !== undefined && (

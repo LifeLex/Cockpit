@@ -61,10 +61,10 @@ export function BatchApprovePanel({
       <CardContent className="p-4">
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h3 className="text-sm font-semibold text-text-primary">
+            <h3 className="text-sm font-semibold text-foreground">
               Batch Approve Preview
             </h3>
-            <p className="mt-0.5 text-xs text-text-muted">
+            <p className="mt-0.5 text-xs text-muted-foreground">
               {eligibleCount}/{verdicts.length} eligible
             </p>
           </div>
@@ -86,7 +86,7 @@ export function BatchApprovePanel({
         </div>
 
         {verdicts.length === 0 && (
-          <p className="text-sm text-text-muted py-2">
+          <p className="text-sm text-muted-foreground py-2">
             No reviews to evaluate.
           </p>
         )}
@@ -96,20 +96,20 @@ export function BatchApprovePanel({
             <div
               key={review.id}
               className={cn(
-                "flex items-center justify-between rounded-lg border-l-[3px] bg-surface-2 px-3 py-2.5",
+                "flex items-center justify-between rounded-lg border-l-[3px] bg-muted px-3 py-2.5",
                 verdictBorderClass(verdict),
               )}
             >
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium text-text-primary truncate">
+                  <span className="text-sm font-medium text-foreground truncate">
                     {review.branch}
                   </span>
                   <Badge variant="outline" className="shrink-0 text-[10px]">
                     {gateStateLabel(review.gate_state)}
                   </Badge>
                 </div>
-                <p className="mt-0.5 text-xs text-text-muted truncate">
+                <p className="mt-0.5 text-xs text-muted-foreground truncate">
                   {verdict.reasons.join(" · ")}
                 </p>
               </div>

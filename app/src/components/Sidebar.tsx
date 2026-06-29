@@ -17,6 +17,7 @@ import {
   TooltipContent,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { Logo } from "./Logo";
 
 type NavKind = ViewState["kind"];
 
@@ -92,7 +93,7 @@ export function Sidebar({
   return (
     <aside
       className={cn(
-        "flex shrink-0 flex-col border-r border-border bg-surface-1 transition-all duration-200",
+        "flex shrink-0 flex-col border-r border-border bg-card transition-all duration-200",
         collapsed ? "w-[60px]" : "w-[240px]",
       )}
     >
@@ -102,9 +103,7 @@ export function Sidebar({
           collapsed ? "justify-center px-2" : "gap-2 px-4",
         )}
       >
-        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-sm font-bold text-primary-foreground">
-          C
-        </div>
+        <Logo size={28} />
         {!collapsed && (
           <span className="flex-1 text-base font-semibold text-foreground">
             Cockpit

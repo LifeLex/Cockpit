@@ -92,7 +92,7 @@ export function ReviewCard({ review, onOpen, onViewDiff }: ReviewCardProps) {
   return (
     <Card
       className={cn(
-        "border-l-4 p-0 transition-colors hover:bg-surface-1/50",
+        "border-l-4 p-0 transition-colors hover:bg-card/50",
         gateStateBorderClass(review.gate_state),
       )}
     >
@@ -100,12 +100,12 @@ export function ReviewCard({ review, onOpen, onViewDiff }: ReviewCardProps) {
         {/* Top row: PR icon + branch + repo slug + gate state badge */}
         <div className="flex items-center justify-between gap-3">
           <div className="flex min-w-0 items-center gap-2.5">
-            <GitPullRequest className="h-4 w-4 shrink-0 text-text-muted" />
-            <span className="truncate text-sm font-semibold text-text-primary">
+            <GitPullRequest className="h-4 w-4 shrink-0 text-muted-foreground" />
+            <span className="truncate text-sm font-semibold text-foreground">
               {review.branch}
             </span>
             {repo !== "" && (
-              <span className="shrink-0 text-xs text-text-muted">
+              <span className="shrink-0 text-xs text-muted-foreground">
                 {repo}#{prNumber}
               </span>
             )}
@@ -122,13 +122,13 @@ export function ReviewCard({ review, onOpen, onViewDiff }: ReviewCardProps) {
         </div>
 
         {/* Middle row: issue ref, base branch, comment count, stale, agent */}
-        <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-text-secondary">
+        <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
           <span>{review.issue}</span>
-          <span className="text-text-muted">
+          <span className="text-muted-foreground">
             base: {review.base}
           </span>
           {review.comments.length > 0 && (
-            <span className="inline-flex items-center gap-1 text-text-muted">
+            <span className="inline-flex items-center gap-1 text-muted-foreground">
               <MessageSquare className="h-3 w-3" />
               {review.comments.length}
             </span>

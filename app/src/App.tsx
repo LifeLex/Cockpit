@@ -307,7 +307,7 @@ function App() {
 
                 {reviews.length > 0 && (
                   <section className="mt-8">
-                    <h2 className="mb-3 text-lg font-semibold text-text-primary">
+                    <h2 className="mb-3 text-lg font-semibold text-foreground">
                       All Reviews ({reviews.length})
                     </h2>
                     <div className="space-y-3">
@@ -331,7 +331,7 @@ function App() {
           return (
             <div className="px-6 py-8">
               {loading ? (
-                <p className="text-sm text-text-muted">Loading diff...</p>
+                <p className="text-sm text-muted-foreground">Loading diff...</p>
               ) : (
                 <div className="rounded-lg border border-danger bg-danger/10 px-4 py-3 text-sm text-danger">
                   Failed to load review.{" "}
@@ -397,10 +397,10 @@ function App() {
             {errorBanner}
 
             <section>
-              <h2 className="mb-1 text-lg font-semibold text-text-primary">
+              <h2 className="mb-1 text-lg font-semibold text-foreground">
                 Stack Dependencies
               </h2>
-              <p className="mb-4 text-sm text-text-secondary">
+              <p className="mb-4 text-sm text-muted-foreground">
                 Review dependency graph — click a node to view its diff
               </p>
               {loading && reviews.length === 0 && <SkeletonList count={3} />}
@@ -422,7 +422,7 @@ function App() {
 
   return (
     <TooltipProvider>
-      <div className="flex h-screen overflow-hidden bg-surface-0 text-text-primary">
+      <div className="flex h-screen overflow-hidden bg-background text-foreground">
         <Sidebar
           activeView={view.kind}
           reviewCount={reviews.length}

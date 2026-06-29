@@ -173,7 +173,7 @@ function StackNode({
     // Dynamic marginLeft: Tailwind cannot compute depth * 28 at build time.
     <div style={{ marginLeft: depth * 28 }}>
       <div
-        className={`flex items-center gap-2 px-2.5 py-1.5 my-0.5 rounded-r border-l-[3px] bg-surface-1 cursor-pointer hover:bg-surface-2 ${borderClass}`}
+        className={`flex items-center gap-2 px-2.5 py-1.5 my-0.5 rounded-r border-l-[3px] bg-card cursor-pointer hover:bg-muted ${borderClass}`}
         onClick={() => {
           onViewDiff(review.pr);
         }}
@@ -192,7 +192,7 @@ function StackNode({
         )}
 
         {/* PR reference */}
-        <span className="font-bold text-[13px] text-text-primary">
+        <span className="font-bold text-[13px] text-foreground">
           {review.pr}
         </span>
 
@@ -211,7 +211,7 @@ function StackNode({
         )}
 
         {/* Issue reference */}
-        <span className="text-text-muted text-xs ml-auto">{review.issue}</span>
+        <span className="text-muted-foreground text-xs ml-auto">{review.issue}</span>
       </div>
 
       {/* Recurse into children */}
@@ -241,13 +241,13 @@ function StackGroup({
     <div className="border border-border rounded-lg p-3 mb-4">
       {/* Stack header with health summary */}
       <div className="flex justify-between items-center mb-2 pb-2 border-b border-border">
-        <span className="text-[13px] font-bold text-text-secondary">
+        <span className="text-[13px] font-bold text-muted-foreground">
           Stack: {root.review.branch}
         </span>
-        <span className="text-xs text-text-muted">
+        <span className="text-xs text-muted-foreground">
           <span
             className={
-              health.approved === health.total ? "text-success" : "text-text-muted"
+              health.approved === health.total ? "text-success" : "text-muted-foreground"
             }
           >
             {health.approved}/{health.total} approved
@@ -282,7 +282,7 @@ export function StackView({ reviews, onViewDiff }: StackViewProps) {
 
   if (reviews.length === 0) {
     return (
-      <div className="text-text-muted p-6 text-center">
+      <div className="text-muted-foreground p-6 text-center">
         <p>No reviews loaded.</p>
         <p className="text-[13px]">
           Use the CLI to ingest PRs, then switch to the Stacks view.
@@ -293,7 +293,7 @@ export function StackView({ reviews, onViewDiff }: StackViewProps) {
 
   if (trees.length === 0) {
     return (
-      <div className="text-text-muted p-6 text-center">
+      <div className="text-muted-foreground p-6 text-center">
         <p>No stack roots found.</p>
       </div>
     );

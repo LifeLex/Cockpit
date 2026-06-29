@@ -601,9 +601,15 @@ async fn fetch_prs_by_filter(
 
     let mut reviews = Vec::with_capacity(prs.len());
     for pr in &prs {
-        let diff = github::pr_diff_in(&repo_path, pr.number)
-            .await
-            .unwrap_or_default();
+        let diff = if pr.repo_slug.is_empty() {
+            github::pr_diff_in(&repo_path, pr.number)
+                .await
+                .unwrap_or_default()
+        } else {
+            github::pr_diff_by_repo(&pr.repo_slug, pr.number)
+                .await
+                .unwrap_or_default()
+        };
         let review = github::build_review_from_pr(pr, diff, &repo_path);
         state.reviews.insert(review.clone());
         reviews.push(review);

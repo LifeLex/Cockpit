@@ -63,6 +63,9 @@ pub struct PrData {
     pub state: String,
     /// Full URL of the PR on GitHub.
     pub url: String,
+    /// Repository slug (e.g. "Nexcade/garage"). Present for cross-repo searches.
+    #[serde(default)]
+    pub repo_slug: String,
 }
 
 /// CI check status from `gh pr checks`.
@@ -236,23 +239,27 @@ pub enum PrFilter {
     ReviewRequested,
 }
 
-/// List open PRs with a filter, running `gh` inside `repo_path`.
+/// List open PRs with a filter across all accessible repositories.
 ///
-/// - [`PrFilter::Authored`] → `gh pr list --author=@me`
-/// - [`PrFilter::ReviewRequested`] → `gh pr list --search "review-requested:@me"`
+/// Uses `gh search prs` (cross-repo) to discover PRs, then enriches each
+/// with branch info from `gh pr view --repo`. This way PRs from any repo
+/// the user has access to are returned, not just a single configured repo.
+///
+/// - [`PrFilter::Authored`] → `gh search prs --author=@me`
+/// - [`PrFilter::ReviewRequested`] → `gh search prs --review-requested=@me`
 pub async fn list_prs_filtered(
-    repo_path: &std::path::Path,
+    _repo_path: &std::path::Path,
     filter: PrFilter,
 ) -> Result<Vec<PrData>, Error> {
+    // Step 1: cross-repo search to discover PRs.
     let mut cmd = Command::new("gh");
-    cmd.current_dir(repo_path);
     cmd.args([
-        "pr",
-        "list",
+        "search",
+        "prs",
         "--state",
         "open",
         "--json",
-        "number,headRefName,baseRefName,title,state,url",
+        "number,title,state,url,repository",
         "--limit",
         "100",
     ]);
@@ -262,7 +269,7 @@ pub async fn list_prs_filtered(
             cmd.args(["--author", "@me"]);
         }
         PrFilter::ReviewRequested => {
-            cmd.args(["--search", "review-requested:@me"]);
+            cmd.args(["--review-requested", "@me"]);
         }
     }
 
@@ -274,10 +281,79 @@ pub async fn list_prs_filtered(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let search_results: Vec<SearchPrResult> =
+        serde_json::from_str(&stdout).map_err(|e| Error::ParseOutput(e.to_string()))?;
+
+    // Step 2: enrich each PR with branch names via `gh pr view --repo`.
+    let mut prs = Vec::with_capacity(search_results.len());
+    for sr in &search_results {
+        let slug = &sr.repository.name_with_owner;
+        match enrich_pr(slug, sr.number).await {
+            Ok(mut pr) => {
+                pr.repo_slug = slug.clone();
+                prs.push(pr);
+            }
+            Err(_) => {
+                prs.push(PrData {
+                    number: sr.number,
+                    head_ref_name: String::new(),
+                    base_ref_name: String::new(),
+                    title: sr.title.clone(),
+                    state: sr.state.clone(),
+                    url: sr.url.clone(),
+                    repo_slug: slug.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(prs)
+}
+
+/// Intermediate type for `gh search prs` JSON output.
+#[derive(Debug, Deserialize)]
+struct SearchPrResult {
+    number: u64,
+    title: String,
+    state: String,
+    url: String,
+    repository: SearchRepo,
+}
+
+/// Repository info embedded in search results.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchRepo {
+    name_with_owner: String,
+}
+
+/// Fetch full PR details (branch names) from a specific repo.
+async fn enrich_pr(repo_slug: &str, pr_number: u64) -> Result<PrData, Error> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--repo",
+            repo_slug,
+            "--json",
+            "number,headRefName,baseRefName,title,state,url",
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout).map_err(|e| Error::ParseOutput(e.to_string()))
 }
 
-/// Fetch the unified diff for a PR, running `gh` inside `repo_path`.
+/// Fetch the unified diff for a PR by repo slug and number.
+///
+/// Uses `--repo` so it works cross-repo without needing `current_dir`.
 pub async fn pr_diff_in(repo_path: &std::path::Path, pr_number: u64) -> Result<String, Error> {
     let output = Command::new("gh")
         .current_dir(repo_path)
@@ -293,10 +369,32 @@ pub async fn pr_diff_in(repo_path: &std::path::Path, pr_number: u64) -> Result<S
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Fetch the unified diff for a PR using `--repo` (cross-repo).
+pub async fn pr_diff_by_repo(repo_slug: &str, pr_number: u64) -> Result<String, Error> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "diff",
+            &pr_number.to_string(),
+            "--repo",
+            repo_slug,
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Build a [`Review`] from GitHub PR data and its diff.
 ///
 /// For PRs linked to a Linear issue (detected from the branch name), the
 /// `issue` field is the parsed issue ref. Otherwise, it uses the PR title.
+/// The `repo_path` is used as the worktree location for local operations.
 pub fn build_review_from_pr(
     pr: &PrData,
     diff: String,
@@ -307,8 +405,14 @@ pub fn build_review_from_pr(
     let issue = parse_issue_from_branch(&pr.head_ref_name)
         .unwrap_or_else(|| IssueRef::new(&pr.title));
 
+    let id_prefix = if pr.repo_slug.is_empty() {
+        format!("gh-{}", pr.number)
+    } else {
+        format!("gh-{}-{}", pr.repo_slug.replace('/', "-"), pr.number)
+    };
+
     Review {
-        id: ReviewId::new(format!("gh-{}", pr.number)),
+        id: ReviewId::new(id_prefix),
         issue,
         pr: PrRef::new(&pr.url),
         branch: pr.head_ref_name.clone(),
@@ -586,6 +690,7 @@ mod tests {
                 title: "Thing".into(),
                 state: "OPEN".into(),
                 url: "https://github.com/o/r/pull/1".into(),
+                repo_slug: String::new(),
             },
             PrData {
                 number: 2,
@@ -594,6 +699,7 @@ mod tests {
                 title: "No ID".into(),
                 state: "OPEN".into(),
                 url: "https://github.com/o/r/pull/2".into(),
+                repo_slug: String::new(),
             },
             PrData {
                 number: 3,
@@ -602,6 +708,7 @@ mod tests {
                 title: "Short".into(),
                 state: "MERGED".into(),
                 url: "https://github.com/o/r/pull/3".into(),
+                repo_slug: String::new(),
             },
         ];
 

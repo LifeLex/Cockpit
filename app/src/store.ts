@@ -149,6 +149,25 @@ interface AppStore {
 
   /** Load a plan document from a file path on disk. */
   loadPlanFromPath: (path: string, project: string) => Promise<void>;
+
+  // -------------------------------------------------------------------------
+  // GitHub PR import
+  // -------------------------------------------------------------------------
+
+  /** PRs authored by the current user. */
+  readonly authoredPrs: readonly Review[];
+
+  /** PRs where the current user is requested for review. */
+  readonly reviewRequests: readonly Review[];
+
+  /** Whether a GitHub PR fetch is in progress. */
+  readonly prFetchLoading: boolean;
+
+  /** Fetch PRs authored by the current user from GitHub. */
+  fetchAuthoredPrs: () => Promise<void>;
+
+  /** Fetch PRs where the current user is requested for review. */
+  fetchReviewRequests: () => Promise<void>;
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
@@ -167,6 +186,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
   configError: null,
   kickoffLoading: false,
   kickoffResult: null,
+  authoredPrs: [],
+  reviewRequests: [],
+  prFetchLoading: false,
 
   fetchReviews: async () => {
     set({ loading: true, error: null });
@@ -496,6 +518,30 @@ export const useAppStore = create<AppStore>((set, get) => ({
       set({ plan, loading: false });
     } catch (e: unknown) {
       set({ error: String(e), loading: false });
+    }
+  },
+
+  // -------------------------------------------------------------------------
+  // GitHub PR import
+  // -------------------------------------------------------------------------
+
+  fetchAuthoredPrs: async () => {
+    set({ prFetchLoading: true, error: null });
+    try {
+      const prs = await invoke<Review[]>("fetch_authored_prs");
+      set({ authoredPrs: prs, prFetchLoading: false });
+    } catch (e: unknown) {
+      set({ error: String(e), prFetchLoading: false });
+    }
+  },
+
+  fetchReviewRequests: async () => {
+    set({ prFetchLoading: true, error: null });
+    try {
+      const prs = await invoke<Review[]>("fetch_review_requests");
+      set({ reviewRequests: prs, prFetchLoading: false });
+    } catch (e: unknown) {
+      set({ error: String(e), prFetchLoading: false });
     }
   },
 }));

@@ -223,6 +223,109 @@ pub fn parse_issue_from_branch(branch: &str) -> Option<IssueRef> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Filtered PR listing
+// ---------------------------------------------------------------------------
+
+/// How to filter the PR list from GitHub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrFilter {
+    /// PRs authored by the authenticated user.
+    Authored,
+    /// PRs where the authenticated user was requested for review.
+    ReviewRequested,
+}
+
+/// List open PRs with a filter, running `gh` inside `repo_path`.
+///
+/// - [`PrFilter::Authored`] → `gh pr list --author=@me`
+/// - [`PrFilter::ReviewRequested`] → `gh pr list --search "review-requested:@me"`
+pub async fn list_prs_filtered(
+    repo_path: &std::path::Path,
+    filter: PrFilter,
+) -> Result<Vec<PrData>, Error> {
+    let mut cmd = Command::new("gh");
+    cmd.current_dir(repo_path);
+    cmd.args([
+        "pr",
+        "list",
+        "--state",
+        "open",
+        "--json",
+        "number,headRefName,baseRefName,title,state,url",
+        "--limit",
+        "100",
+    ]);
+
+    match filter {
+        PrFilter::Authored => {
+            cmd.args(["--author", "@me"]);
+        }
+        PrFilter::ReviewRequested => {
+            cmd.args(["--search", "review-requested:@me"]);
+        }
+    }
+
+    let output = cmd.output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout).map_err(|e| Error::ParseOutput(e.to_string()))
+}
+
+/// Fetch the unified diff for a PR, running `gh` inside `repo_path`.
+pub async fn pr_diff_in(repo_path: &std::path::Path, pr_number: u64) -> Result<String, Error> {
+    let output = Command::new("gh")
+        .current_dir(repo_path)
+        .args(["pr", "diff", &pr_number.to_string()])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Build a [`Review`] from GitHub PR data and its diff.
+///
+/// For PRs linked to a Linear issue (detected from the branch name), the
+/// `issue` field is the parsed issue ref. Otherwise, it uses the PR title.
+pub fn build_review_from_pr(
+    pr: &PrData,
+    diff: String,
+    repo_path: &std::path::Path,
+) -> crate::model::Review {
+    use crate::model::*;
+
+    let issue = parse_issue_from_branch(&pr.head_ref_name)
+        .unwrap_or_else(|| IssueRef::new(&pr.title));
+
+    Review {
+        id: ReviewId::new(format!("gh-{}", pr.number)),
+        issue,
+        pr: PrRef::new(&pr.url),
+        branch: pr.head_ref_name.clone(),
+        base: pr.base_ref_name.clone(),
+        base_sha: String::new(),
+        worktree: repo_path.to_path_buf(),
+        gate_state: GateState::Pending,
+        diff: DiffData { raw: diff },
+        head_sha: String::new(),
+        comments: vec![],
+        parents: vec![],
+        children: vec![],
+        stale: false,
+        agent: None,
+    }
+}
+
 /// Map each PR to its linked Linear issue (if any) by parsing the head branch.
 ///
 /// Returns pairs of `(PrRef, Option<IssueRef>)` in the same order as the input.

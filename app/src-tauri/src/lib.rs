@@ -67,6 +67,8 @@ pub fn run() {
             commands::kickoff,
             commands::restack_pr,
             commands::load_plan_from_path,
+            commands::fetch_authored_prs,
+            commands::fetch_review_requests,
         ])
         .run(tauri::generate_context!())
         // INVARIANT: if Tauri fails to start there is nothing to recover —

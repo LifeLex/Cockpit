@@ -558,6 +558,61 @@ pub async fn restack_pr(
 }
 
 // ---------------------------------------------------------------------------
+// GitHub PR import commands
+// ---------------------------------------------------------------------------
+
+/// Fetch open PRs authored by the current user from GitHub.
+///
+/// Runs `gh pr list --author=@me` in the configured repo path, fetches diffs
+/// concurrently for each PR, builds [`Review`] objects, and stores them.
+/// Returns the created reviews.
+#[tauri::command]
+pub async fn fetch_authored_prs(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<Review>, CommandError> {
+    fetch_prs_by_filter(state, github::PrFilter::Authored).await
+}
+
+/// Fetch open PRs where the current user is requested for review.
+///
+/// Runs `gh pr list --search "review-requested:@me"` in the configured repo
+/// path, fetches diffs concurrently, builds [`Review`] objects, and stores them.
+/// Returns the created reviews.
+#[tauri::command]
+pub async fn fetch_review_requests(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<Review>, CommandError> {
+    fetch_prs_by_filter(state, github::PrFilter::ReviewRequested).await
+}
+
+/// Shared implementation for fetching PRs by filter.
+async fn fetch_prs_by_filter(
+    state: State<'_, Arc<AppState>>,
+    filter: github::PrFilter,
+) -> Result<Vec<Review>, CommandError> {
+    let config = Config::load()?;
+    let repo_path = config.repo_path.unwrap_or_else(|| PathBuf::from("."));
+
+    let prs = github::list_prs_filtered(&repo_path, filter)
+        .await
+        .map_err(|e| CommandError {
+            message: format!("failed to list PRs: {e}"),
+        })?;
+
+    let mut reviews = Vec::with_capacity(prs.len());
+    for pr in &prs {
+        let diff = github::pr_diff_in(&repo_path, pr.number)
+            .await
+            .unwrap_or_default();
+        let review = github::build_review_from_pr(pr, diff, &repo_path);
+        state.reviews.insert(review.clone());
+        reviews.push(review);
+    }
+
+    Ok(reviews)
+}
+
+// ---------------------------------------------------------------------------
 // Plan file loading command
 // ---------------------------------------------------------------------------
 

@@ -246,45 +246,41 @@ pub enum PrFilter {
 /// the user has access to are returned, not just a single configured repo.
 ///
 /// - [`PrFilter::Authored`] → `gh search prs --author=@me`
-/// - [`PrFilter::ReviewRequested`] → `gh search prs --review-requested=@me`
+/// - [`PrFilter::ReviewRequested`] → searches both `--review-requested=@me`
+///   (pending requests) and `--reviewed-by=@me` (already interacted), then
+///   deduplicates by PR URL and excludes self-authored PRs.
 pub async fn list_prs_filtered(
     _repo_path: &std::path::Path,
     filter: PrFilter,
 ) -> Result<Vec<PrData>, Error> {
-    // Step 1: cross-repo search to discover PRs.
-    let mut cmd = Command::new("gh");
-    cmd.args([
-        "search",
-        "prs",
-        "--state",
-        "open",
-        "--json",
-        "number,title,state,url,repository",
-        "--limit",
-        "100",
-    ]);
-
-    match filter {
-        PrFilter::Authored => {
-            cmd.args(["--author", "@me"]);
-        }
+    let search_results = match filter {
+        PrFilter::Authored => search_prs(&["--author", "@me"]).await?,
         PrFilter::ReviewRequested => {
-            cmd.args(["--review-requested", "@me"]);
+            let mut pending = search_prs(&["--review-requested", "@me"]).await?;
+            let reviewed = search_prs(&["--reviewed-by", "@me"]).await?;
+            let me = gh_whoami().await.unwrap_or_default();
+
+            // Merge and deduplicate by URL.
+            let mut seen = std::collections::HashSet::new();
+            for r in &pending {
+                seen.insert(r.url.clone());
+            }
+            for r in reviewed {
+                if seen.insert(r.url.clone()) {
+                    pending.push(r);
+                }
+            }
+
+            // Exclude self-authored PRs (those belong in the Authored tab).
+            if !me.is_empty() {
+                pending.retain(|r| r.author_login() != me);
+            }
+
+            pending
         }
-    }
+    };
 
-    let output = cmd.output().await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::GhCommand(stderr.into_owned()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let search_results: Vec<SearchPrResult> =
-        serde_json::from_str(&stdout).map_err(|e| Error::ParseOutput(e.to_string()))?;
-
-    // Step 2: enrich each PR with branch names via `gh pr view --repo`.
+    // Enrich each PR with branch names via `gh pr view --repo`.
     let mut prs = Vec::with_capacity(search_results.len());
     for sr in &search_results {
         let slug = &sr.repository.name_with_owner;
@@ -310,6 +306,52 @@ pub async fn list_prs_filtered(
     Ok(prs)
 }
 
+/// Run `gh search prs --state=open` with the given extra args.
+async fn search_prs(extra_args: &[&str]) -> Result<Vec<SearchPrResult>, Error> {
+    let mut cmd = Command::new("gh");
+    cmd.args([
+        "search",
+        "prs",
+        "--state",
+        "open",
+        "--json",
+        "number,title,state,url,repository,author",
+        "--limit",
+        "100",
+    ]);
+    cmd.args(extra_args);
+
+    let output = cmd.output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout).map_err(|e| Error::ParseOutput(e.to_string()))
+}
+
+/// Get the current authenticated GitHub username.
+async fn gh_whoami() -> Result<String, Error> {
+    let output = Command::new("gh")
+        .args(["auth", "status", "--json", "user"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(Error::GhCommand("gh auth status failed".into()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).map_err(|e| Error::ParseOutput(e.to_string()))?;
+    Ok(v.get("user")
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
 /// Intermediate type for `gh search prs` JSON output.
 #[derive(Debug, Deserialize)]
 struct SearchPrResult {
@@ -318,6 +360,15 @@ struct SearchPrResult {
     state: String,
     url: String,
     repository: SearchRepo,
+    #[serde(default)]
+    author: SearchAuthor,
+}
+
+impl SearchPrResult {
+    /// Login of the PR author, lowercased for comparison.
+    fn author_login(&self) -> &str {
+        &self.author.login
+    }
 }
 
 /// Repository info embedded in search results.
@@ -325,6 +376,13 @@ struct SearchPrResult {
 #[serde(rename_all = "camelCase")]
 struct SearchRepo {
     name_with_owner: String,
+}
+
+/// Author info embedded in search results.
+#[derive(Debug, Default, Deserialize)]
+struct SearchAuthor {
+    #[serde(default)]
+    login: String,
 }
 
 /// Fetch full PR details (branch names) from a specific repo.

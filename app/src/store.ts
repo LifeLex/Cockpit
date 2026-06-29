@@ -210,13 +210,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   openReview: async (pr: string) => {
+    set({ loading: true, error: null });
     try {
-      await invoke("open_review", { pr });
-      const reviews = await invoke<Review[]>("list_reviews");
-      const frontier = await invoke<Review[]>("get_frontier");
-      set({ reviews, frontier });
+      const review = await invoke<Review>("open_review", { pr });
+      const diff = await invoke<DiffData>("get_review_diff", { pr });
+      set({
+        view: { kind: "diff", pr },
+        activeReview: review,
+        activeDiff: diff,
+        loading: false,
+      });
     } catch (e: unknown) {
-      set({ error: String(e) });
+      set({ error: String(e), loading: false });
     }
   },
 

@@ -33,7 +33,7 @@ pub fn run() {
             // Forward CompletionEvents from the hook server to the frontend
             // via Tauri's event system. The frontend listens for
             // "agent-completed" and refreshes its state.
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 while let Ok(event) = rx.recv().await {
                     // Best-effort: if no frontend window is listening, the
                     // event is simply dropped.

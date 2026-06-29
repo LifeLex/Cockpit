@@ -25,6 +25,7 @@ pub fn run() {
     let app_state = Arc::new(AppState::new_with_completion_tx(completion_tx));
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
         .setup(|app| {
             let app_handle = app.handle().clone();
@@ -61,6 +62,11 @@ pub fn run() {
             commands::plan_open,
             commands::batch_approve_preview,
             commands::approve_review,
+            commands::get_config,
+            commands::save_config,
+            commands::kickoff,
+            commands::restack_pr,
+            commands::load_plan_from_path,
         ])
         .run(tauri::generate_context!())
         // INVARIANT: if Tauri fails to start there is nothing to recover —

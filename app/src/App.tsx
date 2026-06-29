@@ -12,6 +12,9 @@ import { SettingsView } from "./components/SettingsView";
 import { KickoffView } from "./components/KickoffView";
 import { SkeletonList } from "./components/SkeletonCard";
 import { EmptyState } from "./components/EmptyState";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Button } from "@/components/ui/button";
 
 type ReviewTab = "my-prs" | "review-requests" | "frontier";
 
@@ -143,6 +146,18 @@ function App() {
     [navigateToFrontier, navigateToPlan, navigateToStacks, navigateToSettings, navigateToKickoff],
   );
 
+  // Justified cast: value is constrained to the three TabsTrigger values below
+  const handleTabChange = useCallback(
+    (value: unknown) => {
+      if (value === null || typeof value !== "string") return;
+      const tab = value as ReviewTab;
+      setReviewTab(tab);
+      if (tab === "my-prs") void fetchAuthoredPrs();
+      if (tab === "review-requests") void fetchReviewRequests();
+    },
+    [fetchAuthoredPrs, fetchReviewRequests],
+  );
+
   const errorBanner =
     error !== null ? (
       <div className="mb-4 rounded-lg border border-danger bg-danger/10 px-4 py-3 text-sm text-danger">
@@ -157,127 +172,119 @@ function App() {
           <div className="mx-auto max-w-4xl px-6 py-8">
             {errorBanner}
 
-            {/* Tab bar */}
-            <div className="mb-6 flex items-center gap-1 border-b border-border">
-              {(
-                [
-                  { key: "my-prs" as const, label: "My PRs", count: authoredPrs.length },
-                  { key: "review-requests" as const, label: "Review Requests", count: reviewRequests.length },
-                  { key: "frontier" as const, label: "Frontier", count: frontier.length },
-                ] as const
-              ).map((tab) => (
-                <button
-                  key={tab.key}
-                  onClick={() => {
-                    setReviewTab(tab.key);
-                    if (tab.key === "my-prs") void fetchAuthoredPrs();
-                    if (tab.key === "review-requests") void fetchReviewRequests();
-                  }}
-                  className={[
-                    "relative px-4 py-2.5 text-sm font-medium transition-colors",
-                    reviewTab === tab.key
-                      ? "text-accent"
-                      : "text-text-muted hover:text-text-secondary",
-                  ].join(" ")}
-                >
-                  {tab.label}
-                  {tab.count > 0 && (
-                    <span className="ml-1.5 rounded-full bg-surface-3 px-1.5 py-0.5 text-xs text-text-muted">
-                      {tab.count}
-                    </span>
-                  )}
-                  {reviewTab === tab.key && (
-                    <span className="absolute inset-x-0 bottom-0 h-0.5 bg-accent" />
-                  )}
-                </button>
-              ))}
+            <Tabs value={reviewTab} onValueChange={handleTabChange}>
+              <div className="flex items-center mb-6">
+                <TabsList variant="line">
+                  <TabsTrigger value="my-prs">
+                    My PRs
+                    {authoredPrs.length > 0 && (
+                      <span className="ml-1.5 rounded-full bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                        {authoredPrs.length}
+                      </span>
+                    )}
+                  </TabsTrigger>
+                  <TabsTrigger value="review-requests">
+                    Review Requests
+                    {reviewRequests.length > 0 && (
+                      <span className="ml-1.5 rounded-full bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                        {reviewRequests.length}
+                      </span>
+                    )}
+                  </TabsTrigger>
+                  <TabsTrigger value="frontier">
+                    Frontier
+                    {frontier.length > 0 && (
+                      <span className="ml-1.5 rounded-full bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                        {frontier.length}
+                      </span>
+                    )}
+                  </TabsTrigger>
+                </TabsList>
 
-              {/* Batch approve in the frontier tab */}
-              {reviewTab === "frontier" && frontier.length > 0 && (
-                <button
-                  onClick={() => {
-                    void fetchBatchApprovePreview();
+                <div className="ml-auto flex items-center gap-2">
+                  {reviewTab === "frontier" && frontier.length > 0 && (
+                    <Button
+                      onClick={() => {
+                        void fetchBatchApprovePreview();
+                      }}
+                      className="bg-success text-white hover:bg-success/90"
+                    >
+                      Batch Approve
+                    </Button>
+                  )}
+
+                  {(reviewTab === "my-prs" || reviewTab === "review-requests") && (
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        if (reviewTab === "my-prs") void fetchAuthoredPrs();
+                        else void fetchReviewRequests();
+                      }}
+                      disabled={prFetchLoading}
+                    >
+                      {prFetchLoading ? "Fetching..." : "Refresh"}
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              {showBatchPanel && batchVerdicts !== null && reviewTab === "frontier" && (
+                <BatchApprovePanel
+                  verdicts={batchVerdicts}
+                  onApprove={approveReview}
+                  onApproveAll={() => {
+                    void approveAllEligible();
                   }}
-                  className="ml-auto rounded-md bg-success px-4 py-1.5 text-sm font-medium text-white transition-colors hover:opacity-90"
-                >
-                  Batch Approve
-                </button>
+                  onClose={toggleBatchPanel}
+                />
               )}
 
-              {/* Refresh button for GitHub tabs */}
-              {(reviewTab === "my-prs" || reviewTab === "review-requests") && (
-                <button
-                  onClick={() => {
-                    if (reviewTab === "my-prs") void fetchAuthoredPrs();
-                    else void fetchReviewRequests();
-                  }}
-                  disabled={prFetchLoading}
-                  className="ml-auto rounded-md border border-border bg-surface-2 px-3 py-1.5 text-sm text-text-secondary transition-colors hover:bg-surface-3 disabled:opacity-50"
-                >
-                  {prFetchLoading ? "Fetching..." : "Refresh"}
-                </button>
-              )}
-            </div>
+              <TabsContent value="my-prs">
+                <section className="space-y-3">
+                  {prFetchLoading && authoredPrs.length === 0 && <SkeletonList count={4} />}
+                  {authoredPrs.map((review) => (
+                    <ReviewCard
+                      key={review.id}
+                      review={review}
+                      onOpen={openReview}
+                      onViewDiff={handleViewDiff}
+                    />
+                  ))}
+                  {!prFetchLoading && authoredPrs.length === 0 && (
+                    <EmptyState
+                      icon="📝"
+                      title="No open PRs"
+                      description="Click Refresh to fetch your open PRs from GitHub. Make sure your repo path is configured in Settings."
+                      actionLabel="Go to Settings"
+                      onAction={navigateToSettings}
+                    />
+                  )}
+                </section>
+              </TabsContent>
 
-            {showBatchPanel && batchVerdicts !== null && reviewTab === "frontier" && (
-              <BatchApprovePanel
-                verdicts={batchVerdicts}
-                onApprove={approveReview}
-                onApproveAll={() => {
-                  void approveAllEligible();
-                }}
-                onClose={toggleBatchPanel}
-              />
-            )}
+              <TabsContent value="review-requests">
+                <section className="space-y-3">
+                  {prFetchLoading && reviewRequests.length === 0 && <SkeletonList count={4} />}
+                  {reviewRequests.map((review) => (
+                    <ReviewCard
+                      key={review.id}
+                      review={review}
+                      onOpen={openReview}
+                      onViewDiff={handleViewDiff}
+                    />
+                  ))}
+                  {!prFetchLoading && reviewRequests.length === 0 && (
+                    <EmptyState
+                      icon="👀"
+                      title="No review requests"
+                      description="No PRs are waiting for your review. Click Refresh to check again."
+                    />
+                  )}
+                </section>
+              </TabsContent>
 
-            {/* Tab content */}
-            {reviewTab === "my-prs" && (
-              <section>
-                {prFetchLoading && authoredPrs.length === 0 && <SkeletonList count={4} />}
-                {authoredPrs.map((review) => (
-                  <ReviewCard
-                    key={review.id}
-                    review={review}
-                    onOpen={openReview}
-                    onViewDiff={handleViewDiff}
-                  />
-                ))}
-                {!prFetchLoading && authoredPrs.length === 0 && (
-                  <EmptyState
-                    icon="📝"
-                    title="No open PRs"
-                    description="Click Refresh to fetch your open PRs from GitHub. Make sure your repo path is configured in Settings."
-                    actionLabel="Go to Settings"
-                    onAction={navigateToSettings}
-                  />
-                )}
-              </section>
-            )}
-
-            {reviewTab === "review-requests" && (
-              <section>
-                {prFetchLoading && reviewRequests.length === 0 && <SkeletonList count={4} />}
-                {reviewRequests.map((review) => (
-                  <ReviewCard
-                    key={review.id}
-                    review={review}
-                    onOpen={openReview}
-                    onViewDiff={handleViewDiff}
-                  />
-                ))}
-                {!prFetchLoading && reviewRequests.length === 0 && (
-                  <EmptyState
-                    icon="👀"
-                    title="No review requests"
-                    description="No PRs are waiting for your review. Click Refresh to check again."
-                  />
-                )}
-              </section>
-            )}
-
-            {reviewTab === "frontier" && (
-              <>
-                <section>
+              <TabsContent value="frontier">
+                <section className="space-y-3">
                   {loading && frontier.length === 0 && <SkeletonList count={4} />}
                   {frontier.map((review) => (
                     <ReviewCard
@@ -303,17 +310,19 @@ function App() {
                     <h2 className="mb-3 text-lg font-semibold text-text-primary">
                       All Reviews ({reviews.length})
                     </h2>
-                    {reviews.map((review) => (
-                      <ReviewCard
-                        key={review.id}
-                        review={review}
-                        onViewDiff={handleViewDiff}
-                      />
-                    ))}
+                    <div className="space-y-3">
+                      {reviews.map((review) => (
+                        <ReviewCard
+                          key={review.id}
+                          review={review}
+                          onViewDiff={handleViewDiff}
+                        />
+                      ))}
+                    </div>
                   </section>
                 )}
-              </>
-            )}
+              </TabsContent>
+            </Tabs>
           </div>
         );
 
@@ -412,19 +421,21 @@ function App() {
   }
 
   return (
-    <div className="flex h-screen overflow-hidden bg-surface-0 text-text-primary">
-      <Sidebar
-        activeView={view.kind}
-        reviewCount={reviews.length}
-        hasPlan={plan !== null}
-        onNavigate={handleNavigate}
-        collapsed={sidebarCollapsed}
-        onToggleCollapse={toggleSidebar}
-      />
-      <main className="flex-1 overflow-y-auto">
-        {renderContent()}
-      </main>
-    </div>
+    <TooltipProvider>
+      <div className="flex h-screen overflow-hidden bg-surface-0 text-text-primary">
+        <Sidebar
+          activeView={view.kind}
+          reviewCount={reviews.length}
+          hasPlan={plan !== null}
+          onNavigate={handleNavigate}
+          collapsed={sidebarCollapsed}
+          onToggleCollapse={toggleSidebar}
+        />
+        <main className="flex-1 overflow-y-auto">
+          {renderContent()}
+        </main>
+      </div>
+    </TooltipProvider>
   );
 }
 

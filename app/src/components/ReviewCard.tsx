@@ -1,10 +1,21 @@
+import { Card, CardContent } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  GitPullRequest,
+  MessageSquare,
+  AlertTriangle,
+  Bot,
+  ExternalLink,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
 import type { Review } from "../bindings/Review";
 import type { GateState } from "../bindings/GateState";
 
 interface ReviewCardProps {
   readonly review: Review;
-  readonly onOpen?: (pr: string) => void;
-  readonly onViewDiff?: (pr: string) => void;
+  readonly onOpen?: ((pr: string) => void) | undefined;
+  readonly onViewDiff?: ((pr: string) => void) | undefined;
 }
 
 function assertNever(x: never): never {
@@ -28,23 +39,6 @@ function gateStateLabel(state: GateState): string {
   }
 }
 
-function gateStateBgClass(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "bg-state-pending";
-    case "InReview":
-      return "bg-state-in-review";
-    case "Dispatched":
-      return "bg-state-dispatched";
-    case "Reworked":
-      return "bg-state-reworked";
-    case "Approved":
-      return "bg-state-approved";
-    default:
-      return assertNever(state);
-  }
-}
-
 function gateStateBorderClass(state: GateState): string {
   switch (state) {
     case "Pending":
@@ -62,68 +56,125 @@ function gateStateBorderClass(state: GateState): string {
   }
 }
 
+function gateStateBadgeClass(state: GateState): string {
+  switch (state) {
+    case "Pending":
+      return "bg-state-pending/20 text-state-pending border-state-pending/30";
+    case "InReview":
+      return "bg-state-in-review/20 text-state-in-review border-state-in-review/30";
+    case "Dispatched":
+      return "bg-state-dispatched/20 text-state-dispatched border-state-dispatched/30";
+    case "Reworked":
+      return "bg-state-reworked/20 text-state-reworked border-state-reworked/30";
+    case "Approved":
+      return "bg-state-approved/20 text-state-approved border-state-approved/30";
+    default:
+      return assertNever(state);
+  }
+}
+
+function parsePrDisplay(pr: string): { repo: string; number: string } {
+  const match = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(pr);
+  if (match !== null) {
+    const [, repo, num] = match;
+    if (repo !== undefined && num !== undefined) {
+      return { repo, number: num };
+    }
+  }
+  return { repo: "", number: pr };
+}
+
 export function ReviewCard({ review, onOpen, onViewDiff }: ReviewCardProps) {
   const canOpen =
     review.gate_state === "Pending" || review.gate_state === "Reworked";
+  const { repo, number: prNumber } = parsePrDisplay(review.pr);
 
   return (
-    <div
-      className={`border border-border rounded-lg p-4 mb-3 border-l-4 hover:bg-surface-1/50 transition-colors ${gateStateBorderClass(review.gate_state)}`}
+    <Card
+      className={cn(
+        "border-l-4 p-0 transition-colors hover:bg-surface-1/50",
+        gateStateBorderClass(review.gate_state),
+      )}
     >
-      <div className="flex justify-between items-center">
-        <div>
-          <strong className="font-bold text-text-primary">
-            PR {review.pr}
-          </strong>
-          <span className="ml-2 text-text-muted">{review.branch}</span>
+      <CardContent className="p-4">
+        {/* Top row: PR icon + branch + repo slug + gate state badge */}
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <GitPullRequest className="h-4 w-4 shrink-0 text-text-muted" />
+            <span className="truncate text-sm font-semibold text-text-primary">
+              {review.branch}
+            </span>
+            {repo !== "" && (
+              <span className="shrink-0 text-xs text-text-muted">
+                {repo}#{prNumber}
+              </span>
+            )}
+          </div>
+          <Badge
+            variant="outline"
+            className={cn(
+              "shrink-0",
+              gateStateBadgeClass(review.gate_state),
+            )}
+          >
+            {gateStateLabel(review.gate_state)}
+          </Badge>
         </div>
-        <span
-          className={`px-2 py-0.5 rounded text-xs font-bold text-white ${gateStateBgClass(review.gate_state)}`}
-        >
-          {gateStateLabel(review.gate_state)}
-        </span>
-      </div>
 
-      <div className="mt-2 text-sm text-text-secondary">
-        Issue: {review.issue} | Base: {review.base}
-        {review.stale && (
-          <span className="text-danger ml-2">(stale)</span>
-        )}
-        {review.agent != null && (
-          <span className="ml-2 text-warning">
-            Agent running (PID: {review.agent.pid})
+        {/* Middle row: issue ref, base branch, comment count, stale, agent */}
+        <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-text-secondary">
+          <span>{review.issue}</span>
+          <span className="text-text-muted">
+            base: {review.base}
           </span>
-        )}
-      </div>
+          {review.comments.length > 0 && (
+            <span className="inline-flex items-center gap-1 text-text-muted">
+              <MessageSquare className="h-3 w-3" />
+              {review.comments.length}
+            </span>
+          )}
+          {review.stale && (
+            <span className="inline-flex items-center gap-1 text-danger">
+              <AlertTriangle className="h-3 w-3" />
+              Stale
+            </span>
+          )}
+          {review.agent != null && (
+            <span className="inline-flex items-center gap-1 text-warning">
+              <Bot className="h-3 w-3" />
+              PID {review.agent.pid}
+            </span>
+          )}
+        </div>
 
-      <div className="mt-2 flex items-center">
-        {review.comments.length > 0 && (
-          <span className="text-xs text-text-muted">
-            {review.comments.length} comment
-            {review.comments.length !== 1 ? "s" : ""}
-          </span>
+        {/* Bottom row: action buttons */}
+        {(canOpen && onOpen != null || onViewDiff != null) && (
+          <div className="mt-3 flex items-center gap-2">
+            {canOpen && onOpen != null && (
+              <Button
+                size="sm"
+                onClick={() => {
+                  onOpen(review.pr);
+                }}
+              >
+                Open for Review
+              </Button>
+            )}
+            {onViewDiff != null && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  onViewDiff(review.pr);
+                }}
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                View Diff
+              </Button>
+            )}
+          </div>
         )}
-        {canOpen && onOpen != null && (
-          <button
-            onClick={() => {
-              onOpen(review.pr);
-            }}
-            className="ml-2 px-3 py-1 rounded bg-accent hover:bg-accent-hover text-white text-sm border-none cursor-pointer"
-          >
-            Open for Review
-          </button>
-        )}
-        {onViewDiff != null && (
-          <button
-            onClick={() => {
-              onViewDiff(review.pr);
-            }}
-            className="ml-2 px-3 py-1 rounded bg-surface-2 hover:bg-surface-3 text-text-secondary text-sm border border-border cursor-pointer"
-          >
-            View Diff
-          </button>
-        )}
-      </div>
-    </div>
+      </CardContent>
+    </Card>
   );
 }

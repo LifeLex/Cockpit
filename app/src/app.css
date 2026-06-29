@@ -1,70 +1,155 @@
 @import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
 
-/* Design tokens via CSS custom properties */
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Cockpit dark theme — oklch-based, merged with shadcn's variable system.
+ * The app is always dark, so :root sets the dark palette directly.
+ * Gate state colors and surface elevation levels are domain-specific tokens
+ * that shadcn doesn't cover.
+ */
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: 'Geist Variable', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+
+  /* shadcn component variable bindings */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
 @theme {
-  --color-surface-0: oklch(0.145 0.01 260);    /* app bg - near black */
-  --color-surface-1: oklch(0.185 0.015 260);   /* sidebar, cards */
-  --color-surface-2: oklch(0.225 0.015 260);   /* elevated: inputs, hover */
-  --color-surface-3: oklch(0.27 0.015 260);    /* active states */
+  /* Surface elevation levels (domain-specific) */
+  --color-surface-0: oklch(0.145 0.01 260);
+  --color-surface-1: oklch(0.185 0.015 260);
+  --color-surface-2: oklch(0.225 0.015 260);
+  --color-surface-3: oklch(0.27 0.015 260);
 
-  --color-border: oklch(0.32 0.015 260);       /* subtle borders */
-  --color-border-strong: oklch(0.40 0.015 260); /* emphasized borders */
+  --color-border-strong: oklch(0.40 0.015 260);
 
+  /* Text hierarchy (domain-specific) */
   --color-text-primary: oklch(0.95 0.01 260);
   --color-text-secondary: oklch(0.65 0.01 260);
   --color-text-muted: oklch(0.50 0.01 260);
 
-  /* Gate state colors */
+  /* Gate state colors (domain-specific) */
   --color-state-pending: oklch(0.55 0.01 260);
   --color-state-in-review: oklch(0.65 0.18 250);
   --color-state-dispatched: oklch(0.75 0.15 75);
   --color-state-reworked: oklch(0.65 0.2 310);
   --color-state-approved: oklch(0.70 0.17 155);
 
-  /* Accents */
-  --color-accent: oklch(0.65 0.18 250);
-  --color-accent-hover: oklch(0.72 0.18 250);
+  /* Semantic accents (domain-specific) */
+  --color-accent-brand: oklch(0.65 0.18 250);
+  --color-accent-brand-hover: oklch(0.72 0.18 250);
   --color-danger: oklch(0.65 0.22 25);
   --color-warning: oklch(0.75 0.15 75);
   --color-success: oklch(0.70 0.17 155);
 }
 
-/* Base styles */
-body {
-  @apply bg-surface-0 text-text-primary;
-  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
-  -webkit-font-smoothing: antialiased;
+/*
+ * Dark palette — always active. shadcn reads these from :root and .dark;
+ * we use a single dark palette for both since Cockpit has no light mode.
+ */
+:root {
+  --background: oklch(0.145 0.01 260);
+  --foreground: oklch(0.95 0.01 260);
+  --card: oklch(0.185 0.015 260);
+  --card-foreground: oklch(0.95 0.01 260);
+  --popover: oklch(0.185 0.015 260);
+  --popover-foreground: oklch(0.95 0.01 260);
+  --primary: oklch(0.65 0.18 250);
+  --primary-foreground: oklch(0.98 0.01 260);
+  --secondary: oklch(0.225 0.015 260);
+  --secondary-foreground: oklch(0.95 0.01 260);
+  --muted: oklch(0.225 0.015 260);
+  --muted-foreground: oklch(0.50 0.01 260);
+  --accent: oklch(0.225 0.015 260);
+  --accent-foreground: oklch(0.95 0.01 260);
+  --destructive: oklch(0.65 0.22 25);
+  --border: oklch(0.32 0.015 260);
+  --input: oklch(0.225 0.015 260);
+  --ring: oklch(0.65 0.18 250);
+  --chart-1: oklch(0.65 0.18 250);
+  --chart-2: oklch(0.70 0.17 155);
+  --chart-3: oklch(0.75 0.15 75);
+  --chart-4: oklch(0.65 0.2 310);
+  --chart-5: oklch(0.55 0.01 260);
+  --radius: 0.5rem;
+  --sidebar: oklch(0.165 0.012 260);
+  --sidebar-foreground: oklch(0.95 0.01 260);
+  --sidebar-primary: oklch(0.65 0.18 250);
+  --sidebar-primary-foreground: oklch(0.98 0.01 260);
+  --sidebar-accent: oklch(0.225 0.015 260);
+  --sidebar-accent-foreground: oklch(0.95 0.01 260);
+  --sidebar-border: oklch(0.32 0.015 260);
+  --sidebar-ring: oklch(0.65 0.18 250);
 }
 
-/* Scrollbar styling for dark theme */
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground font-sans;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+/* Scrollbar styling */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: var(--color-surface-1);
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--color-border-strong);
-  border-radius: 4px;
+  background: oklch(0.32 0.015 260 / 60%);
+  border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--color-text-muted);
-}
-
-/* Focus rings for keyboard navigation */
-button:focus-visible,
-a:focus-visible,
-input:focus-visible,
-textarea:focus-visible,
-select:focus-visible,
-[role="button"]:focus-visible,
-[role="tab"]:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
-}
-
-/* Smooth transitions on interactive elements */
-button, a, input, textarea, select {
-  transition: background-color 200ms ease, border-color 200ms ease, color 200ms ease, opacity 200ms ease;
+  background: oklch(0.40 0.015 260);
 }

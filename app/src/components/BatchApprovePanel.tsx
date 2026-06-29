@@ -1,3 +1,8 @@
+import { Card, CardContent } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { CheckCircle2, XCircle, X } from "lucide-react";
+import { cn } from "@/lib/utils";
 import type { Review } from "../bindings/Review";
 import type { BatchVerdict } from "../bindings/BatchVerdict";
 import type { GateState } from "../bindings/GateState";
@@ -30,23 +35,12 @@ function gateStateLabel(state: GateState): string {
   }
 }
 
-function verdictBgClass(verdict: BatchVerdict): string {
+function verdictBorderClass(verdict: BatchVerdict): string {
   switch (verdict.kind) {
     case "Eligible":
       return "border-l-success";
     case "Ineligible":
       return "border-l-warning";
-    default:
-      return assertNever(verdict);
-  }
-}
-
-function verdictTextClass(verdict: BatchVerdict): string {
-  switch (verdict.kind) {
-    case "Eligible":
-      return "text-success";
-    case "Ineligible":
-      return "text-warning";
     default:
       return assertNever(verdict);
   }
@@ -63,68 +57,97 @@ export function BatchApprovePanel({
   ).length;
 
   return (
-    <div className="border border-border rounded-lg p-4 mb-4 bg-surface-1">
-      <div className="flex justify-between items-center mb-3">
-        <h3 className="m-0 text-text-primary">
-          Batch Approve Preview ({eligibleCount}/{verdicts.length} eligible)
-        </h3>
-        <div className="flex gap-2">
-          {eligibleCount > 0 && (
-            <button
-              onClick={onApproveAll}
-              className="px-4 py-1.5 bg-success text-white border-none rounded font-bold cursor-pointer hover:opacity-90"
-            >
-              Approve All Eligible ({eligibleCount})
-            </button>
-          )}
-          <button
-            onClick={onClose}
-            className="px-4 py-1.5 bg-transparent text-text-muted border border-border rounded cursor-pointer hover:bg-surface-2"
-          >
-            Close
-          </button>
-        </div>
-      </div>
-
-      {verdicts.length === 0 && (
-        <p className="text-text-muted">No reviews to evaluate.</p>
-      )}
-
-      {verdicts.map(([review, verdict]) => (
-        <div
-          key={review.id}
-          className={`flex justify-between items-center px-3 py-2 mb-1 rounded border-l-[3px] bg-surface-2 ${verdictBgClass(verdict)}`}
-        >
-          <div className="flex-1">
-            <strong className="font-bold text-text-primary">
-              PR {review.pr}
-            </strong>
-            <span className="ml-2 text-text-muted text-[13px]">
-              {gateStateLabel(review.gate_state)}
-            </span>
-            <div className="text-xs text-text-secondary mt-0.5">
-              {verdict.reasons.join(" | ")}
-            </div>
+    <Card className="mb-4 p-0">
+      <CardContent className="p-4">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h3 className="text-sm font-semibold text-text-primary">
+              Batch Approve Preview
+            </h3>
+            <p className="mt-0.5 text-xs text-text-muted">
+              {eligibleCount}/{verdicts.length} eligible
+            </p>
           </div>
           <div className="flex items-center gap-2">
-            <span
-              className={`text-xs font-bold ${verdictTextClass(verdict)}`}
-            >
-              {verdict.kind === "Eligible" ? "ELIGIBLE" : "INELIGIBLE"}
-            </span>
-            {verdict.kind === "Eligible" && (
-              <button
-                onClick={() => {
-                  void onApprove(review.pr);
-                }}
-                className="px-2.5 py-1 bg-success text-white border-none rounded text-xs cursor-pointer"
+            {eligibleCount > 0 && (
+              <Button
+                size="sm"
+                className="bg-success text-white hover:bg-success/90"
+                onClick={onApproveAll}
               >
-                Approve
-              </button>
+                <CheckCircle2 className="h-3.5 w-3.5" />
+                Approve All ({eligibleCount})
+              </Button>
             )}
+            <Button variant="ghost" size="icon" onClick={onClose}>
+              <X className="h-4 w-4" />
+            </Button>
           </div>
         </div>
-      ))}
-    </div>
+
+        {verdicts.length === 0 && (
+          <p className="text-sm text-text-muted py-2">
+            No reviews to evaluate.
+          </p>
+        )}
+
+        <div className="space-y-1.5">
+          {verdicts.map(([review, verdict]) => (
+            <div
+              key={review.id}
+              className={cn(
+                "flex items-center justify-between rounded-lg border-l-[3px] bg-surface-2 px-3 py-2.5",
+                verdictBorderClass(verdict),
+              )}
+            >
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium text-text-primary truncate">
+                    {review.branch}
+                  </span>
+                  <Badge variant="outline" className="shrink-0 text-[10px]">
+                    {gateStateLabel(review.gate_state)}
+                  </Badge>
+                </div>
+                <p className="mt-0.5 text-xs text-text-muted truncate">
+                  {verdict.reasons.join(" · ")}
+                </p>
+              </div>
+              <div className="ml-3 flex shrink-0 items-center gap-2">
+                {verdict.kind === "Eligible" ? (
+                  <>
+                    <Badge
+                      variant="outline"
+                      className="bg-success/15 text-success border-success/30"
+                    >
+                      <CheckCircle2 className="mr-1 h-3 w-3" />
+                      Approve
+                    </Badge>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="border-success/40 text-success hover:bg-success/10"
+                      onClick={() => {
+                        void onApprove(review.pr);
+                      }}
+                    >
+                      Approve
+                    </Button>
+                  </>
+                ) : (
+                  <Badge
+                    variant="outline"
+                    className="bg-warning/15 text-warning border-warning/30"
+                  >
+                    <XCircle className="mr-1 h-3 w-3" />
+                    Blocked
+                  </Badge>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
   );
 }

@@ -1,27 +1,25 @@
-/**
- * Settings pane for configuring Cockpit credentials, paths, and ports.
- *
- * Fetches the persisted Config on mount and renders an editable form.
- * The "Browse" button for the repo path uses Tauri's dialog plugin to
- * open a native directory picker.
- */
-
 import { useState, useEffect, useCallback } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../store";
 import type { Config } from "../bindings/Config";
-
-// ---------------------------------------------------------------------------
-// Feedback union: discriminated on kind so the banner can style itself.
-// ---------------------------------------------------------------------------
+import {
+  Card,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+  CardContent,
+  CardFooter,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
+import { Save, FolderOpen, Eye, EyeOff, Settings } from "lucide-react";
+import { cn } from "@/lib/utils";
 
 type Feedback =
   | { readonly kind: "success"; readonly message: string }
   | { readonly kind: "error"; readonly message: string };
-
-// ---------------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------------
 
 export function SettingsView() {
   const config = useAppStore((s) => s.config);
@@ -30,7 +28,6 @@ export function SettingsView() {
   const fetchConfig = useAppStore((s) => s.fetchConfig);
   const saveConfig = useAppStore((s) => s.saveConfig);
 
-  // Local form state — seeded from the store config once it arrives.
   const [linearApiKey, setLinearApiKey] = useState("");
   const [linearProjectId, setLinearProjectId] = useState("");
   const [repoPath, setRepoPath] = useState("");
@@ -39,12 +36,10 @@ export function SettingsView() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
 
-  // Fetch config on mount.
   useEffect(() => {
     void fetchConfig();
   }, [fetchConfig]);
 
-  // Seed form fields when config arrives from the backend.
   useEffect(() => {
     if (config !== null) {
       setLinearApiKey(config.linear_api_key ?? "");
@@ -79,7 +74,6 @@ export function SettingsView() {
     }
   }, [linearApiKey, linearProjectId, repoPath, agentCommand, hookPort, saveConfig]);
 
-  // Surface backend config-fetch errors as feedback.
   useEffect(() => {
     if (configError !== null) {
       setFeedback({ kind: "error", message: configError });
@@ -88,153 +82,168 @@ export function SettingsView() {
 
   return (
     <div className="mx-auto max-w-2xl px-6 py-8">
-      <h1 className="mb-6 text-xl font-semibold text-text-primary">
-        Settings
-      </h1>
+      <div className="mb-6 flex items-center gap-3">
+        <Settings className="h-6 w-6 text-text-secondary" />
+        <div>
+          <h1 className="text-xl font-semibold text-text-primary">Settings</h1>
+          <p className="text-sm text-text-secondary">
+            Configure credentials, repository path, and agent settings.
+          </p>
+        </div>
+      </div>
 
-      {/* Feedback banner */}
       {feedback !== null && (
-        <div
-          className={[
-            "mb-6 rounded-lg border px-4 py-3 text-sm",
+        <p
+          className={cn(
+            "mb-6 text-sm",
             feedback.kind === "success"
-              ? "border-success bg-success/10 text-success"
-              : "border-danger bg-danger/10 text-danger",
-          ].join(" ")}
+              ? "text-success"
+              : "text-destructive",
+          )}
         >
           {feedback.message}
-        </div>
+        </p>
       )}
 
-      <div className="rounded-lg border border-border bg-surface-1 p-6">
+      <Card>
         {configLoading && config === null ? (
-          <p className="text-sm text-text-muted">Loading configuration...</p>
+          <CardContent className="py-8">
+            <p className="text-sm text-muted-foreground">
+              Loading configuration...
+            </p>
+          </CardContent>
         ) : (
           <form
             onSubmit={(e) => {
               e.preventDefault();
               void handleSave();
             }}
-            className="flex flex-col gap-5"
           >
-            {/* Linear API Key */}
-            <label className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium text-text-secondary">
-                Linear API Key
-              </span>
-              <div className="flex gap-2">
-                <input
-                  type={showApiKey ? "text" : "password"}
-                  value={linearApiKey}
-                  onChange={(e) => {
-                    setLinearApiKey(e.target.value);
-                  }}
-                  placeholder="lin_api_..."
-                  className="flex-1 rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowApiKey((prev) => !prev);
-                  }}
-                  className="rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text-secondary hover:bg-surface-3 hover:text-text-primary"
-                >
-                  {showApiKey ? "Hide" : "Show"}
-                </button>
+            <CardHeader>
+              <CardTitle>Linear Integration</CardTitle>
+              <CardDescription>
+                Connect to your Linear workspace for issue tracking.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-5">
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="linear-api-key">Linear API Key</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="linear-api-key"
+                    type={showApiKey ? "text" : "password"}
+                    value={linearApiKey}
+                    onChange={(e) => {
+                      setLinearApiKey(e.target.value);
+                    }}
+                    placeholder="lin_api_..."
+                    className="flex-1"
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => {
+                      setShowApiKey((prev) => !prev);
+                    }}
+                    aria-label={showApiKey ? "Hide API key" : "Show API key"}
+                  >
+                    {showApiKey ? <EyeOff /> : <Eye />}
+                  </Button>
+                </div>
               </div>
-            </label>
 
-            {/* Linear Project ID */}
-            <label className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium text-text-secondary">
-                Linear Project ID
-              </span>
-              <input
-                type="text"
-                value={linearProjectId}
-                onChange={(e) => {
-                  setLinearProjectId(e.target.value);
-                }}
-                placeholder="PRJ-123"
-                className="rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
-              />
-            </label>
-
-            {/* Repository Path */}
-            <label className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium text-text-secondary">
-                Repository Path
-              </span>
-              <div className="flex gap-2">
-                <input
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="linear-project-id">Linear Project ID</Label>
+                <Input
+                  id="linear-project-id"
                   type="text"
-                  value={repoPath}
+                  value={linearProjectId}
                   onChange={(e) => {
-                    setRepoPath(e.target.value);
+                    setLinearProjectId(e.target.value);
                   }}
-                  placeholder="/path/to/repo"
-                  className="flex-1 rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+                  placeholder="PRJ-123"
                 />
-                <button
-                  type="button"
-                  onClick={() => {
-                    void handleBrowse();
-                  }}
-                  className="rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text-secondary hover:bg-surface-3 hover:text-text-primary"
-                >
-                  Browse
-                </button>
               </div>
-            </label>
+            </CardContent>
 
-            {/* Agent Command */}
-            <label className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium text-text-secondary">
-                Agent Command
-              </span>
-              <input
-                type="text"
-                value={agentCommand}
-                onChange={(e) => {
-                  setAgentCommand(e.target.value);
-                }}
-                placeholder="claude"
-                className="rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
-              />
-            </label>
-
-            {/* Hook Port */}
-            <label className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium text-text-secondary">
-                Hook Port
-              </span>
-              <input
-                type="number"
-                value={hookPort}
-                onChange={(e) => {
-                  const parsed = parseInt(e.target.value, 10);
-                  if (!Number.isNaN(parsed)) {
-                    setHookPort(parsed);
-                  }
-                }}
-                placeholder="19876"
-                className="rounded-md border border-border bg-surface-2 px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
-              />
-            </label>
-
-            {/* Save button */}
-            <div className="flex justify-end pt-2">
-              <button
-                type="submit"
-                disabled={configLoading}
-                className="rounded-md bg-accent px-5 py-2 text-sm font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
-              >
-                {configLoading ? "Saving..." : "Save"}
-              </button>
+            <div className="px-6">
+              <Separator />
             </div>
+
+            <CardHeader>
+              <CardTitle>Development</CardTitle>
+              <CardDescription>
+                Repository, agent command, and hook server settings.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-5">
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="repo-path">Repository Path</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="repo-path"
+                    type="text"
+                    value={repoPath}
+                    onChange={(e) => {
+                      setRepoPath(e.target.value);
+                    }}
+                    placeholder="/path/to/repo"
+                    className="flex-1"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      void handleBrowse();
+                    }}
+                  >
+                    <FolderOpen />
+                    Browse
+                  </Button>
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="agent-command">Agent Command</Label>
+                <Input
+                  id="agent-command"
+                  type="text"
+                  value={agentCommand}
+                  onChange={(e) => {
+                    setAgentCommand(e.target.value);
+                  }}
+                  placeholder="claude"
+                />
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="hook-port">Hook Port</Label>
+                <Input
+                  id="hook-port"
+                  type="number"
+                  value={hookPort}
+                  onChange={(e) => {
+                    const parsed = parseInt(e.target.value, 10);
+                    if (!Number.isNaN(parsed)) {
+                      setHookPort(parsed);
+                    }
+                  }}
+                  placeholder="19876"
+                />
+              </div>
+            </CardContent>
+
+            <CardFooter className="justify-end">
+              <Button type="submit" disabled={configLoading}>
+                <Save />
+                {configLoading ? "Saving..." : "Save"}
+              </Button>
+            </CardFooter>
           </form>
         )}
-      </div>
+      </Card>
     </div>
   );
 }

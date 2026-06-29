@@ -28,18 +28,35 @@ function gateStateLabel(state: GateState): string {
   }
 }
 
-function gateStateColor(state: GateState): string {
+function gateStateBgClass(state: GateState): string {
   switch (state) {
     case "Pending":
-      return "#888";
+      return "bg-state-pending";
     case "InReview":
-      return "#2196F3";
+      return "bg-state-in-review";
     case "Dispatched":
-      return "#FF9800";
+      return "bg-state-dispatched";
     case "Reworked":
-      return "#9C27B0";
+      return "bg-state-reworked";
     case "Approved":
-      return "#4CAF50";
+      return "bg-state-approved";
+    default:
+      return assertNever(state);
+  }
+}
+
+function gateStateBorderClass(state: GateState): string {
+  switch (state) {
+    case "Pending":
+      return "border-l-state-pending";
+    case "InReview":
+      return "border-l-state-in-review";
+    case "Dispatched":
+      return "border-l-state-dispatched";
+    case "Reworked":
+      return "border-l-state-reworked";
+    case "Approved":
+      return "border-l-state-approved";
     default:
       return assertNever(state);
   }
@@ -51,53 +68,37 @@ export function ReviewCard({ review, onOpen, onViewDiff }: ReviewCardProps) {
 
   return (
     <div
-      style={{
-        border: "1px solid #333",
-        borderRadius: 8,
-        padding: 16,
-        marginBottom: 12,
-        borderLeft: `4px solid ${gateStateColor(review.gate_state)}`,
-      }}
+      className={`border border-border rounded-lg p-4 mb-3 border-l-4 hover:bg-surface-1/50 transition-colors ${gateStateBorderClass(review.gate_state)}`}
     >
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-        }}
-      >
+      <div className="flex justify-between items-center">
         <div>
-          <strong>PR {review.pr}</strong>
-          <span style={{ marginLeft: 8, color: "#888" }}>{review.branch}</span>
+          <strong className="font-bold text-text-primary">
+            PR {review.pr}
+          </strong>
+          <span className="ml-2 text-text-muted">{review.branch}</span>
         </div>
         <span
-          style={{
-            padding: "2px 8px",
-            borderRadius: 4,
-            backgroundColor: gateStateColor(review.gate_state),
-            color: "white",
-            fontSize: 12,
-          }}
+          className={`px-2 py-0.5 rounded text-xs font-bold text-white ${gateStateBgClass(review.gate_state)}`}
         >
           {gateStateLabel(review.gate_state)}
         </span>
       </div>
 
-      <div style={{ marginTop: 8, fontSize: 14, color: "#aaa" }}>
+      <div className="mt-2 text-sm text-text-secondary">
         Issue: {review.issue} | Base: {review.base}
         {review.stale && (
-          <span style={{ color: "#FF5722", marginLeft: 8 }}>(stale)</span>
+          <span className="text-danger ml-2">(stale)</span>
         )}
         {review.agent != null && (
-          <span style={{ marginLeft: 8, color: "#FF9800" }}>
+          <span className="ml-2 text-warning">
             Agent running (PID: {review.agent.pid})
           </span>
         )}
       </div>
 
-      <div style={{ marginTop: 8 }}>
+      <div className="mt-2 flex items-center">
         {review.comments.length > 0 && (
-          <span style={{ fontSize: 12, color: "#888" }}>
+          <span className="text-xs text-text-muted">
             {review.comments.length} comment
             {review.comments.length !== 1 ? "s" : ""}
           </span>
@@ -107,7 +108,7 @@ export function ReviewCard({ review, onOpen, onViewDiff }: ReviewCardProps) {
             onClick={() => {
               onOpen(review.pr);
             }}
-            style={{ marginLeft: 8, cursor: "pointer" }}
+            className="ml-2 px-3 py-1 rounded bg-accent hover:bg-accent-hover text-white text-sm border-none cursor-pointer"
           >
             Open for Review
           </button>
@@ -117,7 +118,7 @@ export function ReviewCard({ review, onOpen, onViewDiff }: ReviewCardProps) {
             onClick={() => {
               onViewDiff(review.pr);
             }}
-            style={{ marginLeft: 8, cursor: "pointer" }}
+            className="ml-2 px-3 py-1 rounded bg-surface-2 hover:bg-surface-3 text-text-secondary text-sm border border-border cursor-pointer"
           >
             View Diff
           </button>

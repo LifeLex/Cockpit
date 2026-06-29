@@ -1,11 +1,15 @@
 import { useEffect, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "./store";
+import type { ViewState } from "./store";
+import { Sidebar } from "./components/Sidebar";
 import { ReviewCard } from "./components/ReviewCard";
 import { DiffView } from "./components/DiffView";
 import { PlanView } from "./components/PlanView";
 import { BatchApprovePanel } from "./components/BatchApprovePanel";
 import { StackView } from "./components/StackView";
+import { SettingsView } from "./components/SettingsView";
+import { KickoffView } from "./components/KickoffView";
 
 function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
@@ -23,11 +27,14 @@ function App() {
   const fetchReviews = useAppStore((s) => s.fetchReviews);
   const fetchFrontier = useAppStore((s) => s.fetchFrontier);
   const fetchPlan = useAppStore((s) => s.fetchPlan);
+  const fetchConfig = useAppStore((s) => s.fetchConfig);
   const openReview = useAppStore((s) => s.openReview);
   const navigateToDiff = useAppStore((s) => s.navigateToDiff);
   const navigateToPlan = useAppStore((s) => s.navigateToPlan);
   const navigateToFrontier = useAppStore((s) => s.navigateToFrontier);
   const navigateToStacks = useAppStore((s) => s.navigateToStacks);
+  const navigateToSettings = useAppStore((s) => s.navigateToSettings);
+  const navigateToKickoff = useAppStore((s) => s.navigateToKickoff);
   const addComment = useAppStore((s) => s.addComment);
   const requestChanges = useAppStore((s) => s.requestChanges);
   const mirrorComments = useAppStore((s) => s.mirrorComments);
@@ -49,6 +56,7 @@ function App() {
     void fetchReviews();
     void fetchFrontier();
     void fetchPlan();
+    void fetchConfig();
 
     const unlisten = listen("agent-completed", () => {
       void fetchReviews();
@@ -62,7 +70,7 @@ function App() {
         f();
       });
     };
-  }, [fetchReviews, fetchFrontier, fetchPlan, refreshActiveReview]);
+  }, [fetchReviews, fetchFrontier, fetchPlan, fetchConfig, refreshActiveReview]);
 
   const handleViewDiff = useCallback(
     (pr: string) => {
@@ -71,254 +79,234 @@ function App() {
     [navigateToDiff],
   );
 
-  /** Style for the active tab in the navigation bar. */
-  const activeTabStyle = (color: string) =>
-    ({
-      padding: "8px 20px",
-      cursor: "pointer",
-      border: "1px solid #444",
-      borderBottom: `2px solid ${color}`,
-      backgroundColor: "#1e1e1e",
-      color,
-      fontWeight: "bold",
-      borderRadius: "4px 4px 0 0",
-    }) as const;
-
-  /** Style for an inactive tab in the navigation bar. */
-  const inactiveTabStyle = {
-    padding: "8px 20px",
-    cursor: "pointer",
-    border: "1px solid #444",
-    borderBottom: "none",
-    backgroundColor: "transparent",
-    color: "#888",
-    fontWeight: "normal",
-    borderRadius: "4px 4px 0 0",
-  } as const;
-
-  /** Render the tab navigation bar with the given active tab highlighted. */
-  const renderNav = (active: "frontier" | "plan" | "stacks") => (
-    <nav
-      style={{
-        display: "flex",
-        gap: 0,
-        marginBottom: 24,
-        borderBottom: "1px solid #444",
-      }}
-    >
-      <button
-        onClick={active !== "frontier" ? navigateToFrontier : undefined}
-        style={
-          active === "frontier" ? activeTabStyle("#2196F3") : inactiveTabStyle
-        }
-      >
-        Reviews ({reviews.length})
-      </button>
-      <button
-        onClick={active !== "plan" ? navigateToPlan : undefined}
-        style={
-          active === "plan" ? activeTabStyle("#9C27B0") : inactiveTabStyle
-        }
-      >
-        Plan {plan != null ? "(loaded)" : ""}
-      </button>
-      <button
-        onClick={active !== "stacks" ? navigateToStacks : undefined}
-        style={
-          active === "stacks" ? activeTabStyle("#009688") : inactiveTabStyle
-        }
-      >
-        Stacks
-      </button>
-    </nav>
+  /** Map sidebar navigation kinds to store navigation actions. */
+  const handleNavigate = useCallback(
+    (kind: ViewState["kind"]) => {
+      switch (kind) {
+        case "frontier":
+          navigateToFrontier();
+          break;
+        case "plan":
+          navigateToPlan();
+          break;
+        case "stacks":
+          navigateToStacks();
+          break;
+        case "settings":
+          navigateToSettings();
+          break;
+        case "kickoff":
+          navigateToKickoff();
+          break;
+        case "diff":
+          // Diff is navigated via handleViewDiff, not the sidebar.
+          break;
+        default:
+          assertNever(kind);
+      }
+    },
+    [navigateToFrontier, navigateToPlan, navigateToStacks, navigateToSettings, navigateToKickoff],
   );
 
-  /** Error banner shown when an error is present. */
+  /** Error banner shown when a global error is present. */
   const errorBanner =
-    error != null ? (
-      <div
-        style={{
-          color: "#f44336",
-          padding: 12,
-          marginBottom: 16,
-          border: "1px solid #f44336",
-          borderRadius: 4,
-        }}
-      >
+    error !== null ? (
+      <div className="mb-4 rounded-lg border border-danger bg-danger/10 px-4 py-3 text-sm text-danger">
         {error}
       </div>
     ) : null;
 
-  switch (view.kind) {
-    case "frontier":
-      return (
-        <main style={{ padding: 24, maxWidth: 900, margin: "0 auto" }}>
-          <h1 style={{ marginBottom: 16 }}>Cockpit</h1>
-          {renderNav("frontier")}
-          {errorBanner}
+  /** Render main content based on the current view. */
+  function renderContent() {
+    switch (view.kind) {
+      case "frontier":
+        return (
+          <div className="mx-auto max-w-4xl px-6 py-8">
+            {errorBanner}
 
-          <section>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-              }}
-            >
-              <div>
-                <h2>Frontier ({frontier.length})</h2>
-                <p style={{ color: "#888", fontSize: 14 }}>
-                  Reviews ready for deep-review (not stale)
-                </p>
+            <section>
+              <div className="mb-4 flex items-center justify-between">
+                <div>
+                  <h2 className="text-lg font-semibold text-text-primary">
+                    Frontier ({frontier.length})
+                  </h2>
+                  <p className="text-sm text-text-secondary">
+                    Reviews ready for deep-review (not stale)
+                  </p>
+                </div>
+                {frontier.length > 0 && (
+                  <button
+                    onClick={() => {
+                      void fetchBatchApprovePreview();
+                    }}
+                    className="rounded-md bg-success px-4 py-2 text-sm font-medium text-white transition-colors hover:opacity-90"
+                  >
+                    Batch Approve
+                  </button>
+                )}
               </div>
-              {frontier.length > 0 && (
-                <button
-                  onClick={() => {
-                    void fetchBatchApprovePreview();
+
+              {showBatchPanel && batchVerdicts !== null && (
+                <BatchApprovePanel
+                  verdicts={batchVerdicts}
+                  onApprove={approveReview}
+                  onApproveAll={() => {
+                    void approveAllEligible();
                   }}
-                  style={{
-                    padding: "8px 16px",
-                    cursor: "pointer",
-                    backgroundColor: "#4CAF50",
-                    color: "white",
-                    border: "none",
-                    borderRadius: 4,
-                    fontWeight: "bold",
-                  }}
-                >
-                  Batch Approve
-                </button>
+                  onClose={toggleBatchPanel}
+                />
+              )}
+
+              {loading && (
+                <p className="text-sm text-text-muted">Loading...</p>
+              )}
+              {frontier.map((review) => (
+                <ReviewCard
+                  key={review.id}
+                  review={review}
+                  onOpen={openReview}
+                  onViewDiff={handleViewDiff}
+                />
+              ))}
+              {!loading && frontier.length === 0 && (
+                <p className="text-sm text-text-muted">
+                  No reviews in the frontier.
+                </p>
+              )}
+            </section>
+
+            <section className="mt-8">
+              <h2 className="mb-3 text-lg font-semibold text-text-primary">
+                All Reviews ({reviews.length})
+              </h2>
+              {reviews.map((review) => (
+                <ReviewCard
+                  key={review.id}
+                  review={review}
+                  onViewDiff={handleViewDiff}
+                />
+              ))}
+              {reviews.length === 0 && (
+                <p className="text-sm text-text-muted">
+                  No reviews loaded. Use the CLI to ingest PRs.
+                </p>
+              )}
+            </section>
+          </div>
+        );
+
+      case "diff":
+        if (activeReview === null || activeDiff === null) {
+          return (
+            <div className="px-6 py-8">
+              {loading ? (
+                <p className="text-sm text-text-muted">Loading diff...</p>
+              ) : (
+                <div className="rounded-lg border border-danger bg-danger/10 px-4 py-3 text-sm text-danger">
+                  Failed to load review.{" "}
+                  <button
+                    onClick={navigateToFrontier}
+                    className="underline hover:no-underline"
+                  >
+                    Back
+                  </button>
+                </div>
               )}
             </div>
+          );
+        }
 
-            {showBatchPanel && batchVerdicts !== null && (
-              <BatchApprovePanel
-                verdicts={batchVerdicts}
-                onApprove={approveReview}
-                onApproveAll={() => {
-                  void approveAllEligible();
-                }}
-                onClose={toggleBatchPanel}
-              />
-            )}
-
-            {loading && <p>Loading...</p>}
-            {frontier.map((review) => (
-              <ReviewCard
-                key={review.id}
-                review={review}
-                onOpen={openReview}
-                onViewDiff={handleViewDiff}
-              />
-            ))}
-            {!loading && frontier.length === 0 && (
-              <p style={{ color: "#888" }}>No reviews in the frontier.</p>
-            )}
-          </section>
-
-          <section style={{ marginTop: 32 }}>
-            <h2>All Reviews ({reviews.length})</h2>
-            {reviews.map((review) => (
-              <ReviewCard
-                key={review.id}
-                review={review}
-                onViewDiff={handleViewDiff}
-              />
-            ))}
-            {reviews.length === 0 && (
-              <p style={{ color: "#888" }}>
-                No reviews loaded. Use the CLI to ingest PRs.
-              </p>
-            )}
-          </section>
-        </main>
-      );
-
-    case "diff":
-      if (activeReview === null || activeDiff === null) {
         return (
-          <main style={{ padding: 24 }}>
-            {loading ? (
-              <p>Loading diff...</p>
-            ) : (
-              <p style={{ color: "#f44336" }}>
-                Failed to load review.{" "}
-                <button onClick={navigateToFrontier} style={{ cursor: "pointer" }}>
-                  Back
-                </button>
-              </p>
-            )}
-          </main>
+          <DiffView
+            review={activeReview}
+            diff={activeDiff}
+            onBack={navigateToFrontier}
+            onAddComment={addComment}
+            onRequestChanges={requestChanges}
+            onMirrorComments={mirrorComments}
+          />
         );
-      }
 
-      return (
-        <DiffView
-          review={activeReview}
-          diff={activeDiff}
-          onBack={navigateToFrontier}
-          onAddComment={addComment}
-          onRequestChanges={requestChanges}
-          onMirrorComments={mirrorComments}
-        />
-      );
+      case "plan":
+        return (
+          <div className="mx-auto max-w-4xl px-6 py-8">
+            {errorBanner}
 
-    case "plan":
-      return (
-        <main style={{ padding: 24, maxWidth: 900, margin: "0 auto" }}>
-          <h1 style={{ marginBottom: 16 }}>Cockpit</h1>
-          {renderNav("plan")}
-          {errorBanner}
+            {plan !== null ? (
+              <PlanView
+                plan={plan}
+                onAddComment={(anchor, body) => {
+                  void addPlanComment(anchor, body);
+                }}
+                onRequestChanges={() => {
+                  void requestPlanChanges();
+                }}
+                onApprove={() => {
+                  void approvePlan();
+                }}
+                onOpen={() => {
+                  void openPlan();
+                }}
+              />
+            ) : (
+              <div className="rounded-lg border border-border bg-surface-1 p-8 text-center">
+                <p className="text-text-muted">No plan loaded.</p>
+                <p className="mt-1 text-sm text-text-muted">
+                  Use the CLI to load a plan file, or invoke{" "}
+                  <code className="rounded bg-surface-2 px-1.5 py-0.5 text-xs">
+                    load_plan
+                  </code>{" "}
+                  from the command palette.
+                </p>
+              </div>
+            )}
+          </div>
+        );
 
-          {plan != null ? (
-            <PlanView
-              plan={plan}
-              onAddComment={(anchor, body) => {
-                void addPlanComment(anchor, body);
-              }}
-              onRequestChanges={() => {
-                void requestPlanChanges();
-              }}
-              onApprove={() => {
-                void approvePlan();
-              }}
-              onOpen={() => {
-                void openPlan();
-              }}
-            />
-          ) : (
-            <div style={{ color: "#888", padding: 24, textAlign: "center" }}>
-              <p>No plan loaded.</p>
-              <p style={{ fontSize: 13 }}>
-                Use the CLI to load a plan file, or invoke <code>load_plan</code>{" "}
-                from the command palette.
+      case "stacks":
+        return (
+          <div className="mx-auto max-w-4xl px-6 py-8">
+            {errorBanner}
+
+            <section>
+              <h2 className="mb-1 text-lg font-semibold text-text-primary">
+                Stack Dependencies
+              </h2>
+              <p className="mb-4 text-sm text-text-secondary">
+                Review dependency graph — click a node to view its diff
               </p>
-            </div>
-          )}
-        </main>
-      );
+              {loading && (
+                <p className="text-sm text-text-muted">Loading...</p>
+              )}
+              <StackView reviews={reviews} onViewDiff={handleViewDiff} />
+            </section>
+          </div>
+        );
 
-    case "stacks":
-      return (
-        <main style={{ padding: 24, maxWidth: 900, margin: "0 auto" }}>
-          <h1 style={{ marginBottom: 16 }}>Cockpit</h1>
-          {renderNav("stacks")}
-          {errorBanner}
+      case "settings":
+        return <SettingsView />;
 
-          <section>
-            <h2>Stack Dependencies</h2>
-            <p style={{ color: "#888", fontSize: 14, marginBottom: 16 }}>
-              Review dependency graph — click a node to view its diff
-            </p>
-            {loading && <p>Loading...</p>}
-            <StackView reviews={reviews} onViewDiff={handleViewDiff} />
-          </section>
-        </main>
-      );
+      case "kickoff":
+        return <KickoffView />;
 
-    default:
-      return assertNever(view);
+      default:
+        return assertNever(view);
+    }
   }
+
+  return (
+    <div className="flex h-screen overflow-hidden bg-surface-0 text-text-primary">
+      <Sidebar
+        activeView={view.kind}
+        reviewCount={reviews.length}
+        hasPlan={plan !== null}
+        onNavigate={handleNavigate}
+      />
+      <main className="flex-1 overflow-y-auto">
+        {renderContent()}
+      </main>
+    </div>
+  );
 }
 
 export default App;

@@ -29,18 +29,18 @@ function gateStateLabel(state: GateState): string {
   }
 }
 
-function gateStateColor(state: GateState): string {
+function gateStateBgClass(state: GateState): string {
   switch (state) {
     case "Pending":
-      return "#888";
+      return "bg-state-pending";
     case "InReview":
-      return "#2196F3";
+      return "bg-state-in-review";
     case "Dispatched":
-      return "#FF9800";
+      return "bg-state-dispatched";
     case "Reworked":
-      return "#9C27B0";
+      return "bg-state-reworked";
     case "Approved":
-      return "#4CAF50";
+      return "bg-state-approved";
     default:
       return assertNever(state);
   }
@@ -91,24 +91,11 @@ function CommentList({ comments }: CommentListProps) {
     return null;
   }
   return (
-    <ul
-      style={{
-        margin: "4px 0 0 0",
-        paddingLeft: 16,
-        listStyle: "none",
-      }}
-    >
+    <ul className="mt-1 pl-4 list-none">
       {comments.map((c) => (
         <li
           key={c.id}
-          style={{
-            padding: "4px 8px",
-            marginBottom: 4,
-            backgroundColor: "#2a2a2a",
-            borderLeft: "3px solid #FF9800",
-            borderRadius: 2,
-            fontSize: 13,
-          }}
+          className="px-2 py-1 mb-1 bg-surface-2 border-l-[3px] border-l-warning rounded-sm text-[13px]"
         >
           {c.body}
         </li>
@@ -141,16 +128,8 @@ function CommentForm({ defaultAnchor, onSubmit, onCancel }: CommentFormProps) {
   };
 
   return (
-    <div
-      style={{
-        marginTop: 4,
-        padding: 8,
-        backgroundColor: "#1e1e1e",
-        borderRadius: 4,
-        border: "1px solid #444",
-      }}
-    >
-      <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>
+    <div className="mt-1 p-2 bg-surface-1 rounded border border-border">
+      <div className="text-xs text-text-muted mb-1">
         Anchor: <code>{defaultAnchor}</code>
       </div>
       <textarea
@@ -159,28 +138,17 @@ function CommentForm({ defaultAnchor, onSubmit, onCancel }: CommentFormProps) {
           setBody(e.target.value);
         }}
         placeholder="Add a comment..."
-        style={{
-          width: "100%",
-          minHeight: 60,
-          backgroundColor: "#2a2a2a",
-          color: "#eee",
-          border: "1px solid #555",
-          borderRadius: 4,
-          padding: 8,
-          fontSize: 13,
-          resize: "vertical",
-          boxSizing: "border-box",
-        }}
+        className="w-full min-h-[60px] bg-surface-2 text-text-primary border border-border rounded p-2 text-[13px] resize-y box-border"
       />
-      <div style={{ marginTop: 4, display: "flex", gap: 8 }}>
+      <div className="mt-1 flex gap-2">
         <button
           onClick={handleSubmit}
           disabled={body.trim().length === 0}
-          style={{ cursor: "pointer" }}
+          className="cursor-pointer"
         >
           Add Comment
         </button>
-        <button onClick={onCancel} style={{ cursor: "pointer" }}>
+        <button onClick={onCancel} className="cursor-pointer">
           Cancel
         </button>
       </div>
@@ -213,22 +181,9 @@ function StepItem({
   const [commenting, setCommenting] = useState(false);
 
   return (
-    <li
-      style={{
-        marginBottom: 8,
-        padding: 8,
-        backgroundColor: "#1a1a1a",
-        borderRadius: 4,
-        border: "1px solid #333",
-      }}
-    >
+    <li className="mb-2 p-2 bg-surface-1 rounded border border-border">
       <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "flex-start",
-          cursor: "pointer",
-        }}
+        className="flex justify-between items-start cursor-pointer"
         onClick={() => {
           setExpanded(!expanded);
         }}
@@ -238,20 +193,13 @@ function StepItem({
             {stepIndex + 1}. {title}
           </strong>
         </div>
-        <span style={{ color: "#888", fontSize: 12 }}>
+        <span className="text-text-muted text-xs">
           {expanded ? "[-]" : "[+]"}
         </span>
       </div>
 
       {expanded && description.length > 0 && (
-        <p
-          style={{
-            margin: "8px 0 0 16px",
-            color: "#bbb",
-            fontSize: 13,
-            whiteSpace: "pre-wrap",
-          }}
-        >
+        <p className="mt-2 ml-4 text-text-secondary text-[13px] whitespace-pre-wrap">
           {description}
         </p>
       )}
@@ -263,15 +211,7 @@ function StepItem({
           onClick={() => {
             setCommenting(true);
           }}
-          style={{
-            marginTop: 4,
-            fontSize: 12,
-            cursor: "pointer",
-            color: "#888",
-            background: "none",
-            border: "none",
-            textDecoration: "underline",
-          }}
+          className="mt-1 text-xs cursor-pointer text-text-muted bg-transparent border-none underline"
         >
           + Comment on step {stepIndex + 1}
         </button>
@@ -313,16 +253,8 @@ function FileItem({
   const [commenting, setCommenting] = useState(false);
 
   return (
-    <li
-      style={{
-        marginBottom: 4,
-        padding: "4px 8px",
-        backgroundColor: "#1a1a1a",
-        borderRadius: 4,
-        border: "1px solid #333",
-      }}
-    >
-      <code style={{ fontSize: 13 }}>{filePath}</code>
+    <li className="mb-1 px-2 py-1 bg-surface-1 rounded border border-border">
+      <code className="text-[13px]">{filePath}</code>
 
       <CommentList comments={comments} />
 
@@ -331,15 +263,7 @@ function FileItem({
           onClick={() => {
             setCommenting(true);
           }}
-          style={{
-            marginLeft: 8,
-            fontSize: 12,
-            cursor: "pointer",
-            color: "#888",
-            background: "none",
-            border: "none",
-            textDecoration: "underline",
-          }}
+          className="ml-2 text-xs cursor-pointer text-text-muted bg-transparent border-none underline"
         >
           + Comment
         </button>
@@ -383,11 +307,8 @@ function GateActions({
   switch (gateState) {
     case "Pending":
       return (
-        <div style={{ marginTop: 16 }}>
-          <button
-            onClick={onOpen}
-            style={{ cursor: "pointer", marginRight: 8 }}
-          >
+        <div className="mt-4">
+          <button onClick={onOpen} className="cursor-pointer mr-2">
             Open for Review
           </button>
         </div>
@@ -395,7 +316,7 @@ function GateActions({
 
     case "InReview":
       return (
-        <div style={{ marginTop: 16 }}>
+        <div className="mt-4">
           <button
             onClick={onRequestChanges}
             disabled={commentCount === 0}
@@ -404,21 +325,14 @@ function GateActions({
                 ? "Add at least one comment before requesting changes"
                 : "Send comments to the planner agent for rework"
             }
-            style={{ cursor: "pointer", marginRight: 8 }}
+            className="cursor-pointer mr-2"
           >
             Request Changes ({String(commentCount)} comment
             {commentCount !== 1 ? "s" : ""})
           </button>
           <button
             onClick={onApprove}
-            style={{
-              cursor: "pointer",
-              backgroundColor: "#4CAF50",
-              color: "white",
-              border: "none",
-              padding: "6px 16px",
-              borderRadius: 4,
-            }}
+            className="cursor-pointer bg-success text-white border-none px-4 py-1.5 rounded"
             title="Approve this plan and trigger the batch build. This is an irreversible action."
           >
             Approve Plan
@@ -428,26 +342,15 @@ function GateActions({
 
     case "Dispatched":
       return (
-        <div
-          style={{
-            marginTop: 16,
-            padding: 12,
-            backgroundColor: "#332200",
-            borderRadius: 4,
-            border: "1px solid #FF9800",
-          }}
-        >
+        <div className="mt-4 p-3 bg-warning/10 rounded border border-warning text-warning">
           Agent working on plan revisions...
         </div>
       );
 
     case "Reworked":
       return (
-        <div style={{ marginTop: 16 }}>
-          <button
-            onClick={onOpen}
-            style={{ cursor: "pointer", marginRight: 8 }}
-          >
+        <div className="mt-4">
+          <button onClick={onOpen} className="cursor-pointer mr-2">
             Re-review Plan
           </button>
         </div>
@@ -455,16 +358,7 @@ function GateActions({
 
     case "Approved":
       return (
-        <div
-          style={{
-            marginTop: 16,
-            padding: 12,
-            backgroundColor: "#1b3320",
-            borderRadius: 4,
-            border: "1px solid #4CAF50",
-            color: "#4CAF50",
-          }}
-        >
+        <div className="mt-4 p-3 bg-success/10 rounded border border-success text-success">
           Plan Approved -- batch build triggered.
         </div>
       );
@@ -499,48 +393,30 @@ export function PlanView({
   return (
     <div>
       {/* Header */}
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 16,
-        }}
-      >
-        <h2 style={{ margin: 0 }}>Plan: {doc.summary}</h2>
+      <div className="flex justify-between items-center mb-4">
+        <h2 className="m-0 text-text-primary">Plan: {doc.summary}</h2>
         <span
-          style={{
-            padding: "4px 12px",
-            borderRadius: 4,
-            backgroundColor: gateStateColor(gateState),
-            color: "white",
-            fontSize: 12,
-            fontWeight: "bold",
-          }}
+          className={`px-3 py-1 rounded text-xs font-bold text-white ${gateStateBgClass(gateState)}`}
         >
           {gateStateLabel(gateState)}
         </span>
       </div>
 
-      <div style={{ color: "#888", fontSize: 13, marginBottom: 16 }}>
+      <div className="text-text-muted text-[13px] mb-4">
         Project: {plan.project}
         {plan.agent != null && (
-          <span style={{ marginLeft: 12, color: "#FF9800" }}>
+          <span className="ml-3 text-warning">
             Agent running (PID: {plan.agent.pid})
           </span>
         )}
       </div>
 
       {/* Steps */}
-      <section style={{ marginBottom: 24 }}>
-        <h3>Steps ({String(doc.steps.length)})</h3>
-        <ol
-          style={{
-            listStyle: "none",
-            margin: 0,
-            padding: 0,
-          }}
-        >
+      <section className="mb-6">
+        <h3 className="text-text-primary mb-2">
+          Steps ({String(doc.steps.length)})
+        </h3>
+        <ol className="list-none m-0 p-0">
           {doc.steps.map((step) => (
             <StepItem
               key={step.index}
@@ -556,9 +432,11 @@ export function PlanView({
       </section>
 
       {/* Files */}
-      <section style={{ marginBottom: 24 }}>
-        <h3>Files ({String(doc.files.length)})</h3>
-        <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+      <section className="mb-6">
+        <h3 className="text-text-primary mb-2">
+          Files ({String(doc.files.length)})
+        </h3>
+        <ul className="list-none m-0 p-0">
           {doc.files.map((file) => (
             <FileItem
               key={file}
@@ -573,14 +451,13 @@ export function PlanView({
 
       {/* Risks */}
       {doc.risks.length > 0 && (
-        <section style={{ marginBottom: 24 }}>
-          <h3>Risks ({String(doc.risks.length)})</h3>
-          <ul style={{ margin: 0, paddingLeft: 20 }}>
+        <section className="mb-6">
+          <h3 className="text-text-primary mb-2">
+            Risks ({String(doc.risks.length)})
+          </h3>
+          <ul className="m-0 pl-5">
             {doc.risks.map((risk, i) => (
-              <li
-                key={`risk-${String(i)}`}
-                style={{ marginBottom: 4, color: "#e88" }}
-              >
+              <li key={`risk-${String(i)}`} className="mb-1 text-danger">
                 {risk}
               </li>
             ))}

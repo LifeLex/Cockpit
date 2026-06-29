@@ -30,12 +30,23 @@ function gateStateLabel(state: GateState): string {
   }
 }
 
-function verdictColor(verdict: BatchVerdict): string {
+function verdictBgClass(verdict: BatchVerdict): string {
   switch (verdict.kind) {
     case "Eligible":
-      return "#4CAF50";
+      return "border-l-success";
     case "Ineligible":
-      return "#FF9800";
+      return "border-l-warning";
+    default:
+      return assertNever(verdict);
+  }
+}
+
+function verdictTextClass(verdict: BatchVerdict): string {
+  switch (verdict.kind) {
+    case "Eligible":
+      return "text-success";
+    case "Ineligible":
+      return "text-warning";
     default:
       return assertNever(verdict);
   }
@@ -52,53 +63,23 @@ export function BatchApprovePanel({
   ).length;
 
   return (
-    <div
-      style={{
-        border: "1px solid #444",
-        borderRadius: 8,
-        padding: 16,
-        marginBottom: 16,
-        backgroundColor: "#1a1a2e",
-      }}
-    >
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 12,
-        }}
-      >
-        <h3 style={{ margin: 0 }}>
+    <div className="border border-border rounded-lg p-4 mb-4 bg-surface-1">
+      <div className="flex justify-between items-center mb-3">
+        <h3 className="m-0 text-text-primary">
           Batch Approve Preview ({eligibleCount}/{verdicts.length} eligible)
         </h3>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div className="flex gap-2">
           {eligibleCount > 0 && (
             <button
               onClick={onApproveAll}
-              style={{
-                padding: "6px 14px",
-                cursor: "pointer",
-                backgroundColor: "#4CAF50",
-                color: "white",
-                border: "none",
-                borderRadius: 4,
-                fontWeight: "bold",
-              }}
+              className="px-4 py-1.5 bg-success text-white border-none rounded font-bold cursor-pointer hover:opacity-90"
             >
               Approve All Eligible ({eligibleCount})
             </button>
           )}
           <button
             onClick={onClose}
-            style={{
-              padding: "6px 14px",
-              cursor: "pointer",
-              backgroundColor: "transparent",
-              color: "#888",
-              border: "1px solid #555",
-              borderRadius: 4,
-            }}
+            className="px-4 py-1.5 bg-transparent text-text-muted border border-border rounded cursor-pointer hover:bg-surface-2"
           >
             Close
           </button>
@@ -106,39 +87,28 @@ export function BatchApprovePanel({
       </div>
 
       {verdicts.length === 0 && (
-        <p style={{ color: "#888" }}>No reviews to evaluate.</p>
+        <p className="text-text-muted">No reviews to evaluate.</p>
       )}
 
       {verdicts.map(([review, verdict]) => (
         <div
           key={review.id}
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            padding: "8px 12px",
-            marginBottom: 4,
-            borderRadius: 4,
-            borderLeft: `3px solid ${verdictColor(verdict)}`,
-            backgroundColor: "#16213e",
-          }}
+          className={`flex justify-between items-center px-3 py-2 mb-1 rounded border-l-[3px] bg-surface-2 ${verdictBgClass(verdict)}`}
         >
-          <div style={{ flex: 1 }}>
-            <strong>PR {review.pr}</strong>
-            <span style={{ marginLeft: 8, color: "#888", fontSize: 13 }}>
+          <div className="flex-1">
+            <strong className="font-bold text-text-primary">
+              PR {review.pr}
+            </strong>
+            <span className="ml-2 text-text-muted text-[13px]">
               {gateStateLabel(review.gate_state)}
             </span>
-            <div style={{ fontSize: 12, color: "#aaa", marginTop: 2 }}>
+            <div className="text-xs text-text-secondary mt-0.5">
               {verdict.reasons.join(" | ")}
             </div>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div className="flex items-center gap-2">
             <span
-              style={{
-                fontSize: 12,
-                fontWeight: "bold",
-                color: verdictColor(verdict),
-              }}
+              className={`text-xs font-bold ${verdictTextClass(verdict)}`}
             >
               {verdict.kind === "Eligible" ? "ELIGIBLE" : "INELIGIBLE"}
             </span>
@@ -147,15 +117,7 @@ export function BatchApprovePanel({
                 onClick={() => {
                   void onApprove(review.pr);
                 }}
-                style={{
-                  padding: "4px 10px",
-                  cursor: "pointer",
-                  backgroundColor: "#4CAF50",
-                  color: "white",
-                  border: "none",
-                  borderRadius: 4,
-                  fontSize: 12,
-                }}
+                className="px-2.5 py-1 bg-success text-white border-none rounded text-xs cursor-pointer"
               >
                 Approve
               </button>

@@ -51,19 +51,37 @@ function gateStateLabel(state: GateState): string {
   }
 }
 
-/** Map from GateState to a color used for badges and tree connectors. */
-function gateStateColor(state: GateState): string {
+/** Map from GateState to a Tailwind background class for badges. */
+function gateStateBgClass(state: GateState): string {
   switch (state) {
     case "Pending":
-      return "#888";
+      return "bg-state-pending";
     case "InReview":
-      return "#2196F3";
+      return "bg-state-in-review";
     case "Dispatched":
-      return "#FF9800";
+      return "bg-state-dispatched";
     case "Reworked":
-      return "#E040FB";
+      return "bg-state-reworked";
     case "Approved":
-      return "#4CAF50";
+      return "bg-state-approved";
+    default:
+      return assertNever(state);
+  }
+}
+
+/** Map from GateState to a Tailwind border-left class for tree connectors. */
+function gateStateBorderClass(state: GateState): string {
+  switch (state) {
+    case "Pending":
+      return "border-l-state-pending";
+    case "InReview":
+      return "border-l-state-in-review";
+    case "Dispatched":
+      return "border-l-state-dispatched";
+    case "Reworked":
+      return "border-l-state-reworked";
+    case "Approved":
+      return "border-l-state-approved";
     default:
       return assertNever(state);
   }
@@ -149,22 +167,13 @@ function StackNode({
   readonly onViewDiff: (pr: string) => void;
 }) {
   const review = node.review;
-  const color = gateStateColor(review.gate_state);
+  const borderClass = gateStateBorderClass(review.gate_state);
 
   return (
+    // Dynamic marginLeft: Tailwind cannot compute depth * 28 at build time.
     <div style={{ marginLeft: depth * 28 }}>
       <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          padding: "6px 10px",
-          margin: "2px 0",
-          borderLeft: `3px solid ${color}`,
-          borderRadius: "0 4px 4px 0",
-          backgroundColor: "#1a1a1a",
-          cursor: "pointer",
-        }}
+        className={`flex items-center gap-2 px-2.5 py-1.5 my-0.5 rounded-r border-l-[3px] bg-surface-1 cursor-pointer hover:bg-surface-2 ${borderClass}`}
         onClick={() => {
           onViewDiff(review.pr);
         }}
@@ -179,53 +188,30 @@ function StackNode({
       >
         {/* Connector line indicator for children */}
         {depth > 0 && (
-          <span
-            style={{
-              display: "inline-block",
-              width: 12,
-              height: 2,
-              backgroundColor: "#555",
-              flexShrink: 0,
-            }}
-          />
+          <span className="inline-block w-3 h-0.5 bg-border-strong shrink-0" />
         )}
 
         {/* PR reference */}
-        <span style={{ fontWeight: "bold", fontSize: 13 }}>{review.pr}</span>
+        <span className="font-bold text-[13px] text-text-primary">
+          {review.pr}
+        </span>
 
         {/* Gate state badge */}
         <span
-          style={{
-            padding: "1px 6px",
-            borderRadius: 3,
-            backgroundColor: color,
-            color: "white",
-            fontSize: 11,
-            fontWeight: "bold",
-            flexShrink: 0,
-          }}
+          className={`px-1.5 py-px rounded-sm text-[11px] font-bold text-white shrink-0 ${gateStateBgClass(review.gate_state)}`}
         >
           {gateStateLabel(review.gate_state)}
         </span>
 
         {/* Stale indicator */}
         {review.stale && (
-          <span
-            style={{
-              color: "#FF5722",
-              fontSize: 11,
-              fontWeight: "bold",
-              flexShrink: 0,
-            }}
-          >
+          <span className="text-danger text-[11px] font-bold shrink-0">
             STALE
           </span>
         )}
 
         {/* Issue reference */}
-        <span style={{ color: "#888", fontSize: 12, marginLeft: "auto" }}>
-          {review.issue}
-        </span>
+        <span className="text-text-muted text-xs ml-auto">{review.issue}</span>
       </div>
 
       {/* Recurse into children */}
@@ -252,40 +238,22 @@ function StackGroup({
   const health = useMemo(() => computeHealth(root), [root]);
 
   return (
-    <div
-      style={{
-        border: "1px solid #333",
-        borderRadius: 8,
-        padding: 12,
-        marginBottom: 16,
-      }}
-    >
+    <div className="border border-border rounded-lg p-3 mb-4">
       {/* Stack header with health summary */}
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 8,
-          paddingBottom: 8,
-          borderBottom: "1px solid #333",
-        }}
-      >
-        <span style={{ fontSize: 13, fontWeight: "bold", color: "#ccc" }}>
+      <div className="flex justify-between items-center mb-2 pb-2 border-b border-border">
+        <span className="text-[13px] font-bold text-text-secondary">
           Stack: {root.review.branch}
         </span>
-        <span style={{ fontSize: 12, color: "#888" }}>
+        <span className="text-xs text-text-muted">
           <span
-            style={{
-              color: health.approved === health.total ? "#4CAF50" : "#aaa",
-            }}
+            className={
+              health.approved === health.total ? "text-success" : "text-text-muted"
+            }
           >
             {health.approved}/{health.total} approved
           </span>
           {health.stale > 0 && (
-            <span style={{ color: "#FF5722", marginLeft: 8 }}>
-              {health.stale} stale
-            </span>
+            <span className="text-danger ml-2">{health.stale} stale</span>
           )}
         </span>
       </div>
@@ -314,9 +282,9 @@ export function StackView({ reviews, onViewDiff }: StackViewProps) {
 
   if (reviews.length === 0) {
     return (
-      <div style={{ color: "#888", padding: 24, textAlign: "center" }}>
+      <div className="text-text-muted p-6 text-center">
         <p>No reviews loaded.</p>
-        <p style={{ fontSize: 13 }}>
+        <p className="text-[13px]">
           Use the CLI to ingest PRs, then switch to the Stacks view.
         </p>
       </div>
@@ -325,7 +293,7 @@ export function StackView({ reviews, onViewDiff }: StackViewProps) {
 
   if (trees.length === 0) {
     return (
-      <div style={{ color: "#888", padding: 24, textAlign: "center" }}>
+      <div className="text-text-muted p-6 text-center">
         <p>No stack roots found.</p>
       </div>
     );

@@ -53,18 +53,18 @@ function gateStateLabel(state: GateState): string {
   }
 }
 
-function gateStateColor(state: GateState): string {
+function gateStateBgClass(state: GateState): string {
   switch (state) {
     case "Pending":
-      return "#888";
+      return "bg-state-pending";
     case "InReview":
-      return "#2196F3";
+      return "bg-state-in-review";
     case "Dispatched":
-      return "#FF9800";
+      return "bg-state-dispatched";
     case "Reworked":
-      return "#9C27B0";
+      return "bg-state-reworked";
     case "Approved":
-      return "#4CAF50";
+      return "bg-state-approved";
     default:
       return assertNever(state);
   }
@@ -206,64 +206,42 @@ export function DiffView({
   }, [onRequestChanges]);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+    <div className="flex flex-col h-screen">
       {/* Header */}
-      <header
-        style={{
-          padding: "12px 24px",
-          borderBottom: "1px solid #333",
-          display: "flex",
-          alignItems: "center",
-          gap: 16,
-          flexShrink: 0,
-        }}
-      >
+      <header className="px-6 py-3 border-b border-border flex items-center gap-4 shrink-0 bg-surface-1">
         <button
           onClick={onBack}
-          style={{ cursor: "pointer", padding: "4px 12px" }}
+          className="px-3 py-1 rounded bg-surface-2 hover:bg-surface-3 text-text-secondary cursor-pointer"
         >
           Back
         </button>
 
         <strong>PR {review.pr}</strong>
-        <span style={{ color: "#888" }}>{review.branch}</span>
-        <span style={{ color: "#888" }}>Issue: {review.issue}</span>
+        <span className="text-text-secondary">{review.branch}</span>
+        <span className="text-text-secondary">Issue: {review.issue}</span>
 
         <span
-          style={{
-            padding: "2px 8px",
-            borderRadius: 4,
-            backgroundColor: gateStateColor(review.gate_state),
-            color: "white",
-            fontSize: 12,
-          }}
+          className={`px-2 py-0.5 rounded text-xs font-bold text-white ${gateStateBgClass(review.gate_state)}`}
         >
           {gateStateLabel(review.gate_state)}
         </span>
 
         {review.stale && (
-          <span style={{ color: "#FF5722", fontSize: 12 }}>(stale)</span>
+          <span className="text-danger text-xs">(stale)</span>
         )}
 
         {review.agent != null && (
-          <span style={{ color: "#FF9800", fontSize: 12 }}>
+          <span className="text-warning text-xs">
             Agent running (PID: {review.agent.pid})
           </span>
         )}
 
-        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+        <div className="ml-auto flex gap-2">
           {hasLocalComments && (
             <button
               onClick={() => void handleMirrorComments()}
               disabled={mirroring}
-              style={{
-                cursor: mirroring ? "wait" : "pointer",
-                padding: "4px 12px",
-                backgroundColor: "#607D8B",
-                color: "white",
-                border: "none",
-                borderRadius: 4,
-              }}
+              className="px-3 py-1 rounded bg-surface-2 hover:bg-surface-3 text-white border-none cursor-pointer disabled:cursor-wait"
             >
               {mirroring ? "Mirroring..." : "Mirror to GitHub"}
             </button>
@@ -272,14 +250,7 @@ export function DiffView({
             <button
               onClick={() => void handleRequestChanges()}
               disabled={submitting}
-              style={{
-                cursor: submitting ? "wait" : "pointer",
-                padding: "4px 12px",
-                backgroundColor: "#FF5722",
-                color: "white",
-                border: "none",
-                borderRadius: 4,
-              }}
+              className="px-3 py-1 rounded bg-danger text-white border-none cursor-pointer disabled:cursor-wait"
             >
               Request Changes ({review.comments.length})
             </button>
@@ -290,14 +261,11 @@ export function DiffView({
       {/* Mirror result banner */}
       {mirrorResult !== null && (
         <div
-          style={{
-            padding: "8px 24px",
-            borderBottom: "1px solid #333",
-            fontSize: 13,
-            backgroundColor:
-              mirrorResult.failed.length === 0 ? "#1B5E20" : "#BF360C",
-            color: "white",
-          }}
+          className={`px-6 py-2 border-b border-border text-[13px] ${
+            mirrorResult.failed.length === 0
+              ? "bg-success/20 text-success"
+              : "bg-danger/20 text-danger"
+          }`}
         >
           Mirrored: {mirrorResult.posted} posted
           {mirrorResult.failed.length > 0 &&
@@ -306,16 +274,7 @@ export function DiffView({
             onClick={() => {
               setMirrorResult(null);
             }}
-            style={{
-              marginLeft: 12,
-              cursor: "pointer",
-              background: "transparent",
-              border: "1px solid rgba(255,255,255,0.5)",
-              color: "white",
-              borderRadius: 4,
-              padding: "2px 8px",
-              fontSize: 11,
-            }}
+            className="ml-3 cursor-pointer bg-transparent border border-white/50 text-white rounded px-2 py-0.5 text-[11px]"
           >
             Dismiss
           </button>
@@ -323,46 +282,31 @@ export function DiffView({
       )}
 
       {/* File selector */}
-      <nav
-        style={{
-          padding: "8px 24px",
-          borderBottom: "1px solid #333",
-          display: "flex",
-          gap: 4,
-          overflowX: "auto",
-          flexShrink: 0,
-        }}
-      >
+      <nav className="px-6 py-2 border-b border-border flex gap-1 overflow-x-auto shrink-0">
         {filePaths.map((path) => (
           <button
             key={path}
             onClick={() => {
               setSelectedFile(path);
             }}
-            style={{
-              cursor: "pointer",
-              padding: "4px 8px",
-              fontSize: 12,
-              backgroundColor:
-                path === selectedFile ? "#2196F3" : "transparent",
-              color: path === selectedFile ? "white" : "#ccc",
-              border: "1px solid #555",
-              borderRadius: 4,
-              whiteSpace: "nowrap",
-            }}
+            className={
+              path === selectedFile
+                ? "px-2 py-1 text-xs rounded bg-accent text-white border border-border cursor-pointer whitespace-nowrap"
+                : "px-2 py-1 text-xs rounded bg-transparent text-text-secondary border border-border cursor-pointer whitespace-nowrap hover:bg-surface-2"
+            }
           >
             {path}
           </button>
         ))}
         {filePaths.length === 0 && (
-          <span style={{ color: "#888", fontSize: 12 }}>
+          <span className="text-text-muted text-xs">
             No files in diff
           </span>
         )}
       </nav>
 
       {/* Monaco Diff Editor */}
-      <div style={{ flex: 1, minHeight: 0 }}>
+      <div className="flex-1 min-h-0">
         {selectedFile !== "" ? (
           <DiffEditor
             original={currentFileDiff.original}
@@ -378,34 +322,18 @@ export function DiffView({
             }}
           />
         ) : (
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              height: "100%",
-              color: "#888",
-            }}
-          >
+          <div className="flex items-center justify-center h-full text-text-muted">
             No diff available
           </div>
         )}
       </div>
 
       {/* Comments panel */}
-      <div
-        style={{
-          borderTop: "1px solid #333",
-          padding: "12px 24px",
-          maxHeight: 300,
-          overflowY: "auto",
-          flexShrink: 0,
-        }}
-      >
-        <h3 style={{ margin: "0 0 8px 0", fontSize: 14 }}>
+      <div className="border-t border-border px-6 py-3 max-h-[300px] overflow-y-auto shrink-0">
+        <h3 className="m-0 mb-2 text-sm">
           Comments
           {commentsForFile.length > 0 && (
-            <span style={{ color: "#888", fontWeight: "normal" }}>
+            <span className="text-text-muted font-normal">
               {" "}
               ({commentsForFile.length} on {selectedFile})
             </span>
@@ -418,36 +346,23 @@ export function DiffView({
           return (
             <div
               key={comment.id}
-              style={{
-                padding: "8px 12px",
-                marginBottom: 8,
-                backgroundColor: "#1e1e1e",
-                borderLeft: "3px solid #2196F3",
-                borderRadius: 4,
-                fontSize: 13,
-              }}
+              className="p-3 mb-2 bg-surface-1 border-l-[3px] border-l-accent rounded text-sm"
             >
-              <div style={{ color: "#888", fontSize: 11, marginBottom: 4 }}>
+              <div className="text-text-muted text-[11px] mb-1">
                 {range !== null
                   ? `Lines ${String(range[0])}-${String(range[1])}`
                   : "File-level"}
                 {" | "}
                 {comment.origin}
               </div>
-              <div style={{ whiteSpace: "pre-wrap" }}>{comment.body}</div>
+              <div className="whitespace-pre-wrap">{comment.body}</div>
             </div>
           );
         })}
 
         {/* All comments (other files) summary */}
         {review.comments.length > commentsForFile.length && (
-          <div
-            style={{
-              color: "#888",
-              fontSize: 12,
-              marginBottom: 8,
-            }}
-          >
+          <div className="text-text-muted text-xs mb-2">
             + {review.comments.length - commentsForFile.length} comment
             {review.comments.length - commentsForFile.length !== 1
               ? "s"
@@ -458,19 +373,9 @@ export function DiffView({
 
         {/* Add comment form */}
         {review.gate_state === "InReview" && (
-          <div
-            style={{
-              display: "flex",
-              gap: 8,
-              alignItems: "flex-end",
-              flexWrap: "wrap",
-              marginTop: 8,
-              paddingTop: 8,
-              borderTop: "1px solid #333",
-            }}
-          >
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <label style={{ fontSize: 11, color: "#888" }}>File</label>
+          <div className="flex gap-2 items-end flex-wrap mt-2 pt-2 border-t border-border">
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-text-muted">File</label>
               <input
                 type="text"
                 value={commentFile}
@@ -478,21 +383,13 @@ export function DiffView({
                   setCommentFile(e.target.value);
                 }}
                 placeholder={selectedFile}
-                style={{
-                  width: 200,
-                  padding: "4px 8px",
-                  fontSize: 12,
-                  backgroundColor: "#1e1e1e",
-                  color: "#ccc",
-                  border: "1px solid #555",
-                  borderRadius: 4,
-                }}
+                className="w-[200px] bg-surface-2 text-text-secondary border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
               />
             </div>
 
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <label style={{ fontSize: 11, color: "#888" }}>Lines</label>
-              <div style={{ display: "flex", gap: 4 }}>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-text-muted">Lines</label>
+              <div className="flex gap-1">
                 <input
                   type="number"
                   min={1}
@@ -500,17 +397,9 @@ export function DiffView({
                   onChange={(e) => {
                     setCommentLineStart(Number(e.target.value));
                   }}
-                  style={{
-                    width: 60,
-                    padding: "4px 8px",
-                    fontSize: 12,
-                    backgroundColor: "#1e1e1e",
-                    color: "#ccc",
-                    border: "1px solid #555",
-                    borderRadius: 4,
-                  }}
+                  className="w-[60px] bg-surface-2 text-text-secondary border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
                 />
-                <span style={{ color: "#888", alignSelf: "center" }}>-</span>
+                <span className="text-text-muted self-center">-</span>
                 <input
                   type="number"
                   min={1}
@@ -518,29 +407,14 @@ export function DiffView({
                   onChange={(e) => {
                     setCommentLineEnd(Number(e.target.value));
                   }}
-                  style={{
-                    width: 60,
-                    padding: "4px 8px",
-                    fontSize: 12,
-                    backgroundColor: "#1e1e1e",
-                    color: "#ccc",
-                    border: "1px solid #555",
-                    borderRadius: 4,
-                  }}
+                  className="w-[60px] bg-surface-2 text-text-secondary border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
                 />
               </div>
             </div>
 
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: 4,
-                flex: 1,
-              }}
-            >
-              <label style={{ fontSize: 11, color: "#888" }}>Comment</label>
-              <div style={{ display: "flex", gap: 8 }}>
+            <div className="flex flex-col gap-1 flex-1">
+              <label className="text-[11px] text-text-muted">Comment</label>
+              <div className="flex gap-2">
                 <input
                   type="text"
                   value={commentBody}
@@ -553,33 +427,12 @@ export function DiffView({
                     }
                   }}
                   placeholder="Add a review comment..."
-                  style={{
-                    flex: 1,
-                    padding: "4px 8px",
-                    fontSize: 12,
-                    backgroundColor: "#1e1e1e",
-                    color: "#ccc",
-                    border: "1px solid #555",
-                    borderRadius: 4,
-                  }}
+                  className="flex-1 bg-surface-2 text-text-secondary border border-border rounded px-2 py-1 text-xs focus:border-accent focus:outline-none"
                 />
                 <button
                   onClick={() => void handleAddComment()}
                   disabled={submitting || commentBody.trim() === ""}
-                  style={{
-                    cursor:
-                      submitting || commentBody.trim() === ""
-                        ? "not-allowed"
-                        : "pointer",
-                    padding: "4px 12px",
-                    fontSize: 12,
-                    backgroundColor: "#4CAF50",
-                    color: "white",
-                    border: "none",
-                    borderRadius: 4,
-                    opacity:
-                      submitting || commentBody.trim() === "" ? 0.5 : 1,
-                  }}
+                  className="px-3 py-1 text-xs bg-success text-white border-none rounded cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Add
                 </button>

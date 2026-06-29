@@ -5,19 +5,24 @@ import type { DiffData } from "./bindings/DiffData";
 import type { MirrorResult } from "./bindings/MirrorResult";
 import type { ProjectPlan } from "./bindings/ProjectPlan";
 import type { BatchVerdict } from "./bindings/BatchVerdict";
+import type { Config } from "./bindings/Config";
+import type { KickoffResult } from "./bindings/KickoffResult";
 
 /**
  * Navigation state discriminated union.
  *
  * The app is either showing the frontier list, reviewing a specific PR's diff,
- * viewing the project plan, or viewing the stack dependency graph. Using a
- * tagged union (not optional fields) makes exhaustive switching possible.
+ * viewing the project plan, viewing the stack dependency graph, adjusting
+ * settings, or running the kickoff flow. Using a tagged union (not optional
+ * fields) makes exhaustive switching possible.
  */
 type ViewState =
   | { readonly kind: "frontier" }
   | { readonly kind: "diff"; readonly pr: string }
   | { readonly kind: "plan" }
-  | { readonly kind: "stacks" };
+  | { readonly kind: "stacks" }
+  | { readonly kind: "settings" }
+  | { readonly kind: "kickoff" };
 
 interface AppStore {
   readonly reviews: readonly Review[];
@@ -50,6 +55,12 @@ interface AppStore {
 
   /** Navigate to the stack dependency view. */
   navigateToStacks: () => void;
+
+  /** Navigate to the settings view. */
+  navigateToSettings: () => void;
+
+  /** Navigate to the kickoff view. */
+  navigateToKickoff: () => void;
 
   /** Add an anchored comment to the active review. */
   addComment: (
@@ -92,6 +103,52 @@ interface AppStore {
 
   /** Toggle visibility of the batch-approve panel. */
   toggleBatchPanel: () => void;
+
+  // -------------------------------------------------------------------------
+  // Config
+  // -------------------------------------------------------------------------
+
+  /** The persisted application config, or null if not yet fetched. */
+  readonly config: Config | null;
+
+  /** Whether a config fetch is in progress. */
+  readonly configLoading: boolean;
+
+  /** Error from the last config operation, if any. */
+  readonly configError: string | null;
+
+  /** Fetch configuration from the backend. */
+  fetchConfig: () => Promise<void>;
+
+  /** Save configuration to the backend. */
+  saveConfig: (config: Config) => Promise<void>;
+
+  // -------------------------------------------------------------------------
+  // Kickoff
+  // -------------------------------------------------------------------------
+
+  /** Whether a kickoff operation is in progress. */
+  readonly kickoffLoading: boolean;
+
+  /** Result of the last kickoff run, if any. */
+  readonly kickoffResult: KickoffResult | null;
+
+  /** Run the kickoff flow for a Linear project. */
+  runKickoff: (projectId: string, skipPlan: boolean) => Promise<void>;
+
+  // -------------------------------------------------------------------------
+  // Restack
+  // -------------------------------------------------------------------------
+
+  /** Restack a single PR onto its updated base. */
+  restackPr: (pr: string) => Promise<void>;
+
+  // -------------------------------------------------------------------------
+  // Plan from path
+  // -------------------------------------------------------------------------
+
+  /** Load a plan document from a file path on disk. */
+  loadPlanFromPath: (path: string, project: string) => Promise<void>;
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
@@ -105,6 +162,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
   activeDiff: null,
   batchVerdicts: null,
   showBatchPanel: false,
+  config: null,
+  configLoading: false,
+  configError: null,
+  kickoffLoading: false,
+  kickoffResult: null,
 
   fetchReviews: async () => {
     set({ loading: true, error: null });
@@ -174,6 +236,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
       activeDiff: null,
     });
     void get().fetchReviews();
+  },
+
+  navigateToSettings: () => {
+    set({ view: { kind: "settings" } });
+    void get().fetchConfig();
+  },
+
+  navigateToKickoff: () => {
+    set({ view: { kind: "kickoff" }, kickoffResult: null });
   },
 
   addComment: async (
@@ -347,6 +418,85 @@ export const useAppStore = create<AppStore>((set, get) => ({
   toggleBatchPanel: () => {
     const { showBatchPanel } = get();
     set({ showBatchPanel: !showBatchPanel });
+  },
+
+  // -------------------------------------------------------------------------
+  // Config
+  // -------------------------------------------------------------------------
+
+  fetchConfig: async () => {
+    set({ configLoading: true, configError: null });
+    try {
+      const config = await invoke<Config>("get_config");
+      set({ config, configLoading: false });
+    } catch (e: unknown) {
+      set({ configError: String(e), configLoading: false });
+    }
+  },
+
+  saveConfig: async (config: Config) => {
+    set({ configLoading: true, configError: null });
+    try {
+      await invoke("save_config", { config });
+      set({ config, configLoading: false });
+    } catch (e: unknown) {
+      set({ configError: String(e), configLoading: false });
+    }
+  },
+
+  // -------------------------------------------------------------------------
+  // Kickoff
+  // -------------------------------------------------------------------------
+
+  runKickoff: async (projectId: string, skipPlan: boolean) => {
+    set({ kickoffLoading: true, error: null, kickoffResult: null });
+    try {
+      const result = await invoke<KickoffResult>("kickoff", {
+        projectId,
+        skipPlan,
+      });
+      set({ kickoffLoading: false, kickoffResult: result });
+      // Refresh reviews and frontier after kickoff completes.
+      void get().fetchReviews();
+      void get().fetchFrontier();
+      void get().fetchPlan();
+    } catch (e: unknown) {
+      set({ error: String(e), kickoffLoading: false });
+    }
+  },
+
+  // -------------------------------------------------------------------------
+  // Restack
+  // -------------------------------------------------------------------------
+
+  restackPr: async (pr: string) => {
+    set({ loading: true, error: null });
+    try {
+      const review = await invoke<Review>("restack_pr", { pr });
+      // Update the review in-place in both lists.
+      const reviews = get().reviews.map((r) => (r.pr === review.pr ? review : r));
+      const frontier = get().frontier.map((r) => (r.pr === review.pr ? review : r));
+      set({ reviews, frontier, loading: false });
+    } catch (e: unknown) {
+      set({ error: String(e), loading: false });
+    }
+  },
+
+  // -------------------------------------------------------------------------
+  // Plan from path
+  // -------------------------------------------------------------------------
+
+  loadPlanFromPath: async (path: string, project: string) => {
+    set({ loading: true, error: null });
+    try {
+      const plan = await invoke<ProjectPlan>("load_plan_from_path", {
+        path,
+        project,
+      });
+      set({ plan, loading: false });
+    } catch (e: unknown) {
+      set({ error: String(e), loading: false });
+    }
   },
 }));
 

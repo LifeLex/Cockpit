@@ -430,13 +430,7 @@ pub async fn pr_diff_in(repo_path: &std::path::Path, pr_number: u64) -> Result<S
 /// Fetch the unified diff for a PR using `--repo` (cross-repo).
 pub async fn pr_diff_by_repo(repo_slug: &str, pr_number: u64) -> Result<String, Error> {
     let output = Command::new("gh")
-        .args([
-            "pr",
-            "diff",
-            &pr_number.to_string(),
-            "--repo",
-            repo_slug,
-        ])
+        .args(["pr", "diff", &pr_number.to_string(), "--repo", repo_slug])
         .output()
         .await?;
 
@@ -460,8 +454,8 @@ pub fn build_review_from_pr(
 ) -> crate::model::Review {
     use crate::model::*;
 
-    let issue = parse_issue_from_branch(&pr.head_ref_name)
-        .unwrap_or_else(|| IssueRef::new(&pr.title));
+    let issue =
+        parse_issue_from_branch(&pr.head_ref_name).unwrap_or_else(|| IssueRef::new(&pr.title));
 
     let id_prefix = if pr.repo_slug.is_empty() {
         format!("gh-{}", pr.number)

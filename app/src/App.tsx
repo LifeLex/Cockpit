@@ -10,8 +10,12 @@ import { BatchApprovePanel } from "./components/BatchApprovePanel";
 import { StackView } from "./components/StackView";
 import { SettingsView } from "./components/SettingsView";
 import { KickoffView } from "./components/KickoffView";
+import { SkeletonList } from "./components/SkeletonCard";
+import { EmptyState } from "./components/EmptyState";
 
 type ReviewTab = "my-prs" | "review-requests" | "frontier";
+
+const SIDEBAR_COLLAPSED_KEY = "cockpit-sidebar-collapsed";
 
 function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
@@ -61,6 +65,29 @@ function App() {
   const approveAllEligible = useAppStore((s) => s.approveAllEligible);
   const toggleBatchPanel = useAppStore((s) => s.toggleBatchPanel);
 
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
+  });
+
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(next));
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "b") {
+        e.preventDefault();
+        toggleSidebar();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [toggleSidebar]);
+
   useEffect(() => {
     void fetchReviews();
     void fetchFrontier();
@@ -89,7 +116,6 @@ function App() {
     [navigateToDiff],
   );
 
-  /** Map sidebar navigation kinds to store navigation actions. */
   const handleNavigate = useCallback(
     (kind: ViewState["kind"]) => {
       switch (kind) {
@@ -109,7 +135,6 @@ function App() {
           navigateToKickoff();
           break;
         case "diff":
-          // Diff is navigated via handleViewDiff, not the sidebar.
           break;
         default:
           assertNever(kind);
@@ -118,7 +143,6 @@ function App() {
     [navigateToFrontier, navigateToPlan, navigateToStacks, navigateToSettings, navigateToKickoff],
   );
 
-  /** Error banner shown when a global error is present. */
   const errorBanner =
     error !== null ? (
       <div className="mb-4 rounded-lg border border-danger bg-danger/10 px-4 py-3 text-sm text-danger">
@@ -126,7 +150,6 @@ function App() {
       </div>
     ) : null;
 
-  /** Render main content based on the current view. */
   function renderContent() {
     switch (view.kind) {
       case "frontier":
@@ -210,9 +233,7 @@ function App() {
             {/* Tab content */}
             {reviewTab === "my-prs" && (
               <section>
-                {prFetchLoading && authoredPrs.length === 0 && (
-                  <p className="text-sm text-text-muted">Fetching your PRs from GitHub...</p>
-                )}
+                {prFetchLoading && authoredPrs.length === 0 && <SkeletonList count={4} />}
                 {authoredPrs.map((review) => (
                   <ReviewCard
                     key={review.id}
@@ -222,21 +243,20 @@ function App() {
                   />
                 ))}
                 {!prFetchLoading && authoredPrs.length === 0 && (
-                  <div className="rounded-lg border border-border bg-surface-1 p-8 text-center">
-                    <p className="text-text-muted">No open PRs found.</p>
-                    <p className="mt-1 text-sm text-text-muted">
-                      Click Refresh to fetch your open PRs from GitHub, or make sure your repo path is set in Settings.
-                    </p>
-                  </div>
+                  <EmptyState
+                    icon="📝"
+                    title="No open PRs"
+                    description="Click Refresh to fetch your open PRs from GitHub. Make sure your repo path is configured in Settings."
+                    actionLabel="Go to Settings"
+                    onAction={navigateToSettings}
+                  />
                 )}
               </section>
             )}
 
             {reviewTab === "review-requests" && (
               <section>
-                {prFetchLoading && reviewRequests.length === 0 && (
-                  <p className="text-sm text-text-muted">Fetching review requests from GitHub...</p>
-                )}
+                {prFetchLoading && reviewRequests.length === 0 && <SkeletonList count={4} />}
                 {reviewRequests.map((review) => (
                   <ReviewCard
                     key={review.id}
@@ -246,12 +266,11 @@ function App() {
                   />
                 ))}
                 {!prFetchLoading && reviewRequests.length === 0 && (
-                  <div className="rounded-lg border border-border bg-surface-1 p-8 text-center">
-                    <p className="text-text-muted">No review requests found.</p>
-                    <p className="mt-1 text-sm text-text-muted">
-                      Click Refresh to fetch PRs where your review is requested.
-                    </p>
-                  </div>
+                  <EmptyState
+                    icon="👀"
+                    title="No review requests"
+                    description="No PRs are waiting for your review. Click Refresh to check again."
+                  />
                 )}
               </section>
             )}
@@ -259,9 +278,7 @@ function App() {
             {reviewTab === "frontier" && (
               <>
                 <section>
-                  {loading && (
-                    <p className="text-sm text-text-muted">Loading...</p>
-                  )}
+                  {loading && frontier.length === 0 && <SkeletonList count={4} />}
                   {frontier.map((review) => (
                     <ReviewCard
                       key={review.id}
@@ -271,12 +288,13 @@ function App() {
                     />
                   ))}
                   {!loading && frontier.length === 0 && (
-                    <div className="rounded-lg border border-border bg-surface-1 p-8 text-center">
-                      <p className="text-text-muted">No reviews in the frontier.</p>
-                      <p className="mt-1 text-sm text-text-muted">
-                        Use Kickoff to import a Linear project, or switch to My PRs to review existing GitHub PRs.
-                      </p>
-                    </div>
+                    <EmptyState
+                      icon="🚀"
+                      title="No reviews in the frontier"
+                      description="Use Kickoff to import a Linear project, or switch to My PRs to review existing GitHub PRs."
+                      actionLabel="Go to Kickoff"
+                      onAction={navigateToKickoff}
+                    />
                   )}
                 </section>
 
@@ -353,16 +371,13 @@ function App() {
                 }}
               />
             ) : (
-              <div className="rounded-lg border border-border bg-surface-1 p-8 text-center">
-                <p className="text-text-muted">No plan loaded.</p>
-                <p className="mt-1 text-sm text-text-muted">
-                  Use the CLI to load a plan file, or invoke{" "}
-                  <code className="rounded bg-surface-2 px-1.5 py-0.5 text-xs">
-                    load_plan
-                  </code>{" "}
-                  from the command palette.
-                </p>
-              </div>
+              <EmptyState
+                icon="📋"
+                title="No plan loaded"
+                description="Load a plan file or kick off a project with the plan gate enabled to get started."
+                actionLabel="Go to Kickoff"
+                onAction={navigateToKickoff}
+              />
             )}
           </div>
         );
@@ -379,9 +394,7 @@ function App() {
               <p className="mb-4 text-sm text-text-secondary">
                 Review dependency graph — click a node to view its diff
               </p>
-              {loading && (
-                <p className="text-sm text-text-muted">Loading...</p>
-              )}
+              {loading && reviews.length === 0 && <SkeletonList count={3} />}
               <StackView reviews={reviews} onViewDiff={handleViewDiff} />
             </section>
           </div>
@@ -405,6 +418,8 @@ function App() {
         reviewCount={reviews.length}
         hasPlan={plan !== null}
         onNavigate={handleNavigate}
+        collapsed={sidebarCollapsed}
+        onToggleCollapse={toggleSidebar}
       />
       <main className="flex-1 overflow-y-auto">
         {renderContent()}

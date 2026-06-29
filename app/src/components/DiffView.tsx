@@ -6,7 +6,7 @@
  * and request-changes button.
  */
 
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import { DiffEditor } from "@monaco-editor/react";
 import type { Review } from "../bindings/Review";
 import type { DiffData } from "../bindings/DiffData";
@@ -107,6 +107,55 @@ function getFileDiff(
   return { path, original: "", modified: "" };
 }
 
+/** File status derived from the diff content. */
+type FileStatus = "added" | "modified" | "deleted";
+
+/** Determine file status by checking original/modified content. */
+function fileStatus(fileDiffs: readonly FileDiff[], path: string): FileStatus {
+  const fd = fileDiffs.find((d) => d.path === path);
+  if (fd === undefined) return "modified";
+  if (fd.original.trim() === "") return "added";
+  if (fd.modified.trim() === "") return "deleted";
+  return "modified";
+}
+
+/** Count added and deleted lines for a file from the raw diff. */
+function lineCounts(
+  fileDiffs: readonly FileDiff[],
+  path: string,
+): { readonly additions: number; readonly deletions: number } {
+  const fd = fileDiffs.find((d) => d.path === path);
+  if (fd === undefined) return { additions: 0, deletions: 0 };
+  const origLines = fd.original === "" ? 0 : fd.original.split("\n").length;
+  const modLines = fd.modified === "" ? 0 : fd.modified.split("\n").length;
+  // For a newly added file, all lines are additions
+  if (fd.original.trim() === "") return { additions: modLines, deletions: 0 };
+  // For a deleted file, all lines are deletions
+  if (fd.modified.trim() === "") return { additions: 0, deletions: origLines };
+  // For modified files, approximate: additions = new lines not in original count
+  const additions = Math.max(0, modLines - origLines);
+  const deletions = Math.max(0, origLines - modLines);
+  // If same length but content differs, show at least 1 for each
+  if (additions === 0 && deletions === 0 && fd.original !== fd.modified) {
+    return { additions: 1, deletions: 1 };
+  }
+  return { additions, deletions };
+}
+
+/** Status indicator for the file tree. */
+function statusIndicator(status: FileStatus): { readonly label: string; readonly className: string } {
+  switch (status) {
+    case "added":
+      return { label: "+", className: "text-success font-bold" };
+    case "modified":
+      return { label: "M", className: "text-warning font-bold" };
+    case "deleted":
+      return { label: "-", className: "text-danger font-bold" };
+    default:
+      return assertNever(status);
+  }
+}
+
 /** Filter comments that belong to a specific file. */
 function fileComments(
   comments: readonly Comment[],
@@ -140,6 +189,33 @@ export function DiffView({
   const [commentLineEnd, setCommentLineEnd] = useState(1);
   const [commentBody, setCommentBody] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [diffMode, setDiffMode] = useState<"split" | "unified">("split");
+
+  const activeFileRef = useRef<HTMLButtonElement | null>(null);
+
+  // Keyboard shortcut: `m` toggles the file tree sidebar
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent): void {
+      // Ignore when typing in an input or textarea
+      // Justified: e.target is EventTarget which doesn't expose tagName;
+      // in a DOM KeyboardEvent it is always an Element or null.
+      const tag = (e.target as HTMLElement | null)?.tagName ?? "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (e.key === "m") {
+        setSidebarOpen((prev) => !prev);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  // Scroll the active file into view when it changes
+  useEffect(() => {
+    activeFileRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selectedFile]);
 
   const currentFileDiff = useMemo(
     () => getFileDiff(fileDiffs, selectedFile),
@@ -236,6 +312,30 @@ export function DiffView({
           </span>
         )}
 
+        {/* Unified / Split toggle */}
+        <div className="flex rounded overflow-hidden border border-border">
+          <button
+            onClick={() => { setDiffMode("split"); }}
+            className={
+              diffMode === "split"
+                ? "px-3 py-1 text-xs bg-accent text-white border-none cursor-pointer"
+                : "px-3 py-1 text-xs bg-surface-2 text-text-secondary border-none cursor-pointer hover:bg-surface-3"
+            }
+          >
+            Split
+          </button>
+          <button
+            onClick={() => { setDiffMode("unified"); }}
+            className={
+              diffMode === "unified"
+                ? "px-3 py-1 text-xs bg-accent text-white border-none cursor-pointer"
+                : "px-3 py-1 text-xs bg-surface-2 text-text-secondary border-none cursor-pointer hover:bg-surface-3"
+            }
+          >
+            Unified
+          </button>
+        </div>
+
         <div className="ml-auto flex gap-2">
           {hasLocalComments && (
             <button
@@ -281,51 +381,102 @@ export function DiffView({
         </div>
       )}
 
-      {/* File selector */}
-      <nav className="px-6 py-2 border-b border-border flex gap-1 overflow-x-auto shrink-0">
-        {filePaths.map((path) => (
-          <button
-            key={path}
-            onClick={() => {
-              setSelectedFile(path);
-            }}
-            className={
-              path === selectedFile
-                ? "px-2 py-1 text-xs rounded bg-accent text-white border border-border cursor-pointer whitespace-nowrap"
-                : "px-2 py-1 text-xs rounded bg-transparent text-text-secondary border border-border cursor-pointer whitespace-nowrap hover:bg-surface-2"
-            }
-          >
-            {path}
-          </button>
-        ))}
-        {filePaths.length === 0 && (
-          <span className="text-text-muted text-xs">
-            No files in diff
-          </span>
+      {/* File tree sidebar + Monaco Diff Editor */}
+      <div className="flex flex-1 min-h-0">
+        {/* File tree sidebar */}
+        {sidebarOpen && (
+          <aside className="w-60 shrink-0 bg-surface-1 border-r border-border flex flex-col">
+            <div className="px-3 py-2 border-b border-border flex items-center justify-between">
+              <span className="text-xs font-semibold text-text-secondary">
+                Files ({String(filePaths.length)})
+              </span>
+              <button
+                onClick={() => { setSidebarOpen(false); }}
+                className="text-text-muted hover:text-text-secondary text-xs cursor-pointer bg-transparent border-none"
+                title="Hide file tree (m)"
+              >
+                &laquo;
+              </button>
+            </div>
+            <nav className="flex-1 overflow-y-auto py-1">
+              {filePaths.map((path) => {
+                const status = fileStatus(fileDiffs, path);
+                const indicator = statusIndicator(status);
+                const counts = lineCounts(fileDiffs, path);
+                const isActive = path === selectedFile;
+                return (
+                  <button
+                    key={path}
+                    ref={isActive ? activeFileRef : null}
+                    onClick={() => { setSelectedFile(path); }}
+                    className={
+                      isActive
+                        ? "w-full text-left px-3 py-1.5 flex items-center gap-2 text-xs bg-surface-2 border-l-2 border-l-accent cursor-pointer border-y-0 border-r-0"
+                        : "w-full text-left px-3 py-1.5 flex items-center gap-2 text-xs bg-transparent border-l-2 border-l-transparent cursor-pointer hover:bg-surface-2 border-y-0 border-r-0"
+                    }
+                  >
+                    <span className={`${indicator.className} w-4 text-center shrink-0`}>
+                      {indicator.label}
+                    </span>
+                    <span className="text-text-primary truncate flex-1" title={path}>
+                      {path}
+                    </span>
+                    {(counts.additions > 0 || counts.deletions > 0) && (
+                      <span className="shrink-0 text-[10px] text-text-muted">
+                        {counts.additions > 0 && (
+                          <span className="text-success">+{String(counts.additions)}</span>
+                        )}
+                        {counts.additions > 0 && counts.deletions > 0 && " "}
+                        {counts.deletions > 0 && (
+                          <span className="text-danger">-{String(counts.deletions)}</span>
+                        )}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+              {filePaths.length === 0 && (
+                <span className="px-3 py-2 text-text-muted text-xs block">
+                  No files in diff
+                </span>
+              )}
+            </nav>
+          </aside>
         )}
-      </nav>
 
-      {/* Monaco Diff Editor */}
-      <div className="flex-1 min-h-0">
-        {selectedFile !== "" ? (
-          <DiffEditor
-            original={currentFileDiff.original}
-            modified={currentFileDiff.modified}
-            language={detectLanguage(selectedFile)}
-            theme="vs-dark"
-            options={{
-              readOnly: true,
-              renderSideBySide: true,
-              minimap: { enabled: false },
-              scrollBeyondLastLine: false,
-              fontSize: 13,
-            }}
-          />
-        ) : (
-          <div className="flex items-center justify-center h-full text-text-muted">
-            No diff available
-          </div>
+        {/* Collapsed sidebar toggle */}
+        {!sidebarOpen && (
+          <button
+            onClick={() => { setSidebarOpen(true); }}
+            className="w-6 shrink-0 bg-surface-1 border-r border-border flex items-center justify-center cursor-pointer hover:bg-surface-2 border-y-0 border-l-0 text-text-muted hover:text-text-secondary"
+            title="Show file tree (m)"
+          >
+            &raquo;
+          </button>
         )}
+
+        {/* Monaco Diff Editor */}
+        <div className="flex-1 min-h-0">
+          {selectedFile !== "" ? (
+            <DiffEditor
+              original={currentFileDiff.original}
+              modified={currentFileDiff.modified}
+              language={detectLanguage(selectedFile)}
+              theme="vs-dark"
+              options={{
+                readOnly: true,
+                renderSideBySide: diffMode === "split",
+                minimap: { enabled: false },
+                scrollBeyondLastLine: false,
+                fontSize: 13,
+              }}
+            />
+          ) : (
+            <div className="flex items-center justify-center h-full text-text-muted">
+              No diff available
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Comments panel */}

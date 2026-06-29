@@ -4,6 +4,9 @@
  * Renders the logo, primary navigation items (Reviews, Plan, Stacks),
  * and secondary actions (Kickoff, Settings) separated by a divider.
  * Active state uses a left accent border and `bg-surface-2` highlight.
+ *
+ * Supports a collapsed mode (60px) that shows only icons with tooltips,
+ * toggled via a chevron button or the Cmd+B keyboard shortcut.
  */
 
 import type { ViewState } from "../store";
@@ -24,6 +27,10 @@ interface SidebarProps {
   readonly hasPlan: boolean;
   /** Callback to navigate to a different view. */
   readonly onNavigate: (kind: NavKind) => void;
+  /** Whether the sidebar is in collapsed (icon-only) mode. */
+  readonly collapsed?: boolean | undefined;
+  /** Callback to toggle the collapsed state. */
+  readonly onToggleCollapse?: (() => void) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +129,26 @@ function SettingsIcon() {
   );
 }
 
+/** Chevron icon that rotates based on collapsed state. */
+function CollapseIcon({ collapsed }: { readonly collapsed: boolean }) {
+  return (
+    <svg
+      className={[
+        "h-4 w-4 shrink-0 transition-transform duration-200",
+        collapsed ? "rotate-180" : "",
+      ].join(" ")}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M10 4 6 8l4 4" />
+    </svg>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // NavItem
 // ---------------------------------------------------------------------------
@@ -131,26 +158,33 @@ interface NavItemProps {
   readonly icon: React.ReactNode;
   readonly active: boolean;
   readonly badge?: string | undefined;
+  readonly collapsed?: boolean | undefined;
   readonly onClick: () => void;
 }
 
-function NavItem({ label, icon, active, badge, onClick }: NavItemProps) {
+function NavItem({ label, icon, active, badge, collapsed, onClick }: NavItemProps) {
   return (
     <button
       onClick={onClick}
+      title={collapsed === true ? label : undefined}
       className={[
-        "flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
+        "flex w-full items-center rounded-md text-sm font-medium transition-colors",
+        collapsed === true ? "justify-center px-2 py-2" : "gap-3 px-3 py-2",
         active
           ? "border-l-2 border-accent bg-surface-2 text-text-primary"
           : "border-l-2 border-transparent text-text-secondary hover:bg-surface-2 hover:text-text-primary",
       ].join(" ")}
     >
       {icon}
-      <span className="flex-1 text-left">{label}</span>
-      {badge !== undefined && (
-        <span className="rounded-full bg-surface-3 px-2 py-0.5 text-xs text-text-muted">
-          {badge}
-        </span>
+      {collapsed !== true && (
+        <>
+          <span className="flex-1 text-left">{label}</span>
+          {badge !== undefined && (
+            <span className="rounded-full bg-surface-3 px-2 py-0.5 text-xs text-text-muted">
+              {badge}
+            </span>
+          )}
+        </>
       )}
     </button>
   );
@@ -165,26 +199,64 @@ export function Sidebar({
   reviewCount,
   hasPlan,
   onNavigate,
+  collapsed = false,
+  onToggleCollapse,
 }: SidebarProps) {
   return (
-    <aside className="flex w-60 shrink-0 flex-col border-r border-border bg-surface-1">
+    <aside
+      className={[
+        "flex shrink-0 flex-col border-r border-border bg-surface-1 transition-all duration-200",
+        collapsed ? "w-15" : "w-60",
+      ].join(" ")}
+    >
       {/* Logo / app name */}
-      <div className="flex items-center gap-2 px-4 py-5">
-        <div className="flex h-7 w-7 items-center justify-center rounded-md bg-accent text-sm font-bold text-white">
+      <div className={[
+        "flex items-center py-5",
+        collapsed ? "justify-center px-2" : "gap-2 px-4",
+      ].join(" ")}>
+        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent text-sm font-bold text-white">
           C
         </div>
-        <span className="text-base font-semibold text-text-primary">
-          Cockpit
-        </span>
+        {!collapsed && (
+          <span className="flex-1 text-base font-semibold text-text-primary">
+            Cockpit
+          </span>
+        )}
+        {onToggleCollapse !== undefined && !collapsed && (
+          <button
+            onClick={onToggleCollapse}
+            title="Collapse sidebar"
+            className="flex h-6 w-6 items-center justify-center rounded text-text-muted hover:bg-surface-2 hover:text-text-primary"
+          >
+            <CollapseIcon collapsed={false} />
+          </button>
+        )}
       </div>
 
+      {/* Expand button shown when collapsed */}
+      {onToggleCollapse !== undefined && collapsed && (
+        <div className="flex justify-center px-2 pb-2">
+          <button
+            onClick={onToggleCollapse}
+            title="Expand sidebar"
+            className="flex h-6 w-6 items-center justify-center rounded text-text-muted hover:bg-surface-2 hover:text-text-primary"
+          >
+            <CollapseIcon collapsed={true} />
+          </button>
+        </div>
+      )}
+
       {/* Primary navigation */}
-      <nav className="flex flex-1 flex-col gap-1 px-3">
+      <nav className={[
+        "flex flex-1 flex-col gap-1",
+        collapsed ? "px-1.5" : "px-3",
+      ].join(" ")}>
         <NavItem
           label="Reviews"
           icon={<ReviewsIcon />}
           active={activeView === "frontier" || activeView === "diff"}
           badge={reviewCount > 0 ? String(reviewCount) : undefined}
+          collapsed={collapsed}
           onClick={() => {
             onNavigate("frontier");
           }}
@@ -194,6 +266,7 @@ export function Sidebar({
           icon={<PlanIcon />}
           active={activeView === "plan"}
           badge={hasPlan ? "loaded" : undefined}
+          collapsed={collapsed}
           onClick={() => {
             onNavigate("plan");
           }}
@@ -202,6 +275,7 @@ export function Sidebar({
           label="Stacks"
           icon={<StacksIcon />}
           active={activeView === "stacks"}
+          collapsed={collapsed}
           onClick={() => {
             onNavigate("stacks");
           }}
@@ -219,6 +293,7 @@ export function Sidebar({
             label="Kickoff"
             icon={<KickoffIcon />}
             active={activeView === "kickoff"}
+            collapsed={collapsed}
             onClick={() => {
               onNavigate("kickoff");
             }}
@@ -227,6 +302,7 @@ export function Sidebar({
             label="Settings"
             icon={<SettingsIcon />}
             active={activeView === "settings"}
+            collapsed={collapsed}
             onClick={() => {
               onNavigate("settings");
             }}

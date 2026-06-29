@@ -76,7 +76,10 @@ pub enum PlanDecision {
 // ---------------------------------------------------------------------------
 
 /// Result of a kickoff operation.
-#[derive(Debug)]
+///
+/// Serializable so it can cross the Tauri IPC boundary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
 pub struct KickoffResult {
     /// The reviews created for each frontier issue.
     pub reviews: Vec<Review>,

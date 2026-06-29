@@ -8,14 +8,19 @@ use std::sync::Arc;
 
 use tauri::State;
 
+use cockpit_core::adapters::agent::SpawnConfig;
 use cockpit_core::adapters::github::{self, MirrorResult};
+use cockpit_core::adapters::linear;
 use cockpit_core::batch;
+use cockpit_core::config::Config;
 use cockpit_core::gate::Gated;
+use cockpit_core::kickoff::{self, KickoffResult};
 use cockpit_core::model::{
     Anchor, Comment, CommentId, CommentOrigin, DiffData, GateState, PlanDoc, PrRef, ProjectPlan,
     ProjectRef, Review,
 };
 use cockpit_core::plan_parser;
+use cockpit_core::restack;
 
 use crate::error::CommandError;
 use crate::state::AppState;
@@ -358,4 +363,224 @@ pub fn approve_review(state: State<'_, Arc<AppState>>, pr: String) -> Result<Rev
     state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
         message: format!("Review not found: {pr}"),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Settings / Config commands
+// ---------------------------------------------------------------------------
+
+/// Load the application configuration from `~/.cockpit/config.toml`.
+///
+/// Returns the default configuration if the file does not exist.
+#[tauri::command]
+pub fn get_config() -> Result<Config, CommandError> {
+    let config = Config::load()?;
+    Ok(config)
+}
+
+/// Save the application configuration to `~/.cockpit/config.toml`.
+///
+/// Creates the `~/.cockpit/` directory if it does not already exist.
+#[tauri::command]
+pub fn save_config(config: Config) -> Result<(), CommandError> {
+    config.save()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Kickoff command
+// ---------------------------------------------------------------------------
+
+/// Kick off a Linear project: fetch issues, optionally plan, then create
+/// reviews for each frontier issue.
+///
+/// This is an explicit user action (Invariant 5). If `skip_plan` is false,
+/// a project plan is created in `Pending` state for the user to review
+/// before the batch is spawned.
+///
+/// Returns a [`KickoffResult`] with the created reviews and frontier.
+#[tauri::command]
+pub async fn kickoff(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    skip_plan: bool,
+) -> Result<KickoffResult, CommandError> {
+    let config = Config::load()?;
+
+    let api_key = config.linear_api_key.ok_or_else(|| CommandError {
+        message: "Linear API key not configured. Set it in Settings.".into(),
+    })?;
+
+    let project = ProjectRef::new(&project_id);
+    let client = reqwest::Client::new();
+
+    // 1. Fetch issues and compute the frontier.
+    let (data, frontier) = kickoff::fetch_and_compute_frontier(&client, &api_key, &project).await?;
+
+    if frontier.is_empty() {
+        return Err(CommandError::from(kickoff::Error::EmptyFrontier));
+    }
+
+    // 2. Build the issue DAG for parent/child wiring.
+    let issue_dag = linear::build_issue_dag(&data);
+
+    // 3. Handle plan gate decision.
+    if !skip_plan {
+        let plan = ProjectPlan {
+            project: project.clone(),
+            doc: cockpit_core::model::PlanDoc {
+                summary: format!("Plan for project {project}"),
+                steps: vec![],
+                files: vec![],
+                risks: vec![],
+                raw: String::new(),
+            },
+            gate_state: GateState::Pending,
+            comments: vec![],
+            agent: None,
+        };
+        state.plan.set(plan);
+    }
+
+    // 4. Build reviews for frontier issues.
+    let worktree_base = config
+        .repo_path
+        .as_ref()
+        .map(|p| p.join(".cockpit/worktrees"))
+        .unwrap_or_else(|| PathBuf::from(".cockpit/worktrees"));
+
+    let reviews =
+        kickoff::build_reviews_for_frontier(&frontier, &data, &issue_dag, &worktree_base, "main");
+
+    // 5. Store reviews in the in-memory store.
+    for review in &reviews {
+        state.reviews.insert(review.clone());
+    }
+
+    let result = KickoffResult {
+        reviews,
+        plan: state.plan.get(),
+        issue_count: data.issues.len(),
+        frontier,
+    };
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Restack command
+// ---------------------------------------------------------------------------
+
+/// Restack a stale PR onto its parent's new head.
+///
+/// If the rebase is clean, clears the stale flag and returns the updated
+/// review. If there are conflicts, spawns the conflict-resolver agent and
+/// returns the review with the agent run attached.
+///
+/// This is an explicit user action (Invariant 5).
+///
+/// The git operations run synchronously (via `restack_review`) before any
+/// async agent spawn so that `git2::Repository` (not `Send`) never lives
+/// across an `.await` boundary.
+#[tauri::command]
+pub async fn restack_pr(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+) -> Result<Review, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+
+    let mut review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    if !review.stale {
+        return Err(CommandError {
+            message: format!("PR {pr} is not stale; nothing to restack"),
+        });
+    }
+
+    let config = Config::load()?;
+    let repo_path = config.repo_path.unwrap_or_else(|| PathBuf::from("."));
+    let parent_branch = review.base.clone();
+
+    // Phase 1: synchronous git restack. git2::Repository is not Send, so
+    // we must not hold it across an .await point.
+    let repo = git2::Repository::discover(&repo_path).map_err(|e| CommandError {
+        message: format!(
+            "not inside a git repository at {}: {e}",
+            repo_path.display()
+        ),
+    })?;
+
+    let clean =
+        restack::restack_review(&repo, &mut review, &parent_branch).map_err(|e| CommandError {
+            message: format!("restack failed: {e}"),
+        })?;
+
+    // Drop the repo before any .await to satisfy Send requirements.
+    drop(repo);
+
+    // Phase 2: if conflicts, spawn the conflict-resolver agent (async).
+    if !clean {
+        let spawn_config = SpawnConfig::default();
+        let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
+        let worktree_path = review.worktree.clone();
+
+        let prompt = restack::assemble_conflict_prompt(&review, &parent_branch);
+        let agent_run = cockpit_core::adapters::agent::spawn_agent(
+            &worktree_path,
+            &prompt,
+            cockpit_core::model::AgentMode::Restack,
+            review.id.as_str(),
+            &state.sessions,
+            &hook_url,
+            &spawn_config,
+        )
+        .await
+        .map_err(|e| CommandError {
+            message: format!("failed to spawn conflict-resolver agent: {e}"),
+        })?;
+
+        review.agent = Some(agent_run);
+    }
+
+    // Persist the updated review back to the in-memory store.
+    let review_clone = review.clone();
+    state.reviews.update(&pr_ref, |r| {
+        r.base_sha = review_clone.base_sha.clone();
+        r.stale = review_clone.stale;
+        r.agent = review_clone.agent.clone();
+    });
+
+    state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found after restack: {pr}"),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Plan file loading command
+// ---------------------------------------------------------------------------
+
+/// Load a project plan from a file path on disk.
+///
+/// Parses the plan document and stores it in the app state as a new
+/// [`ProjectPlan`] in `Pending` state. The `path` argument is typically
+/// selected by the user via the file dialog.
+#[tauri::command]
+pub fn load_plan_from_path(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+    project: String,
+) -> Result<ProjectPlan, CommandError> {
+    let raw = std::fs::read_to_string(&path)?;
+    let doc: PlanDoc = plan_parser::parse(&raw)?;
+    let plan = ProjectPlan {
+        project: ProjectRef::new(project),
+        doc,
+        gate_state: GateState::Pending,
+        comments: vec![],
+        agent: None,
+    };
+    state.plan.set(plan.clone());
+    Ok(plan)
 }

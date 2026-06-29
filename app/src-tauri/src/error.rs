@@ -68,3 +68,27 @@ impl From<std::io::Error> for CommandError {
         }
     }
 }
+
+impl From<cockpit_core::config::Error> for CommandError {
+    fn from(e: cockpit_core::config::Error) -> Self {
+        Self {
+            message: e.to_string(),
+        }
+    }
+}
+
+impl From<cockpit_core::kickoff::Error> for CommandError {
+    fn from(e: cockpit_core::kickoff::Error) -> Self {
+        Self {
+            message: e.to_string(),
+        }
+    }
+}
+
+impl From<cockpit_core::restack::Error> for CommandError {
+    fn from(e: cockpit_core::restack::Error) -> Self {
+        Self {
+            message: e.to_string(),
+        }
+    }
+}

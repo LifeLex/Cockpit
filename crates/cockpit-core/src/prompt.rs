@@ -9,6 +9,7 @@ use std::fmt::Write;
 use sha2::{Digest, Sha256};
 
 use crate::model::{Anchor, Artifact, Comment, PlanDoc};
+use crate::skills::Skill;
 
 /// The scope-guard text, verbatim from `SPEC.md` §9.
 ///
@@ -32,6 +33,12 @@ pub struct ReworkInput<'a> {
     pub artifact: &'a Artifact,
     /// Gathered comments for this review cycle.
     pub comments: &'a [Comment],
+    /// Pre-filtered project skills to inject as conventions.
+    ///
+    /// Pass an empty slice to omit the conventions section. Callers are
+    /// responsible for calling [`crate::skills::discover_skills`] and
+    /// [`crate::skills::filter_relevant`] before constructing this input.
+    pub skills: &'a [Skill],
 }
 
 /// Assembled prompt ready for dispatch.
@@ -93,6 +100,12 @@ pub fn assemble_rework(input: &ReworkInput<'_>) -> AssembledPrompt {
     // §5 — Scope guard
     writeln!(text, "## Scope Guard\n").unwrap();
     writeln!(text, "{}\n", SCOPE_GUARD).unwrap();
+
+    // §6 — Project conventions (skills)
+    let conventions = crate::skills::format_for_prompt(input.skills);
+    if !conventions.is_empty() {
+        text.push_str(&conventions);
+    }
 
     let hash = sha256_hex(&text);
 
@@ -216,6 +229,7 @@ mod tests {
             approved_plan: Some(&plan),
             artifact: &diff,
             comments: &comments,
+            skills: &[],
         };
 
         let result = assemble_rework(&input);
@@ -234,6 +248,7 @@ mod tests {
             approved_plan: None,
             artifact: &plan_artifact,
             comments: &comments,
+            skills: &[],
         };
 
         let result = assemble_rework(&input);
@@ -253,6 +268,7 @@ mod tests {
             approved_plan: None,
             artifact: &diff,
             comments: &[],
+            skills: &[],
         };
 
         let result = assemble_rework(&input);
@@ -273,6 +289,7 @@ mod tests {
             approved_plan: None,
             artifact: &diff,
             comments: &comments,
+            skills: &[],
         };
 
         let a = assemble_rework(&input);
@@ -297,6 +314,7 @@ mod tests {
             approved_plan: None,
             artifact: &diff,
             comments: &[],
+            skills: &[],
         });
 
         let b = assemble_rework(&ReworkInput {
@@ -304,6 +322,7 @@ mod tests {
             approved_plan: None,
             artifact: &diff,
             comments: &[],
+            skills: &[],
         });
 
         assert_ne!(
@@ -341,5 +360,66 @@ mod tests {
     fn render_anchor_plan_file() {
         let anchor = Anchor::PlanFile(PathBuf::from("src/widget.rs"));
         assert_eq!(render_anchor(&anchor, None), "plan file: src/widget.rs");
+    }
+
+    #[test]
+    fn skills_appended_after_scope_guard() {
+        let diff = Artifact::Diff(DiffData {
+            raw: "diff --git a/f b/f".into(),
+        });
+        let skills = vec![Skill {
+            name: "error-handling".into(),
+            description: "Error conventions".into(),
+            tags: vec![],
+            body: "Use thiserror in core crates.".into(),
+            path: PathBuf::from("errors.md"),
+        }];
+
+        let input = ReworkInput {
+            intent: "Fix error handling",
+            approved_plan: None,
+            artifact: &diff,
+            comments: &[],
+            skills: &skills,
+        };
+
+        let result = assemble_rework(&input);
+
+        // Skills section should appear after scope guard.
+        let scope_pos = result
+            .text
+            .find("## Scope Guard")
+            .expect("scope guard missing");
+        let conventions_pos = result
+            .text
+            .find("## Project Conventions")
+            .expect("conventions missing");
+        assert!(
+            conventions_pos > scope_pos,
+            "conventions should follow scope guard"
+        );
+        assert!(result.text.contains("### error-handling"));
+        assert!(result.text.contains("Use thiserror in core crates."));
+    }
+
+    #[test]
+    fn empty_skills_no_conventions_section() {
+        let diff = Artifact::Diff(DiffData {
+            raw: "diff --git a/f b/f".into(),
+        });
+
+        let input = ReworkInput {
+            intent: "Do something",
+            approved_plan: None,
+            artifact: &diff,
+            comments: &[],
+            skills: &[],
+        };
+
+        let result = assemble_rework(&input);
+        assert!(
+            !result.text.contains("## Project Conventions"),
+            "empty skills should not produce a conventions section"
+        );
     }
 }

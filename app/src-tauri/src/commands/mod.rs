@@ -3,6 +3,8 @@
 //! Commands parse params, call core, and map results through
 //! [`CommandError`](crate::error::CommandError). All logic lives in core.
 
+pub mod shell;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -485,6 +487,7 @@ pub async fn kickoff(
 #[tauri::command]
 pub async fn restack_pr(
     state: State<'_, Arc<AppState>>,
+    app_handle: tauri::AppHandle,
     pr: String,
 ) -> Result<Review, CommandError> {
     let pr_ref = PrRef::new(&pr);
@@ -527,7 +530,7 @@ pub async fn restack_pr(
         let worktree_path = review.worktree.clone();
 
         let prompt = restack::assemble_conflict_prompt(&review, &parent_branch);
-        let agent_run = cockpit_core::adapters::agent::spawn_agent(
+        let spawn_result = cockpit_core::adapters::agent::spawn_agent(
             &worktree_path,
             &prompt,
             cockpit_core::model::AgentMode::Restack,
@@ -541,6 +544,8 @@ pub async fn restack_pr(
             message: format!("failed to spawn conflict-resolver agent: {e}"),
         })?;
 
+        // Start streaming agent stdout to the frontend.
+        let agent_run = crate::streaming::start_stream_forwarding(spawn_result, app_handle);
         review.agent = Some(agent_run);
     }
 
@@ -599,6 +604,11 @@ async fn fetch_prs_by_filter(
             message: format!("failed to list PRs: {e}"),
         })?;
 
+    let source = match filter {
+        github::PrFilter::Authored => cockpit_core::model::ReviewSource::Authored,
+        github::PrFilter::ReviewRequested => cockpit_core::model::ReviewSource::ReviewRequested,
+    };
+
     let mut reviews = Vec::with_capacity(prs.len());
     for pr in &prs {
         let diff = if pr.repo_slug.is_empty() {
@@ -610,7 +620,7 @@ async fn fetch_prs_by_filter(
                 .await
                 .unwrap_or_default()
         };
-        let review = github::build_review_from_pr(pr, diff, &repo_path);
+        let review = github::build_review_from_pr(pr, diff, &repo_path, source);
         state.reviews.insert(review.clone());
         reviews.push(review);
     }
@@ -644,4 +654,35 @@ pub fn load_plan_from_path(
     };
     state.plan.set(plan.clone());
     Ok(plan)
+}
+
+// ---------------------------------------------------------------------------
+// Open in editor
+// ---------------------------------------------------------------------------
+
+/// Open a file in the user's configured IDE/editor.
+///
+/// Uses the `ide_command` from config (e.g. "cursor", "code", "zed") to open
+/// the given file path. The file path is joined with the repo root.
+#[tauri::command]
+pub async fn open_in_editor(
+    _state: State<'_, Arc<AppState>>,
+    file_path: String,
+) -> Result<(), CommandError> {
+    let config = Config::load()?;
+    let ide = config
+        .ide_command
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "code".to_string());
+    let repo_path = config.repo_path.unwrap_or_else(|| PathBuf::from("."));
+    let full_path = repo_path.join(&file_path);
+
+    tokio::process::Command::new(&ide)
+        .arg(full_path.as_os_str())
+        .spawn()
+        .map_err(|e| CommandError {
+            message: format!("failed to open {file_path} in {ide}: {e}"),
+        })?;
+
+    Ok(())
 }

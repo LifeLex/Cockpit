@@ -12,15 +12,14 @@ import type { KickoffResult } from "./bindings/KickoffResult";
  * Navigation state discriminated union.
  *
  * The app is either showing the frontier list, reviewing a specific PR's diff,
- * viewing the project plan, viewing the stack dependency graph, adjusting
- * settings, or running the kickoff flow. Using a tagged union (not optional
- * fields) makes exhaustive switching possible.
+ * viewing the project plan, adjusting settings, or running the kickoff flow.
+ * Using a tagged union (not optional fields) makes exhaustive switching
+ * possible.
  */
 type ViewState =
   | { readonly kind: "frontier" }
   | { readonly kind: "diff"; readonly pr: string }
   | { readonly kind: "plan" }
-  | { readonly kind: "stacks" }
   | { readonly kind: "settings" }
   | { readonly kind: "kickoff" };
 
@@ -52,9 +51,6 @@ interface AppStore {
 
   /** Navigate back to the frontier list. */
   navigateToFrontier: () => void;
-
-  /** Navigate to the stack dependency view. */
-  navigateToStacks: () => void;
 
   /** Navigate to the settings view. */
   navigateToSettings: () => void;
@@ -116,6 +112,9 @@ interface AppStore {
 
   /** Error from the last config operation, if any. */
   readonly configError: string | null;
+
+  /** Active Monaco editor theme ID, loaded from config. Defaults to "vs-dark". */
+  readonly editorTheme: string;
 
   /** Fetch configuration from the backend. */
   fetchConfig: () => Promise<void>;
@@ -184,6 +183,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   config: null,
   configLoading: false,
   configError: null,
+  editorTheme: "vs-dark",
   kickoffLoading: false,
   kickoffResult: null,
   authoredPrs: [],
@@ -255,15 +255,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
     });
     void get().fetchReviews();
     void get().fetchFrontier();
-  },
-
-  navigateToStacks: () => {
-    set({
-      view: { kind: "stacks" },
-      activeReview: null,
-      activeDiff: null,
-    });
-    void get().fetchReviews();
   },
 
   navigateToSettings: () => {
@@ -456,7 +447,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({ configLoading: true, configError: null });
     try {
       const config = await invoke<Config>("get_config");
-      set({ config, configLoading: false });
+      const theme = config.app_theme ?? "dark";
+      if (theme === "dark") {
+        document.documentElement.classList.add("dark");
+      } else {
+        document.documentElement.classList.remove("dark");
+      }
+      set({
+        config,
+        configLoading: false,
+        editorTheme: config.editor_theme ?? "vs-dark",
+      });
     } catch (e: unknown) {
       set({ configError: String(e), configLoading: false });
     }
@@ -466,7 +467,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({ configLoading: true, configError: null });
     try {
       await invoke("save_config", { config });
-      set({ config, configLoading: false });
+      set({
+        config,
+        configLoading: false,
+        editorTheme: config.editor_theme ?? "vs-dark",
+      });
     } catch (e: unknown) {
       set({ configError: String(e), configLoading: false });
     }

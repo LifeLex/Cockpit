@@ -17,7 +17,7 @@ use cockpit_core::gate::Gated;
 use cockpit_core::hook_server::{self, HookState};
 use cockpit_core::model::{
     Anchor, Artifact, Comment, CommentId, CommentOrigin, DiffData, GateState, IssueRef, PrRef,
-    ProjectPlan, ProjectRef, Review, ReviewId,
+    ProjectPlan, ProjectRef, Review, ReviewId, ReviewSource,
 };
 use cockpit_core::plan_parser;
 use cockpit_core::prompt::{self, ReworkInput};
@@ -312,6 +312,7 @@ async fn run_start(port: u16) -> Result<()> {
             branch: pr_data.head_ref_name.clone(),
             base: pr_data.base_ref_name.clone(),
             base_sha: String::new(),
+            source: ReviewSource::Authored,
             worktree: PathBuf::from(format!(".cockpit/worktrees/{}", pr_data.number)),
             gate_state: GateState::Pending,
             diff: DiffData { raw: String::new() },
@@ -321,6 +322,7 @@ async fn run_start(port: u16) -> Result<()> {
             children: vec![],
             stale: false,
             agent: None,
+            repo_slug: None,
         };
 
         store.insert(review);
@@ -470,6 +472,7 @@ async fn run_request_changes(pr_num: u64) -> Result<()> {
         approved_plan: None,
         artifact: &artifact,
         comments: &review.comments,
+        skills: &[],
     };
     let prompt = prompt::assemble_rework(&input);
 
@@ -480,7 +483,7 @@ async fn run_request_changes(pr_num: u64) -> Result<()> {
     let hook_url = "http://127.0.0.1:19876/hook/stop";
     let config = SpawnConfig::default();
 
-    let agent_run = cockpit_core::adapters::agent::spawn_agent(
+    let spawn_result = cockpit_core::adapters::agent::spawn_agent(
         &review.worktree,
         &prompt,
         cockpit_core::model::AgentMode::Fix,
@@ -492,10 +495,10 @@ async fn run_request_changes(pr_num: u64) -> Result<()> {
     .await
     .context("failed to spawn fixer agent")?;
 
-    println!("Agent PID: {}", agent_run.pid);
+    println!("Agent PID: {}", spawn_result.run.pid);
 
     // Store the agent run on the review.
-    review.agent = Some(agent_run);
+    review.agent = Some(spawn_result.run);
 
     // Persist the updated review.
     store.update(&pr_ref, |r| {
@@ -670,6 +673,7 @@ async fn run_plan_request_changes() -> Result<()> {
         approved_plan: None,
         artifact: &artifact,
         comments: &plan.comments,
+        skills: &[],
     };
     let assembled_prompt = prompt::assemble_rework(&input);
 
@@ -683,7 +687,7 @@ async fn run_plan_request_changes() -> Result<()> {
     // Use the current directory as the worktree for plan-gate agents.
     let worktree = env::current_dir().context("failed to get current directory")?;
 
-    let agent_run = cockpit_core::adapters::agent::spawn_agent(
+    let spawn_result = cockpit_core::adapters::agent::spawn_agent(
         &worktree,
         &assembled_prompt,
         cockpit_core::model::AgentMode::Plan,
@@ -695,10 +699,10 @@ async fn run_plan_request_changes() -> Result<()> {
     .await
     .context("failed to spawn planner agent")?;
 
-    println!("Agent PID: {}", agent_run.pid);
+    println!("Agent PID: {}", spawn_result.run.pid);
 
     // Store the agent run on the plan.
-    plan.agent = Some(agent_run);
+    plan.agent = Some(spawn_result.run);
 
     // Persist the updated plan.
     let updated_store = PlanStore::new();
@@ -1164,7 +1168,7 @@ mod tests {
     use cockpit_core::gate::Gated;
     use cockpit_core::model::{
         Anchor, Comment, CommentId, CommentOrigin, DiffData, GateState, IssueRef, PlanDoc,
-        PlanStep, PrRef, ProjectPlan, ProjectRef, Review, ReviewId,
+        PlanStep, PrRef, ProjectPlan, ProjectRef, Review, ReviewId, ReviewSource,
     };
     use cockpit_core::store::{PlanStore, ReviewStore};
 
@@ -1177,6 +1181,7 @@ mod tests {
             branch: format!("alejandro/test-{pr_num}"),
             base: "main".into(),
             base_sha: "000".into(),
+            source: ReviewSource::Frontier,
             worktree: PathBuf::from(format!("/tmp/wt-{pr_num}")),
             gate_state: state,
             diff: DiffData { raw: String::new() },
@@ -1186,6 +1191,7 @@ mod tests {
             children: vec![],
             stale: false,
             agent: None,
+            repo_slug: None,
         }
     }
 
@@ -1402,6 +1408,7 @@ mod tests {
             approved_plan: None, // plan gate: no approved plan
             artifact: &artifact,
             comments: &plan.comments,
+            skills: &[],
         };
 
         let result = prompt::assemble_rework(&input);

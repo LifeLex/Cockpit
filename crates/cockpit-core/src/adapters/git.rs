@@ -6,9 +6,10 @@
 //! All operations are synchronous and short-lived. The caller can wrap in
 //! `spawn_blocking` if needed in an async context.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use git2::{BranchType, Oid, Repository, WorktreeAddOptions, WorktreePruneOptions};
+use tokio::process::Command;
 
 /// Errors from git worktree operations.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +40,33 @@ pub enum Error {
         branch: String,
         /// The target base branch.
         base: String,
+    },
+
+    /// `git fetch` for a remote branch failed.
+    #[error("failed to fetch branch `{branch}`: {reason}")]
+    FetchFailed {
+        /// The branch that was being fetched.
+        branch: String,
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
+
+    /// `git worktree add` via CLI failed.
+    #[error("worktree add failed for `{branch}`: {reason}")]
+    WorktreeAddFailed {
+        /// The branch the worktree was being created for.
+        branch: String,
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
+
+    /// `git worktree remove` via CLI failed.
+    #[error("worktree remove failed at {path}: {reason}")]
+    WorktreeRemoveFailed {
+        /// The worktree path that was being removed.
+        path: std::path::PathBuf,
+        /// Human-readable reason for the failure.
+        reason: String,
     },
 
     /// Underlying git2 error.
@@ -102,6 +130,111 @@ pub fn prune_worktree(repo: &Repository, worktree_name: &str) -> Result<(), Erro
     let mut prune_opts = WorktreePruneOptions::new();
     prune_opts.valid(true).working_tree(true);
     wt.prune(Some(&mut prune_opts))?;
+    Ok(())
+}
+
+/// Fetch a remote branch if not available locally, then create an isolated worktree.
+///
+/// The worktree is placed at `repo_path/.cockpit/worktrees/<pr_id>` and checked
+/// out on `branch`. If the branch does not exist locally, `git fetch origin <branch>`
+/// is run first via `tokio::process::Command`.
+///
+/// Returns the path to the created worktree directory.
+pub async fn prepare_worktree(
+    repo_path: &Path,
+    branch: &str,
+    pr_id: &str,
+) -> Result<PathBuf, Error> {
+    let worktree_path = repo_path.join(".cockpit").join("worktrees").join(pr_id);
+
+    if worktree_path.exists() {
+        return Err(Error::WorktreeExists(worktree_path));
+    }
+
+    // Check if the branch exists locally via git2.
+    let repo = Repository::discover(repo_path).map_err(Error::Git2)?;
+    let has_local = repo.find_branch(branch, BranchType::Local).is_ok();
+    // Also check for a remote tracking branch.
+    let remote_ref = format!("origin/{branch}");
+    let has_remote = repo.find_branch(&remote_ref, BranchType::Remote).is_ok();
+    // Drop the repo before any .await to avoid holding non-Send type across await.
+    drop(repo);
+
+    if !has_local && !has_remote {
+        // Fetch the branch from origin.
+        let output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["fetch", "origin", branch])
+            .output()
+            .await
+            .map_err(|e| Error::FetchFailed {
+                branch: branch.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::FetchFailed {
+                branch: branch.to_string(),
+                reason: stderr.into_owned(),
+            });
+        }
+    }
+
+    // Create the worktree via `git worktree add <path> <branch>`.
+    // Using the CLI here because git2's worktree API does not handle
+    // remote tracking branches as cleanly as the CLI does.
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["worktree", "add", &worktree_path.to_string_lossy(), branch])
+        .output()
+        .await
+        .map_err(|e| Error::WorktreeAddFailed {
+            branch: branch.to_string(),
+            reason: e.to_string(),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::WorktreeAddFailed {
+            branch: branch.to_string(),
+            reason: stderr.into_owned(),
+        });
+    }
+
+    Ok(worktree_path)
+}
+
+/// Remove a worktree created by [`prepare_worktree`].
+///
+/// Runs `git worktree remove --force <path>` to clean up the worktree
+/// directory and its git metadata.
+pub async fn cleanup_worktree(repo_path: &Path, pr_id: &str) -> Result<(), Error> {
+    let worktree_path = repo_path.join(".cockpit").join("worktrees").join(pr_id);
+
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            &worktree_path.to_string_lossy(),
+        ])
+        .output()
+        .await
+        .map_err(|e| Error::WorktreeRemoveFailed {
+            path: worktree_path.clone(),
+            reason: e.to_string(),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::WorktreeRemoveFailed {
+            path: worktree_path,
+            reason: stderr.into_owned(),
+        });
+    }
+
     Ok(())
 }
 

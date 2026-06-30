@@ -6,6 +6,7 @@ import type { GateState } from "./GateState";
 import type { IssueRef } from "./IssueRef";
 import type { PrRef } from "./PrRef";
 import type { ReviewId } from "./ReviewId";
+import type { ReviewSource } from "./ReviewSource";
 
 /**
  * A single PR under review at the diff gate.
@@ -42,6 +43,10 @@ base: string,
  */
 base_sha: string, 
 /**
+ * Where this review originated (authored, review request, or frontier).
+ */
+source: ReviewSource, 
+/**
  * Path to the git worktree on disk.
  */
 worktree: string, 
@@ -76,4 +81,10 @@ stale: boolean,
 /**
  * The agent run responsible for fixing / restacking.
  */
-agent: AgentRun | null, };
+agent: AgentRun | null, 
+/**
+ * GitHub repository slug (e.g. `"owner/repo"`), used for cross-repo
+ * operations like fetching diffs via `gh --repo`. `None` for reviews
+ * created from the local repo context (kickoff).
+ */
+repo_slug: string | null, };

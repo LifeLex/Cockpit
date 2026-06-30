@@ -214,11 +214,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
     try {
       const review = await invoke<Review>("open_review", { pr });
       const diff = await invoke<DiffData>("get_review_diff", { pr });
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
       set({
         view: { kind: "diff", pr },
         activeReview: review,
         activeDiff: diff,
         loading: false,
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        frontier: get().frontier.map(replace),
+        reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
       set({ error: String(e), loading: false });
@@ -228,10 +233,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
   navigateToDiff: async (pr: string) => {
     set({ loading: true, error: null });
     try {
-      const diff = await invoke<DiffData>("get_review_diff", { pr });
-      const { reviews, authoredPrs, reviewRequests, frontier } = get();
-      const all = [...authoredPrs, ...reviewRequests, ...frontier, ...reviews];
-      const review = all.find((r) => r.pr === pr) ?? null;
+      const [review, diff] = await Promise.all([
+        invoke<Review>("get_review", { pr }),
+        invoke<DiffData>("get_review_diff", { pr }),
+      ]);
       set({
         view: { kind: "diff", pr },
         activeReview: review,
@@ -283,7 +288,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
       lineEnd,
       body,
     });
-    set({ activeReview: review });
+    const replace = (r: Review) => (r.pr === review.pr ? review : r);
+    set({
+      activeReview: review,
+      authoredPrs: get().authoredPrs.map(replace),
+      reviewRequests: get().reviewRequests.map(replace),
+      frontier: get().frontier.map(replace),
+      reviews: get().reviews.map(replace),
+    });
   },
 
   requestChanges: async () => {
@@ -294,7 +306,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const review = await invoke<Review>("request_changes", {
         pr: view.pr,
       });
-      set({ activeReview: review });
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      set({
+        activeReview: review,
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        frontier: get().frontier.map(replace),
+        reviews: get().reviews.map(replace),
+      });
     } catch (e: unknown) {
       set({ error: String(e) });
     }
@@ -322,7 +341,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
     try {
       const review = await invoke<Review>("get_review", { pr: view.pr });
       const diff = await invoke<DiffData>("get_review_diff", { pr: view.pr });
-      set({ activeReview: review, activeDiff: diff });
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      set({
+        activeReview: review,
+        activeDiff: diff,
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        frontier: get().frontier.map(replace),
+        reviews: get().reviews.map(replace),
+      });
     } catch (e: unknown) {
       set({ error: String(e) });
     }

@@ -663,11 +663,14 @@ pub fn load_plan_from_path(
 /// Open a file in the user's configured IDE/editor.
 ///
 /// Uses the `ide_command` from config (e.g. "cursor", "code", "zed") to open
-/// the given file path. The file path is joined with the repo root.
+/// the given file path. For cross-repo PRs or branches not checked out
+/// locally, fetches the branch into a worktree first.
 #[tauri::command]
 pub async fn open_in_editor(
     _state: State<'_, Arc<AppState>>,
     file_path: String,
+    repo_slug: Option<String>,
+    branch: Option<String>,
 ) -> Result<(), CommandError> {
     let config = Config::load()?;
     let ide = config
@@ -675,7 +678,26 @@ pub async fn open_in_editor(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "code".to_string());
     let repo_path = config.repo_path.unwrap_or_else(|| PathBuf::from("."));
-    let full_path = repo_path.join(&file_path);
+
+    let full_path = {
+        let local = repo_path.join(&file_path);
+        if local.exists() {
+            local
+        } else if let Some(ref branch) = branch {
+            let root = cockpit_core::adapters::git::ensure_branch_checkout(
+                &repo_path,
+                branch,
+                repo_slug.as_deref(),
+            )
+            .await
+            .map_err(|e| CommandError {
+                message: format!("failed to checkout branch for {file_path}: {e}"),
+            })?;
+            root.join(&file_path)
+        } else {
+            local
+        }
+    };
 
     tokio::process::Command::new(&ide)
         .arg(full_path.as_os_str())

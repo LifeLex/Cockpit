@@ -69,6 +69,28 @@ pub enum Error {
         reason: String,
     },
 
+    /// Could not determine the user's home directory.
+    #[error("could not determine home directory")]
+    NoHomeDir,
+
+    /// `gh repo clone` failed for a cross-repo checkout.
+    #[error("failed to clone repo `{slug}`: {reason}")]
+    CloneFailed {
+        /// The GitHub repo slug (e.g. `owner/repo`).
+        slug: String,
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
+
+    /// `git checkout` failed.
+    #[error("checkout failed for `{branch}`: {reason}")]
+    CheckoutFailed {
+        /// The branch that was being checked out.
+        branch: String,
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
+
     /// Underlying git2 error.
     #[error(transparent)]
     Git2(#[from] git2::Error),
@@ -236,6 +258,132 @@ pub async fn cleanup_worktree(repo_path: &Path, pr_id: &str) -> Result<(), Error
     }
 
     Ok(())
+}
+
+/// Ensure a branch is checked out on disk so files can be opened in an editor.
+///
+/// For **cross-repo** PRs (`repo_slug` is `Some`), the repo is cloned into
+/// `~/.cockpit/repos/<slug>/` on first access. Subsequent calls reuse the
+/// clone. The requested branch is fetched and checked out via a worktree
+/// inside the clone so multiple branches can coexist.
+///
+/// For **same-repo** PRs (`repo_slug` is `None`), a worktree is created
+/// under `repo_path/.cockpit/worktrees/<branch-id>/` if the branch isn't
+/// already checked out there.
+///
+/// Returns the directory root where `<file_path>` can be joined.
+pub async fn ensure_branch_checkout(
+    repo_path: &Path,
+    branch: &str,
+    repo_slug: Option<&str>,
+) -> Result<PathBuf, Error> {
+    let sanitized = branch.replace('/', "-");
+
+    match repo_slug {
+        Some(slug) => {
+            let home = dirs::home_dir().ok_or(Error::NoHomeDir)?;
+            let slug_dir = slug.replace('/', "-");
+            let clone_dir = home.join(".cockpit").join("repos").join(&slug_dir);
+            let wt_dir = clone_dir.join(".worktrees").join(&sanitized);
+
+            if wt_dir.exists() {
+                return Ok(wt_dir);
+            }
+
+            if !clone_dir.join(".git").exists() {
+                std::fs::create_dir_all(&clone_dir).map_err(|e| Error::CloneFailed {
+                    slug: slug.to_string(),
+                    reason: e.to_string(),
+                })?;
+
+                let output = Command::new("gh")
+                    .args([
+                        "repo",
+                        "clone",
+                        slug,
+                        &clone_dir.to_string_lossy(),
+                        "--",
+                        "--no-checkout",
+                    ])
+                    .output()
+                    .await
+                    .map_err(|e| Error::CloneFailed {
+                        slug: slug.to_string(),
+                        reason: e.to_string(),
+                    })?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(Error::CloneFailed {
+                        slug: slug.to_string(),
+                        reason: stderr.into_owned(),
+                    });
+                }
+            }
+
+            let fetch = Command::new("git")
+                .current_dir(&clone_dir)
+                .args(["fetch", "origin", branch])
+                .output()
+                .await
+                .map_err(|e| Error::FetchFailed {
+                    branch: branch.to_string(),
+                    reason: e.to_string(),
+                })?;
+
+            if !fetch.status.success() {
+                let stderr = String::from_utf8_lossy(&fetch.stderr);
+                return Err(Error::FetchFailed {
+                    branch: branch.to_string(),
+                    reason: stderr.into_owned(),
+                });
+            }
+
+            std::fs::create_dir_all(clone_dir.join(".worktrees")).map_err(|e| {
+                Error::WorktreeAddFailed {
+                    branch: branch.to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+
+            let wt_out = Command::new("git")
+                .current_dir(&clone_dir)
+                .args([
+                    "worktree",
+                    "add",
+                    &wt_dir.to_string_lossy(),
+                    &format!("origin/{branch}"),
+                ])
+                .output()
+                .await
+                .map_err(|e| Error::WorktreeAddFailed {
+                    branch: branch.to_string(),
+                    reason: e.to_string(),
+                })?;
+
+            if !wt_out.status.success() {
+                let stderr = String::from_utf8_lossy(&wt_out.stderr);
+                return Err(Error::WorktreeAddFailed {
+                    branch: branch.to_string(),
+                    reason: stderr.into_owned(),
+                });
+            }
+
+            Ok(wt_dir)
+        }
+        None => {
+            let wt_path = repo_path
+                .join(".cockpit")
+                .join("worktrees")
+                .join(&sanitized);
+
+            if wt_path.exists() {
+                return Ok(wt_path);
+            }
+
+            prepare_worktree(repo_path, branch, &sanitized).await
+        }
+    }
 }
 
 /// Rebase a branch onto a new base.

@@ -933,7 +933,11 @@ export function DiffView({
                       title="Open in editor"
                       onClick={(e) => {
                         e.stopPropagation();
-                        void invoke("open_in_editor", { filePath: path });
+                        void invoke("open_in_editor", {
+                          filePath: path,
+                          repoSlug: review.repo_slug,
+                          branch: review.branch,
+                        });
                       }}
                       className="shrink-0 cursor-pointer border-none bg-transparent p-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/file:opacity-100"
                     >

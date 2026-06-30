@@ -404,6 +404,9 @@ export function DiffView({
   const [editorReady, setEditorReady] = useState(false);
   const [portals, setPortals] = useState<readonly PortalEntry[]>([]);
 
+  // -- Error state for inline operations --
+  const [commentError, setCommentError] = useState<string | null>(null);
+
   // -- Mirror state --
   const [mirrorResult, setMirrorResult] = useState<MirrorResult | null>(null);
   const [mirroring, setMirroring] = useState(false);
@@ -633,9 +636,12 @@ export function DiffView({
   const handleInlineSubmit = useCallback(
     async (lineNumber: number, body: string) => {
       setSubmitting(true);
+      setCommentError(null);
       try {
         await onAddComment(selectedFile, lineNumber, lineNumber, body);
         setActiveCommentLine(null);
+      } catch (e: unknown) {
+        setCommentError(String(e));
       } finally {
         setSubmitting(false);
       }
@@ -817,6 +823,22 @@ export function DiffView({
           )}
         </div>
       </header>
+
+      {/* ----------------------------------------------------------------- */}
+      {/* Comment error banner                                              */}
+      {/* ----------------------------------------------------------------- */}
+      {commentError !== null && (
+        <div className="flex items-center justify-between border-b border-danger bg-danger/10 px-4 py-2 text-xs text-danger">
+          <span>Failed to add comment: {commentError}</span>
+          <button
+            type="button"
+            onClick={() => { setCommentError(null); }}
+            className="cursor-pointer border-none bg-transparent text-danger underline hover:no-underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* ----------------------------------------------------------------- */}
       {/* Mirror result banner                                              */}

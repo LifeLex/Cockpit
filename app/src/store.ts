@@ -229,8 +229,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const diff = await invoke<DiffData>("get_review_diff", { pr });
-      const reviews = get().reviews;
-      const review = reviews.find((r) => r.pr === pr) ?? null;
+      const { reviews, authoredPrs, reviewRequests, frontier } = get();
+      const all = [...authoredPrs, ...reviewRequests, ...frontier, ...reviews];
+      const review = all.find((r) => r.pr === pr) ?? null;
       set({
         view: { kind: "diff", pr },
         activeReview: review,
@@ -275,18 +276,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const { view } = get();
     if (view.kind !== "diff") return;
 
-    try {
-      const review = await invoke<Review>("add_comment", {
-        pr: view.pr,
-        file,
-        lineStart,
-        lineEnd,
-        body,
-      });
-      set({ activeReview: review });
-    } catch (e: unknown) {
-      set({ error: String(e) });
-    }
+    const review = await invoke<Review>("add_comment", {
+      pr: view.pr,
+      file,
+      lineStart,
+      lineEnd,
+      body,
+    });
+    set({ activeReview: review });
   },
 
   requestChanges: async () => {

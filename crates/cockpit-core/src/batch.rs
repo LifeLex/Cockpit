@@ -163,7 +163,7 @@ mod tests {
     use super::*;
     use crate::model::{
         AgentMode, AgentRun, Anchor, Comment, CommentId, CommentOrigin, DiffData, GateState,
-        IssueRef, PrRef, ReviewId,
+        IssueRef, PrRef, ReviewId, ReviewSource,
     };
     use crate::store::ReviewStore;
 
@@ -176,6 +176,7 @@ mod tests {
             branch: format!("alejandro/test-{pr_num}"),
             base: "main".into(),
             base_sha: "000".into(),
+            source: ReviewSource::Frontier,
             worktree: PathBuf::from(format!("/tmp/wt-{pr_num}")),
             gate_state: state,
             diff: DiffData { raw: String::new() },
@@ -185,6 +186,7 @@ mod tests {
             children: vec![],
             stale: false,
             agent: None,
+            repo_slug: None,
         }
     }
 

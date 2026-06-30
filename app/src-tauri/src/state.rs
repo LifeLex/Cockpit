@@ -19,14 +19,13 @@ pub struct AppState {
     pub plan: PlanStore,
     /// Maps agent session IDs to their reviewed objects.
     ///
-    /// Used by the hook server and agent dispatch in later phases.
-    #[allow(dead_code)]
+    /// Shared with the hook server to look up which review an agent
+    /// completion callback belongs to.
     pub sessions: SessionMap,
     /// Sender side of the completion broadcast channel.
     ///
     /// The hook server sends events here; the Tauri setup listener forwards
     /// them to the frontend via Tauri events.
-    #[allow(dead_code)]
     pub completion_tx: broadcast::Sender<CompletionEvent>,
 }
 

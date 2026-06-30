@@ -25,6 +25,7 @@ fn make_test_review(worktree: PathBuf) -> Review {
         branch: "alejandro/test-1-feature".into(),
         base: "main".into(),
         base_sha: "000".into(),
+        source: ReviewSource::Frontier,
         worktree,
         gate_state: GateState::Pending,
         diff: DiffData {
@@ -36,6 +37,7 @@ fn make_test_review(worktree: PathBuf) -> Review {
         children: vec![],
         stale: false,
         agent: None,
+        repo_slug: None,
     }
 }
 
@@ -82,6 +84,7 @@ async fn full_review_loop_round_trip() {
         approved_plan: None,
         artifact: &Artifact::Diff(review.diff.clone()),
         comments: &review.comments,
+        skills: &[],
     };
     let assembled = prompt::assemble_rework(&input);
 
@@ -126,7 +129,7 @@ async fn full_review_loop_round_trip() {
         .port();
     let hook_url = format!("http://127.0.0.1:{port}/hook/stop");
 
-    let agent_run = agent::spawn_agent(
+    let spawn_result = agent::spawn_agent(
         &review.worktree,
         &assembled,
         AgentMode::Fix,
@@ -138,6 +141,7 @@ async fn full_review_loop_round_trip() {
     .await
     .expect("spawn_agent should succeed with stub echo command");
 
+    let agent_run = spawn_result.run;
     assert_eq!(agent_run.mode, AgentMode::Fix);
     assert_eq!(agent_run.prompt_hash, assembled.hash);
     assert!(agent_run.pid > 0, "spawned process must have a valid PID");

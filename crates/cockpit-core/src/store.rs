@@ -275,7 +275,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::model::{DiffData, GateState, IssueRef, ReviewId};
+    use crate::model::{DiffData, GateState, IssueRef, ReviewId, ReviewSource};
 
     /// Build a minimal `Review` with the given PR number.
     fn make_review(pr_num: u64) -> Review {
@@ -286,6 +286,7 @@ mod tests {
             branch: format!("alejandro/test-{pr_num}"),
             base: "main".into(),
             base_sha: "000".into(),
+            source: ReviewSource::Frontier,
             worktree: PathBuf::from(format!("/tmp/wt-{pr_num}")),
             gate_state: GateState::Pending,
             diff: DiffData { raw: String::new() },
@@ -295,6 +296,7 @@ mod tests {
             children: vec![],
             stale: false,
             agent: None,
+            repo_slug: None,
         }
     }
 

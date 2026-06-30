@@ -144,7 +144,11 @@ impl Default for SpawnConfig {
         Self {
             command: "claude".into(),
             base_args: vec!["--print".into(), "-p".into()],
-            tail_args: vec!["--output-format".into(), "json".into()],
+            tail_args: vec![
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+            ],
         }
     }
 }
@@ -153,13 +157,27 @@ impl Default for SpawnConfig {
 // Spawn
 // ---------------------------------------------------------------------------
 
+/// The result of spawning an agent: the run descriptor plus the child
+/// process whose stdout can be read for streaming JSONL events.
+#[derive(Debug)]
+pub struct SpawnResult {
+    /// Metadata about the agent run (pid, mode, log path, etc.).
+    pub run: AgentRun,
+    /// The child process. Stdout is piped so callers can read JSONL lines;
+    /// stderr goes to the log file.
+    pub child: tokio::process::Child,
+    /// Path to the log file that should receive a copy of each stdout line.
+    pub log_path: PathBuf,
+}
+
 /// Spawn a Claude Code agent in the given worktree.
 ///
 /// The agent runs the assembled prompt in the specified mode. Its session
 /// is registered in the session map so the Stop-hook can route completion.
 ///
-/// The process runs detached: this function returns immediately after
-/// spawning. The Stop-hook listener (T1.3) handles completion.
+/// Returns a [`SpawnResult`] containing the run descriptor and the child
+/// process. Stdout is piped so the caller can read JSONL lines for
+/// streaming UI updates (and tee each line to the log file).
 pub async fn spawn_agent(
     worktree_path: &Path,
     prompt: &AssembledPrompt,
@@ -168,7 +186,7 @@ pub async fn spawn_agent(
     session_map: &SessionMap,
     hook_url: &str,
     config: &SpawnConfig,
-) -> Result<AgentRun, Error> {
+) -> Result<SpawnResult, Error> {
     // 1. Verify worktree exists.
     tokio::fs::metadata(worktree_path)
         .await
@@ -181,17 +199,18 @@ pub async fn spawn_agent(
     let cockpit_dir = worktree_path.join(".cockpit");
     tokio::fs::create_dir_all(&cockpit_dir).await?;
     let log_path = cockpit_dir.join(format!("agent-{session_id}.log"));
-    let log_file = std::fs::File::create(&log_path)?;
-    let stderr_file = log_file.try_clone()?;
+    let stderr_file = std::fs::File::create(&log_path)?;
 
     // 4. Build and spawn the command.
+    //    Stdout is piped so we can parse JSONL lines and tee to the log.
+    //    Stderr goes directly to the log file.
     let child = Command::new(&config.command)
         .args(&config.base_args)
         .arg(&prompt.text)
         .args(&config.tail_args)
         .current_dir(worktree_path)
         .env("CLAUDE_STOP_HOOK_URL", hook_url)
-        .stdout(std::process::Stdio::from(log_file))
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .map_err(|e| Error::SpawnFailed(e.to_string()))?;
@@ -210,12 +229,18 @@ pub async fn spawn_agent(
         },
     )?;
 
-    // 6. Return the run descriptor.
-    Ok(AgentRun {
+    // 6. Return the run descriptor and child process.
+    let run = AgentRun {
         pid,
         mode,
         started_at: SystemTime::now(),
         prompt_hash: prompt.hash.clone(),
+        log_path: log_path.clone(),
+    };
+
+    Ok(SpawnResult {
+        run,
+        child,
         log_path,
     })
 }
@@ -332,7 +357,7 @@ mod tests {
             tail_args: vec![],
         };
 
-        let run = spawn_agent(
+        let result = spawn_agent(
             dir.path(),
             &prompt,
             AgentMode::Fix,
@@ -344,6 +369,7 @@ mod tests {
         .await
         .unwrap();
 
+        let run = &result.run;
         assert_eq!(run.mode, AgentMode::Fix);
         assert_eq!(run.prompt_hash, "abc123hash");
         assert!(run.pid > 0);

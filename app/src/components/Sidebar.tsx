@@ -2,7 +2,6 @@ import type { ViewState } from "../store";
 import {
   ListChecks,
   FileText,
-  Layers,
   Rocket,
   Settings,
   PanelLeftClose,
@@ -167,16 +166,6 @@ export function Sidebar({
             onNavigate("plan");
           }}
         />
-        <NavItem
-          label="Stacks"
-          icon={<Layers className="h-4 w-4 shrink-0" />}
-          active={activeView === "stacks"}
-          collapsed={collapsed}
-          onClick={() => {
-            onNavigate("stacks");
-          }}
-        />
-
         <div className="flex-1" />
 
         <Separator className="mx-1" />

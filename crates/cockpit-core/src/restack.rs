@@ -69,6 +69,7 @@ pub fn assemble_conflict_prompt(review: &Review, parent_branch: &str) -> Assembl
         approved_plan: None,
         artifact: &Artifact::Diff(review.diff.clone()),
         comments: &[], // no comments for conflict resolution
+        skills: &[],
     };
     prompt::assemble_rework(&input)
 }
@@ -119,7 +120,7 @@ pub async fn restack_or_resolve(
 
     // 2. On conflict, assemble prompt and spawn conflict-resolver.
     let prompt = assemble_conflict_prompt(review, parent_branch);
-    let agent_run = agent::spawn_agent(
+    let spawn_result = agent::spawn_agent(
         worktree_path,
         &prompt,
         AgentMode::Restack,
@@ -130,7 +131,7 @@ pub async fn restack_or_resolve(
     )
     .await?;
 
-    review.agent = Some(agent_run);
+    review.agent = Some(spawn_result.run);
     Ok(Outcome::ConflictDispatched)
 }
 
@@ -283,7 +284,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::model::{DiffData, GateState, IssueRef, PrRef, ReviewId};
+    use crate::model::{DiffData, GateState, IssueRef, PrRef, ReviewId, ReviewSource};
 
     /// Build a minimal `Review` with the given id, parents, children, and branch.
     fn make_review(
@@ -300,6 +301,7 @@ mod tests {
             branch: branch.to_string(),
             base: base.to_string(),
             base_sha: "000".into(),
+            source: ReviewSource::Frontier,
             worktree: PathBuf::from(format!("/tmp/wt-{id}")),
             gate_state: GateState::Pending,
             diff: DiffData { raw: String::new() },
@@ -309,6 +311,7 @@ mod tests {
             children: children.iter().map(|s| ReviewId::new(*s)).collect(),
             stale: false,
             agent: None,
+            repo_slug: None,
         }
     }
 

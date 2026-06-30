@@ -6,7 +6,6 @@ import {
   MessageSquare,
   AlertTriangle,
   Bot,
-  ExternalLink,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Review } from "../bindings/Review";
@@ -14,8 +13,7 @@ import type { GateState } from "../bindings/GateState";
 
 interface ReviewCardProps {
   readonly review: Review;
-  readonly onOpen?: ((pr: string) => void) | undefined;
-  readonly onViewDiff?: ((pr: string) => void) | undefined;
+  readonly onAction: (pr: string) => void;
 }
 
 function assertNever(x: never): never {
@@ -73,6 +71,33 @@ function gateStateBadgeClass(state: GateState): string {
   }
 }
 
+/** Button variant type matching the Button component's variant prop. */
+type ButtonVariant = "default" | "outline" | "ghost";
+
+interface ActionConfig {
+  readonly label: string;
+  readonly variant: ButtonVariant;
+  readonly muted: boolean;
+}
+
+/** Determines the action button label, variant, and muted state from the gate state. */
+function actionConfigForState(state: GateState): ActionConfig {
+  switch (state) {
+    case "Pending":
+      return { label: "Review", variant: "default", muted: false };
+    case "InReview":
+      return { label: "Continue", variant: "default", muted: false };
+    case "Dispatched":
+      return { label: "Waiting…", variant: "outline", muted: true };
+    case "Reworked":
+      return { label: "Re-review", variant: "default", muted: false };
+    case "Approved":
+      return { label: "View", variant: "ghost", muted: false };
+    default:
+      return assertNever(state);
+  }
+}
+
 function parsePrDisplay(pr: string): { repo: string; number: string } {
   const match = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(pr);
   if (match !== null) {
@@ -84,10 +109,9 @@ function parsePrDisplay(pr: string): { repo: string; number: string } {
   return { repo: "", number: pr };
 }
 
-export function ReviewCard({ review, onOpen, onViewDiff }: ReviewCardProps) {
-  const canOpen =
-    review.gate_state === "Pending" || review.gate_state === "Reworked";
+export function ReviewCard({ review, onAction }: ReviewCardProps) {
   const { repo, number: prNumber } = parsePrDisplay(review.pr);
+  const action = actionConfigForState(review.gate_state);
 
   return (
     <Card
@@ -147,33 +171,19 @@ export function ReviewCard({ review, onOpen, onViewDiff }: ReviewCardProps) {
           )}
         </div>
 
-        {/* Bottom row: action buttons */}
-        {(canOpen && onOpen != null || onViewDiff != null) && (
-          <div className="mt-3 flex items-center gap-2">
-            {canOpen && onOpen != null && (
-              <Button
-                size="sm"
-                onClick={() => {
-                  onOpen(review.pr);
-                }}
-              >
-                Open for Review
-              </Button>
-            )}
-            {onViewDiff != null && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  onViewDiff(review.pr);
-                }}
-              >
-                <ExternalLink className="h-3.5 w-3.5" />
-                View Diff
-              </Button>
-            )}
-          </div>
-        )}
+        {/* Bottom row: context-aware action button */}
+        <div className="mt-3 flex items-center gap-2">
+          <Button
+            variant={action.variant}
+            size="sm"
+            className={action.muted ? "opacity-60" : undefined}
+            onClick={() => {
+              onAction(review.pr);
+            }}
+          >
+            {action.label}
+          </Button>
+        </div>
       </CardContent>
     </Card>
   );

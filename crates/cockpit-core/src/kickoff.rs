@@ -17,7 +17,7 @@ use std::path::Path;
 use crate::adapters::{agent, git, linear};
 use crate::dag;
 use crate::model::{
-    DiffData, GateState, IssueRef, PrRef, ProjectPlan, ProjectRef, Review, ReviewId,
+    DiffData, GateState, IssueRef, PrRef, ProjectPlan, ProjectRef, Review, ReviewId, ReviewSource,
 };
 use crate::plan_parser;
 use crate::prompt::{self, ReworkInput};
@@ -163,6 +163,7 @@ pub fn build_review(
         branch,
         base,
         base_sha: String::new(),
+        source: ReviewSource::Frontier,
         worktree,
         gate_state: GateState::Pending,
         diff: DiffData { raw: String::new() },
@@ -172,6 +173,7 @@ pub fn build_review(
         children: vec![],
         stale: false,
         agent: None,
+        repo_slug: None,
     }
 }
 
@@ -295,7 +297,7 @@ pub async fn spawn_batch(
         let prompt = assemble_implement_prompt(review, project);
 
         // 3. Spawn the implementer agent.
-        let agent_run = agent::spawn_agent(
+        let spawn_result = agent::spawn_agent(
             &review.worktree,
             &prompt,
             crate::model::AgentMode::Implement,
@@ -306,7 +308,7 @@ pub async fn spawn_batch(
         )
         .await?;
 
-        review.agent = Some(agent_run);
+        review.agent = Some(spawn_result.run);
     }
 
     Ok(())
@@ -328,6 +330,7 @@ fn assemble_implement_prompt(review: &Review, project: &ProjectRef) -> prompt::A
         approved_plan: None,
         artifact: &crate::model::Artifact::Diff(review.diff.clone()),
         comments: &[],
+        skills: &[],
     };
 
     prompt::assemble_rework(&input)
@@ -585,6 +588,7 @@ mod tests {
             branch: "b-1".into(),
             base: "main".into(),
             base_sha: String::new(),
+            source: ReviewSource::Frontier,
             worktree: PathBuf::new(),
             gate_state: GateState::Pending,
             diff: DiffData { raw: String::new() },
@@ -594,6 +598,7 @@ mod tests {
             children: vec![],
             stale: false,
             agent: None,
+            repo_slug: None,
         }];
 
         wire_children(&mut reviews);
@@ -609,6 +614,7 @@ mod tests {
             branch: "alejandro/nex-1-thing".into(),
             base: "main".into(),
             base_sha: String::new(),
+            source: ReviewSource::Frontier,
             worktree: PathBuf::new(),
             gate_state: GateState::Pending,
             diff: DiffData { raw: String::new() },
@@ -618,6 +624,7 @@ mod tests {
             children: vec![],
             stale: false,
             agent: None,
+            repo_slug: None,
         };
 
         let prompt = assemble_implement_prompt(&review, &ProjectRef::new("proj-1"));

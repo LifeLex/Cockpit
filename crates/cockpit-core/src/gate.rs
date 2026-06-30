@@ -7,6 +7,7 @@
 //! plumbing and the effectful `dispatch`/`reconcile`.
 
 use crate::model::{AgentRun, Comment, GateState, ProjectPlan, Review};
+use crate::workflow::TransitionEvent;
 
 /// Errors from gate state transitions.
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +28,15 @@ pub enum Error {
     /// Placeholder for operations not yet wired to real adapters.
     #[error("operation not yet implemented")]
     NotImplemented,
+}
+
+/// Record a transition for workflow automation.
+///
+/// Constructs a [`TransitionEvent`] from the object ID and the before/after
+/// states. Callers use this after a successful transition to feed into
+/// [`crate::workflow::evaluate_rules`].
+pub fn transition_event(object_id: &str, from: GateState, to: GateState) -> TransitionEvent {
+    crate::workflow::transition_event(object_id, from, to)
 }
 
 /// The shared review loop, implemented by both [`ProjectPlan`] and [`Review`].
@@ -226,6 +236,7 @@ mod tests {
     use super::*;
     use crate::model::{
         Anchor, CommentId, CommentOrigin, DiffData, IssueRef, PlanDoc, PrRef, ProjectRef, ReviewId,
+        ReviewSource,
     };
 
     /// Build a minimal `Review` starting at the given `GateState`.
@@ -237,6 +248,7 @@ mod tests {
             branch: "alejandro/test".into(),
             base: "main".into(),
             base_sha: "000".into(),
+            source: ReviewSource::Frontier,
             worktree: PathBuf::from("/tmp/wt"),
             gate_state: state,
             diff: DiffData { raw: String::new() },
@@ -246,6 +258,7 @@ mod tests {
             children: vec![],
             stale: false,
             agent: None,
+            repo_slug: None,
         }
     }
 

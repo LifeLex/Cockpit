@@ -4,8 +4,9 @@
  * Persistent application configuration stored at `~/.cockpit/config.toml`.
  *
  * All fields have sensible defaults so the app works out of the box.
- * Optional fields (`linear_api_key`, `linear_project_id`, `repo_path`)
- * are `None` until the user fills them in through the settings UI.
+ * Optional fields are `None` until the user fills them in through the
+ * settings UI. New fields use `#[serde(default)]` for backward
+ * compatibility with existing config files.
  */
 export type Config = { 
 /**
@@ -27,4 +28,40 @@ agent_command: string,
 /**
  * Port for the Stop-hook listener (default: `19876`).
  */
-hook_port: number, };
+hook_port: number, 
+/**
+ * Anthropic API key for direct model access.
+ */
+anthropic_api_key: string | null, 
+/**
+ * Model identifier to use for agent runs (default: `"claude-sonnet-4-6"`).
+ */
+model: string | null, 
+/**
+ * Optional daily spend cap in US dollars. `None` means unlimited.
+ */
+daily_budget_usd: number | null, 
+/**
+ * GitHub personal access token for API operations.
+ */
+github_token: string | null, 
+/**
+ * Shell command to launch the preferred IDE (e.g. `"cursor"`, `"code"`).
+ */
+ide_command: string | null, 
+/**
+ * Application color theme: `"dark"`, `"light"`, or `"system"`.
+ */
+app_theme: string | null, 
+/**
+ * Monaco editor theme identifier (default: `"vs-dark"`).
+ */
+editor_theme: string | null, 
+/**
+ * Terminal font family name (default: `"SF Mono"`).
+ */
+terminal_font: string | null, 
+/**
+ * Terminal font size in points (default: `13`).
+ */
+terminal_font_size: number | null, };

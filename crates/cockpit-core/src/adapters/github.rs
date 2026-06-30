@@ -447,10 +447,13 @@ pub async fn pr_diff_by_repo(repo_slug: &str, pr_number: u64) -> Result<String, 
 /// For PRs linked to a Linear issue (detected from the branch name), the
 /// `issue` field is the parsed issue ref. Otherwise, it uses the PR title.
 /// The `repo_path` is used as the worktree location for local operations.
+/// The `source` parameter indicates whether this is an authored or
+/// review-requested PR.
 pub fn build_review_from_pr(
     pr: &PrData,
     diff: String,
     repo_path: &std::path::Path,
+    source: crate::model::ReviewSource,
 ) -> crate::model::Review {
     use crate::model::*;
 
@@ -463,6 +466,12 @@ pub fn build_review_from_pr(
         format!("gh-{}-{}", pr.repo_slug.replace('/', "-"), pr.number)
     };
 
+    let slug = if pr.repo_slug.is_empty() {
+        None
+    } else {
+        Some(pr.repo_slug.clone())
+    };
+
     Review {
         id: ReviewId::new(id_prefix),
         issue,
@@ -470,6 +479,7 @@ pub fn build_review_from_pr(
         branch: pr.head_ref_name.clone(),
         base: pr.base_ref_name.clone(),
         base_sha: String::new(),
+        source,
         worktree: repo_path.to_path_buf(),
         gate_state: GateState::Pending,
         diff: DiffData { raw: diff },
@@ -479,6 +489,7 @@ pub fn build_review_from_pr(
         children: vec![],
         stale: false,
         agent: None,
+        repo_slug: slug,
     }
 }
 

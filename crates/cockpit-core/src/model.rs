@@ -116,6 +116,21 @@ pub enum CommentOrigin {
     GitHubMirror,
 }
 
+/// Where a [`Review`] originated, determining how comments are handled.
+///
+/// `Authored` and `Frontier` reviews dispatch comments to a local agent.
+/// `ReviewRequested` reviews mirror comments to GitHub instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub enum ReviewSource {
+    /// PR authored by the current user (from `gh pr list --author=@me`).
+    Authored,
+    /// PR where the current user is requested as reviewer.
+    ReviewRequested,
+    /// Review created from a Linear project kickoff.
+    Frontier,
+}
+
 /// A location inside the current artifact that a [`Comment`] points to.
 ///
 /// Anchors are ephemeral — they reference the *current* artifact version only
@@ -268,6 +283,8 @@ pub struct Review {
     /// Used as the fork point for `restack`: only commits after this OID belong
     /// to this review's branch. Updated after each successful restack.
     pub base_sha: String,
+    /// Where this review originated (authored, review request, or frontier).
+    pub source: ReviewSource,
     /// Path to the git worktree on disk.
     pub worktree: PathBuf,
     /// Current gate state in the review loop.
@@ -286,6 +303,10 @@ pub struct Review {
     pub stale: bool,
     /// The agent run responsible for fixing / restacking.
     pub agent: Option<AgentRun>,
+    /// GitHub repository slug (e.g. `"owner/repo"`), used for cross-repo
+    /// operations like fetching diffs via `gh --repo`. `None` for reviews
+    /// created from the local repo context (kickoff).
+    pub repo_slug: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +326,7 @@ mod tests {
             branch: format!("alejandro/{id}"),
             base: "main".into(),
             base_sha: "000".into(),
+            source: ReviewSource::Frontier,
             worktree: PathBuf::from(format!("/tmp/wt-{id}")),
             gate_state: GateState::Pending,
             diff: DiffData { raw: String::new() },
@@ -314,6 +336,7 @@ mod tests {
             children: children.iter().map(|s| ReviewId::new(*s)).collect(),
             stale: false,
             agent: None,
+            repo_slug: None,
         }
     }
 

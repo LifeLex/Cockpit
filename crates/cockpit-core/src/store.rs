@@ -16,6 +16,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::model::{GateState, PrRef, Project, ProjectId, ProjectPlan, Review, ReviewId};
 
+// INVARIANT: every `.lock().expect("... lock poisoned")` below deliberately
+// propagates a poisoned-lock panic (CLAUDE.md §2). A `Mutex` becomes poisoned
+// only when another thread panicked while holding it, leaving the map in an
+// unknown, unrecoverable state; continuing on that state would be worse than
+// crashing, so re-panicking via `expect` is the correct response.
+
 // ---------------------------------------------------------------------------
 // ReviewStore (in-memory)
 // ---------------------------------------------------------------------------
@@ -85,7 +91,11 @@ impl ReviewStore {
             false
         };
         drop(map);
-        self.bump();
+        // Only bump when the closure actually ran on an existing entry: a
+        // missing-key update mutates nothing and must not trigger a re-save.
+        if found {
+            self.bump();
+        }
         found
     }
 
@@ -298,7 +308,11 @@ impl ProjectStore {
             false
         };
         drop(map);
-        self.bump();
+        // Only bump when the closure actually ran on an existing entry: a
+        // missing-key update mutates nothing and must not trigger a re-save.
+        if found {
+            self.bump();
+        }
         found
     }
 
@@ -358,7 +372,11 @@ impl ProjectStore {
             false
         };
         drop(map);
-        self.bump();
+        // Only bump when the closure actually ran on an existing entry: a
+        // missing-key update mutates nothing and must not trigger a re-save.
+        if found {
+            self.bump();
+        }
         found
     }
 }
@@ -676,6 +694,15 @@ mod tests {
         store.remove(&PrRef::new("owner/repo#1"));
         let after_remove = store.revision();
         assert!(after_remove > after_update, "remove bumps the revision");
+
+        // A missing-key update mutates nothing and must not bump the revision.
+        let missing = store.update(&PrRef::new("owner/repo#404"), |r| r.stale = true);
+        assert!(!missing, "update on a missing key returns false");
+        assert_eq!(
+            store.revision(),
+            after_remove,
+            "a missing-key update must not bump the revision"
+        );
     }
 
     #[test]
@@ -712,6 +739,25 @@ mod tests {
         store.remove(&ProjectId::new("p-1"));
         let after_remove = store.revision();
         assert!(after_remove > after_plan, "remove bumps the revision");
+
+        // Missing-key mutators (`update` / `update_plan`) change nothing and
+        // must not bump the revision.
+        let missing = store.update(&ProjectId::new("absent"), |p| p.name = "x".into());
+        assert!(!missing, "update on a missing key returns false");
+        assert_eq!(
+            store.revision(),
+            after_remove,
+            "a missing-key update must not bump the revision"
+        );
+
+        let missing_plan =
+            store.update_plan(&ProjectId::new("absent"), |slot| *slot = Some(make_plan()));
+        assert!(!missing_plan, "update_plan on a missing key returns false");
+        assert_eq!(
+            store.revision(),
+            after_remove,
+            "a missing-key update_plan must not bump the revision"
+        );
     }
 
     #[test]

@@ -256,6 +256,17 @@ impl Review {
         &mut self,
         new_head: Option<String>,
     ) -> Result<AgentOutcome, Error> {
+        // Validate the transition is legal before mutating any state: an illegal
+        // call (state != Dispatched) must leave head_sha and the agent handle
+        // untouched, not partially applied. Both downstream transitions
+        // (`mark_reworked` / `mark_agent_failed`) also require `Dispatched`, so
+        // this is the single precondition for either branch.
+        if self.gate_state != GateState::Dispatched {
+            return Err(Error::IllegalTransition {
+                from: self.gate_state,
+                event: "apply_agent_completion",
+            });
+        }
         match new_head {
             Some(h) if h != self.head_sha => {
                 self.head_sha = h;

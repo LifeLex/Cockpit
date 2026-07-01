@@ -532,7 +532,10 @@ pub async fn list_prs_filtered(
         PrFilter::ReviewRequested => {
             let mut pending = search_prs(&["--review-requested", "@me"]).await?;
             let reviewed = search_prs(&["--reviewed-by", "@me"]).await?;
-            let me = gh_whoami().await.unwrap_or_default();
+            // GitHub logins are case-insensitive; lowercase our identity so the
+            // self-exclusion below compares like-for-like against the likewise
+            // lowercased `author_login`.
+            let me = gh_whoami().await.unwrap_or_default().to_lowercase();
 
             // Merge and deduplicate by URL.
             let mut seen = std::collections::HashSet::new();
@@ -682,9 +685,12 @@ struct SearchPrResult {
 }
 
 impl SearchPrResult {
-    /// Login of the PR author, lowercased for comparison.
-    fn author_login(&self) -> &str {
-        &self.author.login
+    /// Login of the PR author, lowercased for case-insensitive comparison.
+    ///
+    /// GitHub logins are case-insensitive, so callers compare against a
+    /// likewise-lowercased identity (see [`list_prs_filtered`]).
+    fn author_login(&self) -> String {
+        self.author.login.to_lowercase()
     }
 }
 
@@ -1353,6 +1359,44 @@ mod tests {
 
     use super::*;
     use crate::model::{DiffData, DiffSide, GateState, Review, ReviewId, ReviewSource};
+
+    // -- author_login (self-exclusion) tests --
+
+    /// Build a minimal search result authored by `login`.
+    fn search_result_by(login: &str) -> SearchPrResult {
+        SearchPrResult {
+            number: 1,
+            title: String::new(),
+            state: "open".into(),
+            url: "https://example/pr/1".into(),
+            repository: SearchRepo {
+                name_with_owner: "owner/repo".into(),
+            },
+            author: SearchAuthor {
+                login: login.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn author_login_lowercases_for_comparison() {
+        let sr = search_result_by("Alejandro");
+        assert_eq!(
+            sr.author_login(),
+            "alejandro",
+            "author_login must lowercase so self-exclusion is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn author_login_matches_differently_cased_identity() {
+        // Mirrors the self-exclusion comparison in `list_prs_filtered`: the
+        // authenticated identity is lowercased too, so a case mismatch between
+        // the search result and `gh_whoami` must still count as "self".
+        let sr = search_result_by("AlejandroPerez");
+        let me = "alejandroperez".to_string();
+        assert_eq!(sr.author_login(), me, "case-insensitive self-match");
+    }
 
     // -- parse_issue_from_branch tests --
 

@@ -786,16 +786,24 @@ pub async fn fix_ci(
     // as a transition error below.
     let mut transition_err: Option<cockpit_core::gate::Error> = None;
     state.reviews.update(&pr_ref, |r| {
-        if r.gate_state == GateState::Reworked
+        // Auto-open from Pending/Reworked so the gate can dispatch. A failing
+        // open bails before we touch comments.
+        if matches!(r.gate_state, GateState::Pending | GateState::Reworked)
             && let Err(e) = r.open()
         {
             transition_err = Some(e);
             return;
         }
-        if r.gate_state == GateState::Pending
-            && let Err(e) = r.open()
-        {
-            transition_err = Some(e);
+
+        // Guard: only mutate the review when it is in a state `request_changes`
+        // will accept (InReview). Pushing the synthetic comment first and only
+        // then discovering the transition is illegal would leave a stray CI
+        // comment behind, so bail here without mutating.
+        if r.gate_state != GateState::InReview {
+            transition_err = Some(cockpit_core::gate::Error::IllegalTransition {
+                from: r.gate_state,
+                event: "request_changes",
+            });
             return;
         }
 
@@ -808,8 +816,9 @@ pub async fn fix_ci(
              job logs; fix the failing checks."
                 .to_string()
         };
+        let comment_id = CommentId::new(format!("ci-{}", uuid::Uuid::new_v4()));
         r.comments.push(Comment {
-            id: CommentId::new(format!("ci-{}", uuid::Uuid::new_v4())),
+            id: comment_id.clone(),
             anchor: Anchor::DiffLine {
                 path: PathBuf::from("CI"),
                 range: (0, 0),
@@ -820,12 +829,14 @@ pub async fn fix_ci(
         });
 
         // D10: snapshot the pre-rework head + the synthetic CI comment being
-        // dispatched, before the gate advances to Dispatched.
-        if r.gate_state == GateState::InReview {
-            r.snapshot_dispatch();
-        }
+        // dispatched, before the gate advances to Dispatched. State is InReview
+        // by the guard above.
+        r.snapshot_dispatch();
 
         if let Err(e) = r.request_changes() {
+            // Roll back the synthetic comment so a rejected transition never
+            // leaves a stray CI comment on the review.
+            r.comments.retain(|c| c.id != comment_id);
             transition_err = Some(e);
         }
     });
@@ -1366,21 +1377,58 @@ async fn run_fan_out(
         }
 
         // Wait for this wave's implementers to finish before starting the next.
+        //
+        // Completions arrive on a shared, bounded broadcast that can drop
+        // messages: a `Lagged` error means we already missed at least one, and a
+        // completion can even be missed with no detected lag (another subscriber
+        // drains its slot first). Either way a PR could sit in `pending` forever
+        // and stall every later wave. The store — not the channel — is the
+        // durable source of truth for "still building": the global completion
+        // consumer clears a review's `agent` handle once it applies the
+        // completion. So on detected lag reconcile `pending` against the store,
+        // and add a periodic safety tick so even a silently-missed completion
+        // eventually unblocks the wave.
+        let mut safety_tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        // The first tick fires immediately; skip it so we do not reconcile before
+        // any agent has had a chance to run.
+        safety_tick.tick().await;
+
         while !pending.is_empty() {
-            match completions.recv().await {
-                Ok(event) => {
-                    if event.mode == AgentMode::Implement {
-                        pending.remove(&event.object_id);
+            tokio::select! {
+                recv = completions.recv() => match recv {
+                    Ok(event) => {
+                        if event.mode == AgentMode::Implement {
+                            pending.remove(&event.object_id);
+                        }
                     }
-                }
-                // Missed events under load: keep waiting for the rest. We consume
-                // in a tight loop, so lag is not expected in practice.
-                Err(RecvError::Lagged(_)) => continue,
-                // Channel closed (app shutting down): stop the fan-out.
-                Err(RecvError::Closed) => return,
+                    // Detected lag: at least one completion was dropped.
+                    // Reconcile so a lost completion cannot pin a PR in `pending`.
+                    Err(RecvError::Lagged(_)) => reconcile_pending(&state, &mut pending),
+                    // Channel closed (app shutting down): stop the fan-out.
+                    Err(RecvError::Closed) => return,
+                },
+                // Safety tick: catch completions missed without a detected lag.
+                _ = safety_tick.tick() => reconcile_pending(&state, &mut pending),
             }
         }
     }
+}
+
+/// Drop from `pending` any PR whose review no longer has a running agent (or no
+/// longer exists), reconciling the wave gate against the store.
+///
+/// [`run_fan_out`] waits on a shared, bounded completion broadcast that can drop
+/// messages, so it cannot rely on seeing every completion. The store's `agent`
+/// handle — cleared by the global completion consumer once a completion is
+/// applied — is the durable signal for whether an implementer is still running,
+/// so it is what the wave gate reconciles against.
+fn reconcile_pending(state: &AppState, pending: &mut HashSet<String>) {
+    pending.retain(|pr| {
+        state
+            .reviews
+            .get(&PrRef::new(pr.as_str()))
+            .is_some_and(|review| review.agent.is_some())
+    });
 }
 
 /// Surface an implementer fan-out preparation failure to the project's agent

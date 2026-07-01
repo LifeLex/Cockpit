@@ -24,6 +24,18 @@ import {
 import { X, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
+/**
+ * Envelope wrapping an agent {@link Event} with the UI key of the object it
+ * belongs to, as emitted on the backend `"agent-event"` channel. Hand-typed to
+ * mirror the Rust `AgentEventEnvelope` (no ts-rs binding).
+ */
+interface AgentEventEnvelope {
+  /** UI key of the object this event belongs to (PR ref or project id). */
+  readonly object_id: string;
+  /** The parsed agent stream event. */
+  readonly event: Event;
+}
+
 /** Internal event entry with a local sequence number for keying. */
 interface TimelineEntry {
   readonly seq: number;
@@ -224,8 +236,10 @@ export function AgentPanel({ visible, onClose }: AgentPanelProps) {
 
   // Listen for agent events from Tauri.
   useEffect(() => {
-    const unlisten = listen<Event>("agent-event", (tauriEvent) => {
-      const event = tauriEvent.payload;
+    const unlisten = listen<AgentEventEnvelope>("agent-event", (tauriEvent) => {
+      // Unwrap the object-keyed envelope. Scoping/filtering by object_id is a
+      // later wave — for now the panel behaves exactly as before.
+      const event = tauriEvent.payload.event;
       const now = Date.now();
       setStartTime((prev) => prev ?? now);
 

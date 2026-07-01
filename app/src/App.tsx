@@ -48,6 +48,13 @@ interface CompletionEventPayload {
   readonly session_id: string;
   readonly object_id: string;
   readonly mode: AgentMode;
+  /**
+   * git-HEAD-authoritative outcome of the completed run: `"reworked"` when a
+   * commit landed, `"failed"` for a no-op/failed run, `"completed"` for a
+   * non-gate-advancing artifact fill. Optional — hand-typed, tolerant of older
+   * payloads.
+   */
+  readonly outcome?: "reworked" | "failed" | "completed";
 }
 
 type ReviewTab = "my-prs" | "review-requests" | "all";

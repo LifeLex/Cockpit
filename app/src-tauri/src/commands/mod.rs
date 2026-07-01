@@ -220,11 +220,12 @@ async fn dispatch_fix_agent(
         }
         Err(e) => {
             eprintln!("dispatch_fix_agent: agent spawn failed: {e}");
-            use tauri::Emitter;
+            // Surface the spawn failure to the agent panel, keyed by the
+            // review's PR ref so the frontend attributes it to the right object.
             let error_event = cockpit_core::adapters::agent_stream::Event::Error {
                 message: format!("Agent spawn failed: {e}"),
             };
-            let _ = app_handle.emit("agent-event", &error_event);
+            crate::streaming::emit_agent_event(app_handle, pr, error_event);
         }
     }
 }
@@ -761,11 +762,12 @@ pub async fn plan_request_changes(
         }
         Err(e) => {
             eprintln!("plan_request_changes: planner spawn failed: {e}");
-            use tauri::Emitter;
+            // Surface the spawn failure to the agent panel, keyed by the
+            // project id so the frontend attributes it to the right plan.
             let error_event = cockpit_core::adapters::agent_stream::Event::Error {
                 message: format!("Planner spawn failed: {e}"),
             };
-            let _ = app_handle.emit("agent-event", &error_event);
+            crate::streaming::emit_agent_event(&app_handle, &project_id, error_event);
         }
     }
 

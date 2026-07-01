@@ -29,14 +29,6 @@ impl From<cockpit_core::gate::Error> for CommandError {
     }
 }
 
-impl From<cockpit_core::store::Error> for CommandError {
-    fn from(e: cockpit_core::store::Error) -> Self {
-        Self {
-            message: e.to_string(),
-        }
-    }
-}
-
 impl From<cockpit_core::adapters::agent::Error> for CommandError {
     fn from(e: cockpit_core::adapters::agent::Error) -> Self {
         Self {

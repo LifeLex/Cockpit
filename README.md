@@ -27,9 +27,6 @@ cd app && npm install && cd ..
 
 # Run the desktop app (dev mode with hot-reload)
 cd app && cargo tauri dev
-
-# Or run just the CLI
-cargo run -p cockpit-cli -- --help
 ```
 
 ## Repository layout
@@ -37,8 +34,7 @@ cargo run -p cockpit-cli -- --help
 ```
 cockpit/
 ├── crates/
-│   ├── cockpit-core/       # Headless library: domain model, Gated loop, adapters
-│   └── cockpit-cli/        # Thin CLI binary over core
+│   └── cockpit-core/       # Headless library: domain model, Gated loop, adapters
 ├── app/
 │   ├── src-tauri/          # Tauri 2 Rust shell
 │   └── src/                # React + TypeScript frontend (Vite)
@@ -46,7 +42,7 @@ cockpit/
 └── CLAUDE.md               # How to build it
 ```
 
-`cockpit-core` is the source of truth for all logic. Both `cockpit-cli` and the Tauri app are thin shells that delegate to core. Core has no UI dependencies.
+`cockpit-core` is the source of truth for all logic. The Tauri app is a thin shell that delegates to core, and the headless core integration tests exercise the loop end to end. Core has no UI dependencies.
 
 ## Running
 
@@ -57,22 +53,6 @@ cd app && cargo tauri dev
 ```
 
 This starts the Vite dev server on `localhost:5173` and opens the Tauri window. The React frontend hot-reloads; the Rust backend recompiles on changes to `src-tauri/`.
-
-### CLI
-
-```bash
-cargo run -p cockpit-cli -- --help
-```
-
-Available commands:
-
-| Command | Description |
-|---|---|
-| `kickoff <project-id>` | Fetch a Linear project, compute the frontier, optionally run the plan gate, and spawn agent batch |
-| `plan <action>` | Load, view, comment on, or approve a project plan |
-| `batch-approve` | Preview or approve eligible reviews in bulk (`--dry-run` default, `--confirm` to apply) |
-| `mirror <pr>` | Mirror local comments to a GitHub PR (`--dry-run` available) |
-| `restack <pr>` | Rebase a PR onto its updated base and restack descendants |
 
 ### Frontend only (no Tauri)
 
@@ -91,7 +71,7 @@ cargo fmt --all
 # Lint (warnings are errors)
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Test (218 tests: 202 core + 13 CLI + 3 e2e)
+# Test (core unit tests + headless e2e integration tests)
 cargo test --all
 
 # TypeScript type-check

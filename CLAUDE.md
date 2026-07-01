@@ -16,8 +16,10 @@ project to merged PRs through one review loop run at two gates: an optional proj
 
 1. **The local app is the source of truth.** GitHub PRs are published artifacts. Never make
    the loop block on a GitHub round-trip.
-2. **`cockpit-core` has no UI dependencies.** No `tauri`, no DOM, no framework. If a feature
-   can't be driven from `cockpit-cli`, it doesn't belong in core yet.
+2. **`cockpit-core` has no UI dependencies and must be fully exercisable headlessly.** No
+   `tauri`, no DOM, no framework. The integration tests drive the real loop against local
+   git and the hook server. If a feature can't be exercised that way, it doesn't belong in
+   core yet.
 3. **One loop, written once.** The review loop is the `Gated` trait. Do not fork it per gate.
 4. **Comments are ephemeral.** A comment lives for one review→rework cycle and is cleared on
    `Reworked`. Do not add durable anchoring or a `resolved` flag.
@@ -44,7 +46,6 @@ cockpit/
 │   │       ├── adapters/      # linear.rs, github.rs, git.rs, agent.rs
 │   │       ├── prompt.rs      # deterministic prompt assembly
 │   │       └── hook_server.rs # axum Stop-hook listener
-│   └── cockpit-cli/           # thin binary over core; the validation surface
 └── app/                       # Tauri 2 shell
     ├── src-tauri/             # Rust side of the shell
     │   └── src/
@@ -57,8 +58,9 @@ cockpit/
     └── capabilities/          # least-privilege capability files
 ```
 
-Both `cockpit-cli` and `app/src-tauri` depend on `cockpit-core`. Nothing depends the other
-way. Phases 0–2 (see `SPEC.md` §15) ship entirely in `cockpit-core` + `cockpit-cli`.
+`app/src-tauri` depends on `cockpit-core`. Nothing depends the other way. The headless core
+and its integration tests are the validation surface; Phases 0–2 (see `SPEC.md` §15) ship
+entirely in `cockpit-core`.
 
 ---
 
@@ -103,7 +105,7 @@ the caller will branch on the failure mode.
   }
   ```
 
-- **`cockpit-cli` and `src-tauri` (caller just reports and gives up):** use `anyhow::Result`
+- **Binaries like `src-tauri` (caller just reports and gives up):** use `anyhow::Result`
   with `.context("…")` / `.with_context(|| …)` to add the human-readable trail. Print the
   full chain with `{:#}`.
 
@@ -221,7 +223,8 @@ Tauri command rules:
   test. Test real behavior against real (local) git/worktrees where feasible.
 - **TS:** Vitest. Narrow discriminated unions with real guards in tests, not casts.
 - The Phase-1 reliability bar is itself the acceptance test: comment → request-changes →
-  agent fixes + pushes → state flips, end to end from the CLI.
+  agent fixes + pushes → state flips, end to end via a core integration test (see
+  `crates/cockpit-core/tests/fix_loop_e2e.rs`).
 
 ---
 
@@ -244,7 +247,7 @@ A change is done when all of these hold:
 - Branch prefix `alejandro/`; one task ≈ one PR; keep PRs small and reviewable.
 - Stacked PRs via your stacking tool; the dependency order comes from the Linear project DAG
   (same graph cockpit itself uses). Restack descendants when a base changes.
-- Conventional-style commit subjects, imperative mood, scoped (`core:`, `cli:`, `app:`).
+- Conventional-style commit subjects, imperative mood, scoped (`core:`, `app:`).
 - Each PR states which `SPEC.md` section / plan task it implements and how it was verified.
 
 > Dogfooding note: cockpit exists to review batches of agent PRs. Build it in exactly the
@@ -280,4 +283,4 @@ or agent output:
 
 Force-push happens only inside an agent's own worktree as part of rework, never as a cockpit
 action against an arbitrary branch. When in doubt, surface it and wait for an explicit human
-yes in the UI/CLI.
+yes in the UI.

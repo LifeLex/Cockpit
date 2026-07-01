@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cockpit-core", "crates/cockpit-cli", "app/src-tauri"]
+members = ["crates/cockpit-core", "app/src-tauri"]
 
 [workspace.package]
 edition = "2024"
@@ -18,7 +18,6 @@ tempfile = "3"
 sha2 = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
-clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 tower = "0.5"
 http = "1"

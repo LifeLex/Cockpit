@@ -1,54 +1,14 @@
-//! In-memory and file-backed stores for active [`Review`]s and the
-//! optional [`ProjectPlan`].
+//! In-memory stores for active [`Review`]s, the optional [`ProjectPlan`], and
+//! first-class [`Project`]s.
 //!
-//! V1 uses JSON file persistence: `start` writes the initial state,
-//! `comment add` and `request-changes` read/modify/write it back.
-//! Thread-safe in-memory access via `Arc<Mutex<…>>`.
+//! These back [`AppState`](../../app/src-tauri) and are driven by the Tauri
+//! commands. Thread-safe in-memory access via `Arc<Mutex<…>>`; the app owns
+//! the lifetime, so there is no on-disk persistence layer here.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::config;
 use crate::model::{GateState, PrRef, Project, ProjectId, ProjectPlan, Review};
-
-// ---------------------------------------------------------------------------
-// Error
-// ---------------------------------------------------------------------------
-
-/// Errors from the review store.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// The state file could not be read or written.
-    #[error("state file I/O error at {path}: {source}")]
-    Io {
-        /// Path that was being read/written.
-        path: PathBuf,
-        /// Underlying I/O error.
-        source: std::io::Error,
-    },
-
-    /// The state file contained invalid JSON.
-    #[error("failed to parse state file {path}: {source}")]
-    Parse {
-        /// Path that was being parsed.
-        path: PathBuf,
-        /// Underlying serde error.
-        source: serde_json::Error,
-    },
-
-    /// No review found for the given PR reference.
-    #[error("no review found for PR {0}")]
-    NotFound(PrRef),
-
-    /// No project plan is loaded.
-    #[error("no project plan loaded")]
-    NoPlan,
-
-    /// Failed to resolve a cockpit path (e.g. the cockpit home directory).
-    #[error("config error: {0}")]
-    Config(#[from] config::Error),
-}
 
 // ---------------------------------------------------------------------------
 // ReviewStore (in-memory)
@@ -294,179 +254,6 @@ impl ProjectStore {
     }
 }
 
-/// Save the plan from a [`PlanStore`] to a JSON file.
-///
-/// Creates parent directories if they don't exist.
-pub fn save_plan_to_file(store: &PlanStore, path: &Path) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-
-    let plan = store.get();
-    let content = serde_json::to_string_pretty(&plan).map_err(|source| Error::Parse {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    std::fs::write(path, content).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    Ok(())
-}
-
-/// Load a [`PlanStore`] from a JSON file.
-///
-/// Returns an empty store if the file does not exist.
-pub fn load_plan_from_file(path: &Path) -> Result<PlanStore, Error> {
-    if !path.exists() {
-        return Ok(PlanStore::new());
-    }
-
-    let content = std::fs::read_to_string(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    let plan: Option<ProjectPlan> =
-        serde_json::from_str(&content).map_err(|source| Error::Parse {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-    let store = PlanStore::new();
-    if let Some(p) = plan {
-        store.set(p);
-    }
-    Ok(store)
-}
-
-// ---------------------------------------------------------------------------
-// File-backed persistence
-// ---------------------------------------------------------------------------
-
-/// Resolve the reviews state file path (`<cockpit_home>/state.json`).
-///
-/// This lives under the user's cockpit home rather than the current working
-/// directory, so a bundled app never writes scratch state into a checkout.
-pub fn state_file_path() -> Result<PathBuf, Error> {
-    Ok(config::cockpit_home()?.join("state.json"))
-}
-
-/// Resolve the plan state file path (`<cockpit_home>/plan.json`).
-pub fn plan_state_file_path() -> Result<PathBuf, Error> {
-    Ok(config::cockpit_home()?.join("plan.json"))
-}
-
-/// Resolve the projects state file path (`<cockpit_home>/projects.json`).
-pub fn project_state_file_path() -> Result<PathBuf, Error> {
-    Ok(config::cockpit_home()?.join("projects.json"))
-}
-
-/// Load reviews from a JSON state file into a `ReviewStore`.
-///
-/// Returns an empty store if the file does not exist.
-pub fn load_from_file(path: &Path) -> Result<ReviewStore, Error> {
-    if !path.exists() {
-        return Ok(ReviewStore::new());
-    }
-
-    let content = std::fs::read_to_string(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    let reviews: Vec<Review> = serde_json::from_str(&content).map_err(|source| Error::Parse {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    let store = ReviewStore::new();
-    for review in reviews {
-        store.insert(review);
-    }
-    Ok(store)
-}
-
-/// Write all reviews from a `ReviewStore` to a JSON state file.
-///
-/// Creates parent directories if they don't exist.
-pub fn save_to_file(store: &ReviewStore, path: &Path) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-
-    let reviews = store.list();
-    let content = serde_json::to_string_pretty(&reviews).map_err(|source| Error::Parse {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    std::fs::write(path, content).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    Ok(())
-}
-
-/// Load projects from a JSON state file into a [`ProjectStore`].
-///
-/// Returns an empty store if the file does not exist.
-pub fn load_projects_from_file(path: &Path) -> Result<ProjectStore, Error> {
-    if !path.exists() {
-        return Ok(ProjectStore::new());
-    }
-
-    let content = std::fs::read_to_string(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    let projects: Vec<Project> = serde_json::from_str(&content).map_err(|source| Error::Parse {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    let store = ProjectStore::new();
-    for project in projects {
-        store.insert(project);
-    }
-    Ok(store)
-}
-
-/// Write all projects from a [`ProjectStore`] to a JSON state file.
-///
-/// Creates parent directories if they don't exist.
-pub fn save_projects_to_file(store: &ProjectStore, path: &Path) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-
-    let projects = store.list();
-    let content = serde_json::to_string_pretty(&projects).map_err(|source| Error::Parse {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    std::fs::write(path, content).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -569,34 +356,6 @@ mod tests {
         assert_eq!(all.len(), 3);
     }
 
-    #[test]
-    fn file_round_trip() {
-        let dir = tempfile::tempdir().expect("should create temp dir");
-        let path = dir.path().join(".cockpit/state.json");
-
-        let store = ReviewStore::new();
-        store.insert(make_review(100));
-        store.insert(make_review(200));
-
-        save_to_file(&store, &path).expect("save should succeed");
-
-        let loaded = load_from_file(&path).expect("load should succeed");
-        let reviews = loaded.list();
-        assert_eq!(reviews.len(), 2);
-
-        // Verify the reviews round-tripped correctly.
-        let pr100 = PrRef::new("owner/repo#100");
-        let got = loaded.get(&pr100).expect("review 100 should be present");
-        assert_eq!(got.id.as_str(), "r-100");
-    }
-
-    #[test]
-    fn load_missing_file_returns_empty() {
-        let path = PathBuf::from("/nonexistent/path/state.json");
-        let store = load_from_file(&path).expect("load of missing file should return empty store");
-        assert!(store.list().is_empty());
-    }
-
     // ---------------------------------------------------------------
     // PlanStore tests
     // ---------------------------------------------------------------
@@ -676,30 +435,6 @@ mod tests {
         assert!(removed.is_none(), "clear on empty store returns None");
     }
 
-    #[test]
-    fn plan_file_round_trip() {
-        let dir = tempfile::tempdir().expect("should create temp dir");
-        let path = dir.path().join(".cockpit/plan.json");
-
-        let store = PlanStore::new();
-        store.set(make_plan());
-
-        save_plan_to_file(&store, &path).expect("save should succeed");
-
-        let loaded = load_plan_from_file(&path).expect("load should succeed");
-        let got = loaded.get().expect("plan should be present after load");
-        assert_eq!(got.doc.summary, "Build a thing");
-        assert_eq!(got.doc.steps.len(), 1);
-    }
-
-    #[test]
-    fn plan_load_missing_file_returns_empty() {
-        let path = PathBuf::from("/nonexistent/path/plan.json");
-        let store =
-            load_plan_from_file(&path).expect("load of missing file should return empty store");
-        assert!(store.get().is_none());
-    }
-
     // ---------------------------------------------------------------
     // ProjectStore + reviews_by_project tests
     // ---------------------------------------------------------------
@@ -746,23 +481,6 @@ mod tests {
         let removed = store.remove(&ProjectId::new("p-1")).expect("removed");
         assert_eq!(removed.name, "renamed");
         assert!(store.get(&ProjectId::new("p-1")).is_none());
-    }
-
-    #[test]
-    fn project_file_round_trip() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join(".cockpit/projects.json");
-
-        let store = ProjectStore::new();
-        store.insert(make_project("p-1", ProjectSource::AdHoc));
-        store.insert(make_project(
-            "p-2",
-            ProjectSource::Linear("lin-42".to_string()),
-        ));
-
-        save_projects_to_file(&store, &path).expect("save");
-        let loaded = load_projects_from_file(&path).expect("load");
-        assert_eq!(loaded.list().len(), 2);
     }
 
     #[test]

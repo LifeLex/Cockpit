@@ -200,7 +200,9 @@ reconcile step differ.
 8. **Re-review / advance.** Reworked → InReview. Plan approved → implement the batch. Diff
    approved → merge. On any base change with children, restack (§13).
 
-v1 reliability bar: steps 1–7 round-trip on one real PR at the diff gate, from the CLI.
+v1 reliability bar: steps 1–7 round-trip on one real PR at the diff gate. (Note: the
+`cockpit-cli` crate has been retired; the loop now ships and validates via headless
+`cockpit-core` integration tests and the Tauri app.)
 
 ## 9. Prompt assembly
 
@@ -273,7 +275,8 @@ gate), then reuse it for the plan gate, because both share it.
   frontier; `cockpit ingest` lists existing PRs.
 - **Phase 1 — the loop at the diff gate, headless.** `comment add`, `request-changes`,
   spawn fixer, Stop-hook reconcile to `Reworked`. Proof: comment → dispatch → agent fixes
-  + pushes → state flips, all from the CLI. **The product in miniature.**
+  + pushes → state flips, driven end to end by a headless core integration test. **The
+  product in miniature.**
 - **Phase 2 — batch kickoff + optional plan gate.** Reuse the loop with the planner on a
   `ProjectPlan`; `cockpit kickoff <project>` plans (or skips), approve, then the
   implementer spawns all PRs. Proof: a project goes plan→approved→batch of PRs (or

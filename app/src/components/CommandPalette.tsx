@@ -63,19 +63,22 @@ function gateStateLabel(state: GateState): string {
   }
 }
 
-/** Tailwind badge color classes for gate states. */
+/**
+ * Tailwind badge color classes for gate states, routed through the
+ * `--color-state-*` design tokens so the palette matches the rest of the app.
+ */
 function gateStateBadgeClass(state: GateState): string {
   switch (state) {
     case "Pending":
-      return "bg-muted text-muted-foreground";
+      return "bg-state-pending/15 text-state-pending";
     case "InReview":
-      return "bg-blue-500/15 text-blue-600";
+      return "bg-state-in-review/15 text-state-in-review";
     case "Dispatched":
-      return "bg-yellow-500/15 text-yellow-600";
+      return "bg-state-dispatched/15 text-state-dispatched";
     case "Reworked":
-      return "bg-green-500/15 text-green-600";
+      return "bg-state-reworked/15 text-state-reworked";
     case "Approved":
-      return "bg-emerald-500/15 text-emerald-600";
+      return "bg-state-approved/15 text-state-approved";
     default: {
       const _exhaustive: never = state;
       void _exhaustive;

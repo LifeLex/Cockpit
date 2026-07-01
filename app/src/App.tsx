@@ -149,6 +149,7 @@ function App() {
   const planOpen = useAppStore((s) => s.planOpen);
   const generatePlan = useAppStore((s) => s.generatePlan);
   const batchStatus = useAppStore((s) => s.batchStatus);
+  const restackPr = useAppStore((s) => s.restackPr);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
@@ -339,6 +340,13 @@ function App() {
     [openReview, navigateToDiff, authoredPrs, reviewRequests, reviews],
   );
 
+  const handleRestack = useCallback(
+    (pr: string) => {
+      void restackPr(pr);
+    },
+    [restackPr],
+  );
+
   // Opening a project always routes to its plan gate. When the project has no
   // plan yet, PlanView surfaces a "Generate plan" affordance.
   const handleOpenProject = useCallback(
@@ -441,6 +449,7 @@ function App() {
               key={review.id}
               review={review}
               onAction={handleReviewAction}
+              onRestack={handleRestack}
             />
           ))}
         </div>

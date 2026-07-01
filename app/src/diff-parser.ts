@@ -5,7 +5,37 @@
  * A unified diff contains one or more file hunks. Each hunk has an `@@`
  * header describing the affected line ranges, followed by context (`" "`),
  * added (`"+"`), and removed (`"-"`) lines.
+ *
+ * The reconstructed `original`/`modified` strings only contain the lines that
+ * appear in the diff — hunk gaps are collapsed — so an editor line in those
+ * fragments does NOT equal the real file line. Every {@link FileDiff} therefore
+ * carries a {@link LineMap} translating between fragment (editor) lines and real
+ * file lines on each {@link DiffSide}. Use {@link fragmentToReal} and
+ * {@link realToFragment} rather than reading the map directly.
  */
+
+import type { DiffSide } from "@/bindings/DiffSide";
+
+/**
+ * Bidirectional line mapping for one side of a file's diff.
+ *
+ * Fragment lines are the 1-based line numbers within the reconstructed
+ * `original`/`modified` text (i.e. the lines Monaco renders). Real lines are
+ * the 1-based line numbers in the actual pre-/post-change file.
+ */
+interface SideLineMap {
+  /**
+   * Fragment line → real file line. Indexed by `fragmentLine - 1`; a `number`
+   * at an index means that editor line exists on this side, `undefined` means
+   * it does not.
+   */
+  readonly toReal: readonly number[];
+  /** Real file line → fragment (editor) line for lines present in the diff. */
+  readonly toFragment: ReadonlyMap<number, number>;
+}
+
+/** Per-file line mapping keyed by {@link DiffSide} (`"Old"` / `"New"`). */
+type LineMap = Record<DiffSide, SideLineMap>;
 
 /** A single file's diff, split into the text Monaco expects. */
 interface FileDiff {
@@ -15,7 +45,32 @@ interface FileDiff {
   readonly original: string;
   /** Content after the change (lines prefixed with `+` or ` ` in the diff). */
   readonly modified: string;
+  /**
+   * Translation between fragment (editor) lines and real file lines for both
+   * sides. Always present on results from {@link parseDiff}; optional so
+   * existing callers that synthesize a bare {@link FileDiff} keep compiling.
+   * Consume via {@link fragmentToReal} / {@link realToFragment}.
+   */
+  readonly lineMap?: LineMap;
 }
+
+/** Mutable accumulator used while a single file's hunks are parsed. */
+interface FileAccumulator {
+  path: string;
+  originalLines: string[];
+  modifiedLines: string[];
+  oldToReal: number[];
+  newToReal: number[];
+  oldToFragment: Map<number, number>;
+  newToFragment: Map<number, number>;
+  /** Next real old-file line number to assign; set by each hunk header. */
+  oldLine: number;
+  /** Next real new-file line number to assign; set by each hunk header. */
+  newLine: number;
+}
+
+/** Matches `@@ -a,b +c,d @@`, tolerating the omitted-count forms `-a`/`+c`. */
+const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
 /**
  * Parse a raw unified diff string into per-file original/modified pairs.
@@ -24,9 +79,11 @@ interface FileDiff {
  * - Multiple files in a single diff
  * - `diff --git a/... b/...` headers
  * - `---`/`+++` file headers
- * - `@@` hunk headers
+ * - `@@` hunk headers, including the omitted-count forms (`@@ -a +c @@`)
  * - Context, addition, and deletion lines
  * - New files (original is empty) and deleted files (modified is empty)
+ * - Non-contiguous hunks (gaps are collapsed in the fragment text but the
+ *   {@link LineMap} preserves the real line numbers)
  */
 function parseDiff(raw: string): readonly FileDiff[] {
   if (raw.trim() === "") {
@@ -36,21 +93,35 @@ function parseDiff(raw: string): readonly FileDiff[] {
   const results: FileDiff[] = [];
   const lines = raw.split("\n");
 
-  let currentPath: string | null = null;
-  let originalLines: string[] = [];
-  let modifiedLines: string[] = [];
+  let acc: FileAccumulator | null = null;
+
+  function newAccumulator(path: string): FileAccumulator {
+    return {
+      path,
+      originalLines: [],
+      modifiedLines: [],
+      oldToReal: [],
+      newToReal: [],
+      oldToFragment: new Map(),
+      newToFragment: new Map(),
+      oldLine: 1,
+      newLine: 1,
+    };
+  }
 
   function flushFile(): void {
-    if (currentPath !== null) {
+    if (acc !== null) {
       results.push({
-        path: currentPath,
-        original: originalLines.join("\n"),
-        modified: modifiedLines.join("\n"),
+        path: acc.path,
+        original: acc.originalLines.join("\n"),
+        modified: acc.modifiedLines.join("\n"),
+        lineMap: {
+          Old: { toReal: acc.oldToReal, toFragment: acc.oldToFragment },
+          New: { toReal: acc.newToReal, toFragment: acc.newToFragment },
+        },
       });
     }
-    currentPath = null;
-    originalLines = [];
-    modifiedLines = [];
+    acc = null;
   }
 
   for (const line of lines) {
@@ -60,7 +131,7 @@ function parseDiff(raw: string): readonly FileDiff[] {
       // Extract path from "diff --git a/foo b/foo"
       const match = /^diff --git a\/.+ b\/(.+)$/.exec(line);
       if (match?.[1] !== undefined) {
-        currentPath = match[1];
+        acc = newAccumulator(match[1]);
       }
       continue;
     }
@@ -82,8 +153,13 @@ function parseDiff(raw: string): readonly FileDiff[] {
       continue;
     }
 
-    // Hunk header: @@ -a,b +c,d @@
+    // Hunk header: @@ -a,b +c,d @@ — reset the real line counters for this hunk.
     if (line.startsWith("@@")) {
+      const header = HUNK_HEADER.exec(line);
+      if (acc !== null && header?.[1] !== undefined && header[3] !== undefined) {
+        acc.oldLine = Number.parseInt(header[1], 10);
+        acc.newLine = Number.parseInt(header[3], 10);
+      }
       continue;
     }
 
@@ -92,22 +168,39 @@ function parseDiff(raw: string): readonly FileDiff[] {
       continue;
     }
 
-    if (currentPath === null) {
+    if (acc === null) {
       continue;
     }
 
-    // Context line (unchanged)
+    // Context line (unchanged): advances both sides.
     if (line.startsWith(" ")) {
-      originalLines.push(line.slice(1));
-      modifiedLines.push(line.slice(1));
+      acc.originalLines.push(line.slice(1));
+      const oldFrag = acc.originalLines.length;
+      acc.oldToReal[oldFrag - 1] = acc.oldLine;
+      acc.oldToFragment.set(acc.oldLine, oldFrag);
+      acc.oldLine += 1;
+
+      acc.modifiedLines.push(line.slice(1));
+      const newFrag = acc.modifiedLines.length;
+      acc.newToReal[newFrag - 1] = acc.newLine;
+      acc.newToFragment.set(acc.newLine, newFrag);
+      acc.newLine += 1;
     }
-    // Removed line
+    // Removed line: advances the old side only.
     else if (line.startsWith("-")) {
-      originalLines.push(line.slice(1));
+      acc.originalLines.push(line.slice(1));
+      const oldFrag = acc.originalLines.length;
+      acc.oldToReal[oldFrag - 1] = acc.oldLine;
+      acc.oldToFragment.set(acc.oldLine, oldFrag);
+      acc.oldLine += 1;
     }
-    // Added line
+    // Added line: advances the new side only.
     else if (line.startsWith("+")) {
-      modifiedLines.push(line.slice(1));
+      acc.modifiedLines.push(line.slice(1));
+      const newFrag = acc.modifiedLines.length;
+      acc.newToReal[newFrag - 1] = acc.newLine;
+      acc.newToFragment.set(acc.newLine, newFrag);
+      acc.newLine += 1;
     }
     // Empty line at end of diff (no prefix) -- treat as context
     else if (line === "") {
@@ -117,6 +210,37 @@ function parseDiff(raw: string): readonly FileDiff[] {
 
   flushFile();
   return results;
+}
+
+/**
+ * Translate a fragment (editor) line to its real file line on `side`.
+ *
+ * Returns `undefined` when the fragment line does not exist on that side
+ * (e.g. the new side of a deleted file, or a line past the fragment's end).
+ */
+function fragmentToReal(
+  file: FileDiff,
+  side: DiffSide,
+  fragmentLine: number,
+): number | undefined {
+  if (fragmentLine < 1) {
+    return undefined;
+  }
+  return file.lineMap?.[side].toReal[fragmentLine - 1];
+}
+
+/**
+ * Translate a real file line on `side` to its fragment (editor) line.
+ *
+ * Returns `undefined` when the real line is not present in the diff on that
+ * side (i.e. it falls in a collapsed gap between hunks, or the side is absent).
+ */
+function realToFragment(
+  file: FileDiff,
+  side: DiffSide,
+  realLine: number,
+): number | undefined {
+  return file.lineMap?.[side].toFragment.get(realLine);
 }
 
 /** Added / removed line counts for a raw unified diff. */
@@ -165,5 +289,11 @@ function extractFilePaths(raw: string): readonly string[] {
   return files;
 }
 
-export { parseDiff, extractFilePaths, diffStats };
-export type { FileDiff, DiffStats };
+export {
+  parseDiff,
+  extractFilePaths,
+  diffStats,
+  fragmentToReal,
+  realToFragment,
+};
+export type { FileDiff, DiffStats, LineMap, SideLineMap };

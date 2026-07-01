@@ -7,7 +7,6 @@
 //! plumbing and the effectful `dispatch`/`reconcile`.
 
 use crate::model::{AgentRun, Comment, DispatchSnapshot, GateState, ProjectPlan, Review};
-use crate::workflow::TransitionEvent;
 
 /// Errors from gate state transitions.
 #[derive(Debug, thiserror::Error)]
@@ -40,15 +39,6 @@ pub enum AgentOutcome {
     /// The agent produced no new commit; the review returned `Dispatched →
     /// InReview` with its comments preserved for re-dispatch.
     Failed,
-}
-
-/// Record a transition for workflow automation.
-///
-/// Constructs a [`TransitionEvent`] from the object ID and the before/after
-/// states. Callers use this after a successful transition to feed into
-/// [`crate::workflow::evaluate_rules`].
-pub fn transition_event(object_id: &str, from: GateState, to: GateState) -> TransitionEvent {
-    crate::workflow::transition_event(object_id, from, to)
 }
 
 /// The shared review loop, implemented by both [`ProjectPlan`] and [`Review`].

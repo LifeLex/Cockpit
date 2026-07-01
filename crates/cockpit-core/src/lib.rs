@@ -23,7 +23,6 @@ pub mod prompt;
 pub mod restack;
 pub mod skills;
 pub mod store;
-pub mod workflow;
 
 pub mod hook_server;
 

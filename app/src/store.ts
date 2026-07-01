@@ -7,6 +7,7 @@ import type { ProjectPlan } from "./bindings/ProjectPlan";
 import type { Config } from "./bindings/Config";
 import type { KickoffResult } from "./bindings/KickoffResult";
 import type { Project } from "./bindings/Project";
+import type { ProjectId } from "./bindings/ProjectId";
 import type { BatchStatus } from "./bindings/BatchStatus";
 import type { Skill } from "./bindings/Skill";
 import type { SyncReport } from "./bindings/SyncReport";
@@ -23,7 +24,7 @@ import type { CiCheck } from "./bindings/CiCheck";
 type ViewState =
   | { readonly kind: "prs" }
   | { readonly kind: "diff"; readonly pr: string }
-  | { readonly kind: "plan" }
+  | { readonly kind: "plan"; readonly project: ProjectId }
   | { readonly kind: "projects" }
   | { readonly kind: "new-project" }
   | { readonly kind: "skills" }
@@ -56,8 +57,8 @@ interface AppStore {
   /** Navigate to the diff view for a specific PR. */
   navigateToDiff: (pr: string) => Promise<void>;
 
-  /** Navigate to the plan view. */
-  navigateToPlan: () => void;
+  /** Navigate to a project's plan gate. */
+  navigateToPlan: (projectId: ProjectId) => void;
 
   /** Navigate to the PRs list (the default view). */
   navigateToPrs: () => void;
@@ -94,24 +95,27 @@ interface AppStore {
   /** Refresh the active review to pick up state changes. */
   refreshActiveReview: () => Promise<void>;
 
-  fetchPlan: () => Promise<void>;
-  loadPlan: (file: string, project: string) => Promise<void>;
-  addPlanComment: (anchor: string, body: string) => Promise<void>;
+  /** Fetch the plan for a specific project into the store. */
+  fetchPlan: (projectId: ProjectId) => Promise<void>;
 
-  /** Request changes on the project plan (spawns the plan agent). */
-  planRequestChanges: () => Promise<void>;
+  /** Add a comment to a project's plan (anchored to a step or file). */
+  addPlanComment: (
+    projectId: ProjectId,
+    anchor: string,
+    body: string,
+  ) => Promise<void>;
 
-  /** Approve the project plan (explicit user action; fans out the batch). */
-  planApprove: () => Promise<void>;
+  /** Request changes on a project's plan (spawns the plan agent). */
+  planRequestChanges: (projectId: ProjectId) => Promise<void>;
 
-  /** Open the plan for review (`Pending | Reworked` -> `InReview`). */
-  openPlan: () => Promise<void>;
+  /** Approve a project's plan (explicit user action; fans out the batch). */
+  planApprove: (projectId: ProjectId) => Promise<void>;
 
-  /**
-   * Generate the plan document via the plan agent for the loaded plan (or an
-   * explicit project, if wired later by the caller).
-   */
-  generatePlan: (projectId?: string) => Promise<void>;
+  /** Open a project's plan for review (`Pending | Reworked` -> `InReview`). */
+  planOpen: (projectId: ProjectId) => Promise<void>;
+
+  /** Generate the plan document via the plan agent for a project. */
+  generatePlan: (projectId: ProjectId) => Promise<void>;
 
   /** Approve a single review by PR ref (explicit user action). */
   approveReview: (pr: string) => Promise<void>;
@@ -166,8 +170,8 @@ interface AppStore {
   /** Attach an existing review (by PR ref) to a project. */
   attachReview: (pr: string, projectId: string) => Promise<void>;
 
-  /** Fetch aggregate batch progress for a project (or all reviews). */
-  batchStatus: (projectId?: string) => Promise<BatchStatus | null>;
+  /** Fetch per-project batch progress. */
+  batchStatus: (projectId: ProjectId) => Promise<BatchStatus | null>;
 
   // -------------------------------------------------------------------------
   // Kickoff (Linear import)
@@ -342,9 +346,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  navigateToPlan: () => {
-    set({ view: { kind: "plan" } });
-    void get().fetchPlan();
+  navigateToPlan: (projectId: ProjectId) => {
+    set({ view: { kind: "plan", project: projectId } });
+    void get().fetchPlan(projectId);
   },
 
   navigateToPrs: () => {
@@ -464,28 +468,21 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  fetchPlan: async () => {
+  fetchPlan: async (projectId: ProjectId) => {
     try {
-      const plan = await invoke<ProjectPlan | null>("get_plan");
+      const plan = await invoke<ProjectPlan | null>("get_plan", {
+        projectId,
+      });
       set({ plan });
     } catch (e: unknown) {
       set({ error: String(e) });
     }
   },
 
-  loadPlan: async (file: string, project: string) => {
-    set({ loading: true, error: null });
-    try {
-      const plan = await invoke<ProjectPlan>("load_plan", { file, project });
-      set({ plan, loading: false });
-    } catch (e: unknown) {
-      set({ error: String(e), loading: false });
-    }
-  },
-
-  addPlanComment: async (anchor: string, body: string) => {
+  addPlanComment: async (projectId: ProjectId, anchor: string, body: string) => {
     try {
       const plan = await invoke<ProjectPlan>("add_plan_comment", {
+        projectId,
         anchor,
         body,
       });
@@ -495,37 +492,39 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  planRequestChanges: async () => {
+  planRequestChanges: async (projectId: ProjectId) => {
     try {
-      const plan = await invoke<ProjectPlan>("plan_request_changes");
+      const plan = await invoke<ProjectPlan>("plan_request_changes", {
+        projectId,
+      });
       set({ plan });
     } catch (e: unknown) {
       set({ error: String(e) });
     }
   },
 
-  planApprove: async () => {
+  planApprove: async (projectId: ProjectId) => {
     try {
-      const plan = await invoke<ProjectPlan>("plan_approve");
+      const plan = await invoke<ProjectPlan>("plan_approve", { projectId });
       set({ plan });
     } catch (e: unknown) {
       set({ error: String(e) });
     }
   },
 
-  openPlan: async () => {
+  planOpen: async (projectId: ProjectId) => {
     try {
-      const plan = await invoke<ProjectPlan>("plan_open");
+      const plan = await invoke<ProjectPlan>("plan_open", { projectId });
       set({ plan });
     } catch (e: unknown) {
       set({ error: String(e) });
     }
   },
 
-  generatePlan: async (_projectId?: string) => {
+  generatePlan: async (projectId: ProjectId) => {
     set({ loading: true, error: null });
     try {
-      const plan = await invoke<ProjectPlan>("generate_plan");
+      const plan = await invoke<ProjectPlan>("generate_plan", { projectId });
       set({ plan, loading: false });
     } catch (e: unknown) {
       set({ error: String(e), loading: false });
@@ -617,7 +616,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
       set({ kickoffLoading: false, kickoffResult: result });
       void get().fetchReviews();
       void get().fetchFrontier();
-      void get().fetchPlan();
       void get().listProjects();
     } catch (e: unknown) {
       set({ error: String(e), kickoffLoading: false });
@@ -642,10 +640,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  batchStatus: async (projectId?: string): Promise<BatchStatus | null> => {
+  batchStatus: async (projectId: ProjectId): Promise<BatchStatus | null> => {
     try {
       const status = await invoke<BatchStatus>("batch_status", {
-        projectId: projectId ?? null,
+        projectId,
       });
       return status;
     } catch (e: unknown) {

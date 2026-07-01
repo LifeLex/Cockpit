@@ -65,7 +65,7 @@ interface ProjectCardProps {
   readonly project: Project;
   /** Number of reviews belonging to this project. */
   readonly prCount: number;
-  /** Navigate: to the plan gate if the project has a plan, else to its PRs. */
+  /** Open this project's plan gate (which offers to generate a plan if none). */
   readonly onOpen: (project: Project) => void;
 }
 
@@ -74,7 +74,8 @@ interface ProjectCardProps {
  *
  * Surfaces the project name, its source (Linear / ad-hoc), the plan gate state
  * (if a plan exists), and the member-PR count. The whole card is clickable and
- * routes to the plan gate when a plan is present, otherwise to the PRs list.
+ * routes to the project's plan gate; when the project has no plan yet, the plan
+ * gate offers to generate one.
  */
 export function ProjectCard({ project, prCount, onOpen }: ProjectCardProps) {
   const plan = project.plan;

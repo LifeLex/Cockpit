@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import type { ProjectPlan } from "../bindings/ProjectPlan";
+import type { ProjectId } from "../bindings/ProjectId";
 import type { GateState } from "../bindings/GateState";
 import type { Comment } from "../bindings/Comment";
 import type { Anchor } from "../bindings/Anchor";
@@ -437,7 +438,12 @@ function GateActions({
 // ---------------------------------------------------------------------------
 
 interface PlanViewProps {
-  readonly plan: ProjectPlan;
+  /** The project whose plan gate is being shown. */
+  readonly projectId: ProjectId;
+  /** The project's plan, or `null` when it has none yet. */
+  readonly plan: ProjectPlan | null;
+  /** Generate the plan via the planner agent (when the project has none). */
+  readonly onGenerate: () => void;
   readonly onAddComment: (anchor: string, body: string) => void;
   readonly onRequestChanges: () => void;
   readonly onApprove: () => void;
@@ -446,14 +452,52 @@ interface PlanViewProps {
   readonly onFetchBatchStatus: () => Promise<BatchStatus | null>;
 }
 
-export function PlanView({
+/**
+ * The plan gate for a single project.
+ *
+ * When the project has no plan yet, renders a "Generate plan" affordance that
+ * spawns the planner agent. Otherwise renders the plan document with the
+ * standard gate actions (open / request changes / approve-and-build).
+ */
+export function PlanView(props: PlanViewProps) {
+  if (props.plan === null) {
+    return <GeneratePlanState onGenerate={props.onGenerate} />;
+  }
+  return <PlanGate {...props} plan={props.plan} />;
+}
+
+/** Empty state shown when a project has no plan; offers to generate one. */
+function GeneratePlanState({ onGenerate }: { readonly onGenerate: () => void }) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-4 rounded-lg border border-dashed border-border bg-card px-6 py-16 text-center">
+      <ClipboardList className="h-10 w-10 text-muted-foreground" />
+      <div>
+        <h1 className="text-lg font-semibold text-foreground">No plan yet</h1>
+        <p className="mt-1 max-w-md text-sm text-muted-foreground">
+          Generate a project plan with the planner agent. It runs against your
+          repo and writes a plan you can review, comment on, and approve.
+        </p>
+      </div>
+      <Button onClick={onGenerate}>
+        <Bot />
+        Generate plan
+      </Button>
+    </div>
+  );
+}
+
+interface PlanGateProps extends PlanViewProps {
+  readonly plan: ProjectPlan;
+}
+
+function PlanGate({
   plan,
   onAddComment,
   onRequestChanges,
   onApprove,
   onOpen,
   onFetchBatchStatus,
-}: PlanViewProps) {
+}: PlanGateProps) {
   const { doc, gate_state: gateState, comments } = plan;
   const canComment = gateState === "InReview";
 

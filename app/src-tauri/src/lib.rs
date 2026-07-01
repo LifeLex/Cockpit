@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 use cockpit_core::gate::Gated;
-use cockpit_core::model::{AgentMode, PrRef};
+use cockpit_core::model::{AgentMode, PrRef, ProjectId};
 
 use state::AppState;
 
@@ -109,7 +109,11 @@ pub fn run() {
                             // the markdown into `doc`. Read/parse failure is
                             // non-fatal (Invariant 1) — we log and keep the
                             // prior doc rather than block the loop.
-                            ingest_plan_output(&app_state_ref);
+                            //
+                            // The session object_id is the project id (set at
+                            // spawn), so this routes to the right project's plan.
+                            let project_id = cockpit_core::model::ProjectId::new(&event.object_id);
+                            ingest_plan_output(&app_state_ref, &project_id);
                         }
                         AgentMode::Implement => {
                             // An implementer finished building a review's
@@ -172,7 +176,6 @@ pub fn run() {
             commands::ci_run_logs_by_link,
             commands::fix_ci,
             commands::get_plan,
-            commands::load_plan,
             commands::add_plan_comment,
             commands::generate_plan,
             commands::plan_request_changes,
@@ -194,7 +197,6 @@ pub fn run() {
             commands::create_project,
             commands::attach_review,
             commands::restack_pr,
-            commands::load_plan_from_path,
             commands::fetch_authored_prs,
             commands::fetch_review_requests,
             commands::shell::spawn_shell,
@@ -210,7 +212,7 @@ pub fn run() {
         .expect("error running tauri application");
 }
 
-/// Settle plan state after a planner (`AgentMode::Plan`) completion.
+/// Settle a project's plan after a planner (`AgentMode::Plan`) completion.
 ///
 /// Clears the running agent, ingests the planner's written markdown (when a
 /// `plan_path` is recorded and the file is present and non-empty) by parsing it
@@ -218,14 +220,15 @@ pub fn run() {
 ///   * `Dispatched` (rework) -> `Reworked` (also clears ephemeral comments).
 ///   * `Pending` (initial artifact-fill) stays `Pending`.
 ///
-/// Read/parse failures are non-fatal (Invariant 1): the prior doc is kept and
-/// the failure is logged rather than blocking the loop.
-fn ingest_plan_output(state: &AppState) {
+/// Keyed by [`ProjectId`] (the completion event's `object_id`) so the correct
+/// project's plan is updated. Read/parse failures are non-fatal (Invariant 1):
+/// the prior doc is kept and the failure is logged rather than blocking the loop.
+fn ingest_plan_output(state: &AppState, project_id: &ProjectId) {
     use cockpit_core::gate::Gated;
     use cockpit_core::model::GateState;
 
     // Read + parse outside the store lock; only touch on-disk state here.
-    let parsed = state.plan.get().and_then(|plan| {
+    let parsed = state.projects.plan(project_id).and_then(|plan| {
         let path = plan.plan_path.clone()?;
         match std::fs::read_to_string(&path) {
             Ok(raw) if !raw.trim().is_empty() => match cockpit_core::plan_parser::parse(&raw) {
@@ -249,7 +252,10 @@ fn ingest_plan_output(state: &AppState) {
         }
     });
 
-    state.plan.update(|plan| {
+    state.projects.update_plan(project_id, |slot| {
+        let Some(plan) = slot.as_mut() else {
+            return;
+        };
         plan.agent = None;
         if let Some(doc) = parsed {
             plan.doc = doc;

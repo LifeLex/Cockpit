@@ -146,7 +146,8 @@ function App() {
   const addPlanComment = useAppStore((s) => s.addPlanComment);
   const planRequestChanges = useAppStore((s) => s.planRequestChanges);
   const planApprove = useAppStore((s) => s.planApprove);
-  const openPlan = useAppStore((s) => s.openPlan);
+  const planOpen = useAppStore((s) => s.planOpen);
+  const generatePlan = useAppStore((s) => s.generatePlan);
   const batchStatus = useAppStore((s) => s.batchStatus);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
@@ -237,7 +238,6 @@ function App() {
   useEffect(() => {
     void fetchReviews();
     void fetchFrontier();
-    void fetchPlan();
     void fetchConfig();
     void fetchAuthoredPrs();
     void listProjects();
@@ -245,7 +245,12 @@ function App() {
     const unlisten = listen<CompletionEventPayload>("agent-completed", (event) => {
       void fetchReviews();
       void fetchFrontier();
-      void fetchPlan();
+      void listProjects();
+      // Refresh the open plan (if any) so a completed Plan agent updates it.
+      const currentView = useAppStore.getState().view;
+      if (currentView.kind === "plan") {
+        void fetchPlan(currentView.project);
+      }
       void refreshActiveReview();
 
       // Best-effort desktop notification. Use the event payload's mode
@@ -334,17 +339,13 @@ function App() {
     [openReview, navigateToDiff, authoredPrs, reviewRequests, reviews],
   );
 
-  // Opening a project routes to its plan gate when a plan exists, otherwise to
-  // the project-grouped PRs list.
+  // Opening a project always routes to its plan gate. When the project has no
+  // plan yet, PlanView surfaces a "Generate plan" affordance.
   const handleOpenProject = useCallback(
     (project: Project) => {
-      if (project.plan !== null) {
-        navigateToPlan();
-      } else {
-        navigateToPrs();
-      }
+      navigateToPlan(project.id);
     },
-    [navigateToPlan, navigateToPrs],
+    [navigateToPlan],
   );
 
   const handleNavigate = useCallback(
@@ -365,12 +366,12 @@ function App() {
         case "agents":
           navigateToAgents();
           break;
-        case "plan":
-          navigateToPlan();
-          break;
         case "settings":
           navigateToSettings();
           break;
+        // "plan" and "diff" are drill-in views that require an id, so they are
+        // not reachable from the generic (id-less) sidebar navigation.
+        case "plan":
         case "diff":
           break;
         default:
@@ -383,7 +384,6 @@ function App() {
       navigateToNewProject,
       navigateToSkills,
       navigateToAgents,
-      navigateToPlan,
       navigateToSettings,
     ],
   );
@@ -611,39 +611,35 @@ function App() {
           />
         );
 
-      case "plan":
+      case "plan": {
+        const projectId = view.project;
         return (
           <div className="mx-auto max-w-4xl px-6 py-8">
             {errorBanner}
 
-            {plan !== null ? (
-              <PlanView
-                plan={plan}
-                onAddComment={(anchor, body) => {
-                  void addPlanComment(anchor, body);
-                }}
-                onRequestChanges={() => {
-                  void planRequestChanges();
-                }}
-                onApprove={() => {
-                  void planApprove();
-                }}
-                onOpen={() => {
-                  void openPlan();
-                }}
-                onFetchBatchStatus={() => batchStatus()}
-              />
-            ) : (
-              <EmptyState
-                icon="📋"
-                title="No plan loaded"
-                description="Create a project with the plan gate enabled to get started."
-                actionLabel="Go to Projects"
-                onAction={navigateToProjects}
-              />
-            )}
+            <PlanView
+              projectId={projectId}
+              plan={plan}
+              onGenerate={() => {
+                void generatePlan(projectId);
+              }}
+              onAddComment={(anchor, body) => {
+                void addPlanComment(projectId, anchor, body);
+              }}
+              onRequestChanges={() => {
+                void planRequestChanges(projectId);
+              }}
+              onApprove={() => {
+                void planApprove(projectId);
+              }}
+              onOpen={() => {
+                void planOpen(projectId);
+              }}
+              onFetchBatchStatus={() => batchStatus(projectId)}
+            />
           </div>
         );
+      }
 
       case "projects":
         return (

@@ -1,5 +1,8 @@
-//! In-memory stores for active [`Review`]s, the optional [`ProjectPlan`], and
-//! first-class [`Project`]s.
+//! In-memory stores for active [`Review`]s and first-class [`Project`]s.
+//!
+//! Each project owns its optional [`ProjectPlan`] (see [`Project::plan`]); the
+//! plan gate operates per project via [`ProjectStore::update_plan`] and
+//! [`ProjectStore::plan`].
 //!
 //! These back [`AppState`](../../app/src-tauri) and are driven by the Tauri
 //! commands. Thread-safe in-memory access via `Arc<Mutex<…>>`; the app owns
@@ -138,61 +141,6 @@ pub fn batch_status(store: &ReviewStore, project: Option<&ProjectId>) -> BatchSt
 }
 
 // ---------------------------------------------------------------------------
-// PlanStore (in-memory)
-// ---------------------------------------------------------------------------
-
-/// Thread-safe in-memory store for the optional project plan.
-///
-/// Holds at most one [`ProjectPlan`]. Uses `std::sync::Mutex` because the lock
-/// is held only for trivial get/set operations (no `.await` while locked).
-#[derive(Debug, Clone, Default)]
-pub struct PlanStore {
-    inner: Arc<Mutex<Option<ProjectPlan>>>,
-}
-
-impl PlanStore {
-    /// Create an empty plan store.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the project plan, replacing any existing one.
-    pub fn set(&self, plan: ProjectPlan) {
-        // INVARIANT: lock held only for an Option assignment — no .await, no blocking.
-        let mut guard = self.inner.lock().expect("plan store lock poisoned");
-        *guard = Some(plan);
-    }
-
-    /// Get a clone of the current project plan, if any.
-    pub fn get(&self) -> Option<ProjectPlan> {
-        // INVARIANT: lock held only for an Option read — no .await, no blocking.
-        let guard = self.inner.lock().expect("plan store lock poisoned");
-        guard.clone()
-    }
-
-    /// Apply a mutation to the stored plan.
-    ///
-    /// Returns `true` if a plan was present and updated, `false` otherwise.
-    pub fn update(&self, f: impl FnOnce(&mut ProjectPlan)) -> bool {
-        // INVARIANT: lock held only for an Option op — no .await, no blocking.
-        let mut guard = self.inner.lock().expect("plan store lock poisoned");
-        if let Some(plan) = guard.as_mut() {
-            f(plan);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Remove the stored plan, returning it if present.
-    pub fn clear(&self) -> Option<ProjectPlan> {
-        // INVARIANT: lock held only for an Option op — no .await, no blocking.
-        let mut guard = self.inner.lock().expect("plan store lock poisoned");
-        guard.take()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ProjectStore (in-memory)
 // ---------------------------------------------------------------------------
 
@@ -251,6 +199,31 @@ impl ProjectStore {
         // INVARIANT: lock held only for a HashMap op, no .await, no blocking.
         let map = self.inner.lock().expect("project store lock poisoned");
         map.values().cloned().collect()
+    }
+
+    /// Get a clone of the plan owned by the given project, if any.
+    ///
+    /// Returns `None` when the project is unknown or has no plan yet.
+    pub fn plan(&self, id: &ProjectId) -> Option<ProjectPlan> {
+        // INVARIANT: lock held only for a HashMap op, no .await, no blocking.
+        let map = self.inner.lock().expect("project store lock poisoned");
+        map.get(id).and_then(|p| p.plan.clone())
+    }
+
+    /// Mutate the plan slot of the given project.
+    ///
+    /// The closure receives the project's `Option<ProjectPlan>` so it can read,
+    /// set, replace, or clear the plan. Returns `true` if the project exists (and
+    /// the closure ran), `false` if the project is unknown.
+    pub fn update_plan(&self, id: &ProjectId, f: impl FnOnce(&mut Option<ProjectPlan>)) -> bool {
+        // INVARIANT: lock held only for a HashMap op, no .await, no blocking.
+        let mut map = self.inner.lock().expect("project store lock poisoned");
+        if let Some(project) = map.get_mut(id) {
+            f(&mut project.plan);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -357,7 +330,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // PlanStore tests
+    // Plan helpers (per-project) — shared fixture
     // ---------------------------------------------------------------
 
     use crate::model::{PlanDoc, PlanStep, ProjectRef};
@@ -381,58 +354,6 @@ mod tests {
             agent: None,
             plan_path: None,
         }
-    }
-
-    #[test]
-    fn plan_store_set_and_get() {
-        let store = PlanStore::new();
-        assert!(store.get().is_none(), "empty store should return None");
-
-        let plan = make_plan();
-        store.set(plan.clone());
-
-        let got = store.get().expect("plan should be present after set");
-        assert_eq!(got.project, plan.project);
-        assert_eq!(got.doc.summary, plan.doc.summary);
-    }
-
-    #[test]
-    fn plan_store_update() {
-        let store = PlanStore::new();
-        let plan = make_plan();
-        store.set(plan);
-
-        let updated = store.update(|p| {
-            p.gate_state = GateState::InReview;
-        });
-        assert!(updated, "update should return true when plan exists");
-
-        let got = store.get().unwrap();
-        assert_eq!(got.gate_state, GateState::InReview);
-    }
-
-    #[test]
-    fn plan_store_update_empty_returns_false() {
-        let store = PlanStore::new();
-        let updated = store.update(|_| {});
-        assert!(!updated, "update should return false on empty store");
-    }
-
-    #[test]
-    fn plan_store_clear() {
-        let store = PlanStore::new();
-        store.set(make_plan());
-
-        let removed = store.clear();
-        assert!(removed.is_some(), "clear should return the plan");
-        assert!(store.get().is_none(), "store should be empty after clear");
-    }
-
-    #[test]
-    fn plan_store_clear_empty() {
-        let store = PlanStore::new();
-        let removed = store.clear();
-        assert!(removed.is_none(), "clear on empty store returns None");
     }
 
     // ---------------------------------------------------------------
@@ -481,6 +402,41 @@ mod tests {
         let removed = store.remove(&ProjectId::new("p-1")).expect("removed");
         assert_eq!(removed.name, "renamed");
         assert!(store.get(&ProjectId::new("p-1")).is_none());
+    }
+
+    #[test]
+    fn project_store_plan_set_get_and_update() {
+        let store = ProjectStore::new();
+        let id = ProjectId::new("p-1");
+        store.insert(make_project("p-1", ProjectSource::AdHoc));
+
+        // No plan initially.
+        assert!(store.plan(&id).is_none(), "new project has no plan");
+
+        // Set a plan via update_plan.
+        let existed = store.update_plan(&id, |slot| *slot = Some(make_plan()));
+        assert!(existed, "update_plan returns true for a known project");
+        let got = store.plan(&id).expect("plan present after set");
+        assert_eq!(got.gate_state, GateState::Pending);
+
+        // Mutate the existing plan in place.
+        store.update_plan(&id, |slot| {
+            if let Some(plan) = slot.as_mut() {
+                plan.gate_state = GateState::InReview;
+            }
+        });
+        assert_eq!(
+            store.plan(&id).expect("plan present").gate_state,
+            GateState::InReview
+        );
+    }
+
+    #[test]
+    fn project_store_update_plan_unknown_project_returns_false() {
+        let store = ProjectStore::new();
+        let existed = store.update_plan(&ProjectId::new("nope"), |slot| *slot = Some(make_plan()));
+        assert!(!existed, "update_plan returns false for an unknown project");
+        assert!(store.plan(&ProjectId::new("nope")).is_none());
     }
 
     #[test]

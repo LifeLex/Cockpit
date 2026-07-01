@@ -11,7 +11,7 @@ use cockpit_core::adapters::agent::SessionMap;
 use cockpit_core::adapters::lsp::LspBridge;
 use cockpit_core::config::LspLanguage;
 use cockpit_core::hook_server::CompletionEvent;
-use cockpit_core::store::{PlanStore, ProjectStore, ReviewStore};
+use cockpit_core::store::{ProjectStore, ReviewStore};
 
 /// Holds core handles shared across the Tauri app.
 ///
@@ -21,9 +21,9 @@ pub struct AppState {
     /// In-memory store of active reviews.
     pub reviews: ReviewStore,
     /// In-memory store of first-class projects that group reviews.
+    ///
+    /// Each project owns its optional plan; the plan gate operates per project.
     pub projects: ProjectStore,
-    /// In-memory store for the optional project plan.
-    pub plan: PlanStore,
     /// Maps agent session IDs to their reviewed objects.
     ///
     /// Shared with the hook server to look up which review an agent
@@ -51,7 +51,6 @@ impl AppState {
         Self {
             reviews: ReviewStore::new(),
             projects: ProjectStore::new(),
-            plan: PlanStore::new(),
             sessions: SessionMap::new(),
             completion_tx,
             lsp_bridges: Mutex::new(HashMap::new()),

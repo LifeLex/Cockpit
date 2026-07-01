@@ -59,6 +59,7 @@ import {
   XCircle,
   Loader2,
   Wrench,
+  Layers,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -465,6 +466,10 @@ export function DiffView({
   const [ciSummary, setCiSummary] = useState<CiSummary | null>(null);
   const [fixingCi, setFixingCi] = useState(false);
 
+  // -- Restack state --
+  const restackPr = useAppStore((s) => s.restackPr);
+  const [restacking, setRestacking] = useState(false);
+
   // -- Refs --
   const activeFileRef = useRef<HTMLButtonElement | null>(null);
   const diffEditorRef = useRef<MonacoDiffEditor | null>(null);
@@ -850,6 +855,15 @@ export function DiffView({
     }
   }, [prRef]);
 
+  const handleRestack = useCallback(async () => {
+    setRestacking(true);
+    try {
+      await restackPr(prRef);
+    } finally {
+      setRestacking(false);
+    }
+  }, [restackPr, prRef]);
+
   const handleSubmitReview = useCallback(async () => {
     const commentCount = review.comments.filter((c) => isLocalOrigin(c.origin)).length;
     if (commentCount === 0) return;
@@ -1046,6 +1060,22 @@ export function DiffView({
             <Bot className="h-3.5 w-3.5" />
             Agent
           </Button>
+
+          {/* Restack — explicit user action; only when the review is stale.
+              Operates only on the review's own branch (Invariant 5 / §9). */}
+          {review.stale && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="border-danger/40 text-danger hover:bg-danger/10"
+              onClick={() => void handleRestack()}
+              disabled={restacking || review.agent != null}
+              title="Rebase this review onto its parent's new head"
+            >
+              <Layers className="h-3.5 w-3.5" />
+              {restacking || review.agent != null ? "Restacking…" : "Restack"}
+            </Button>
+          )}
 
           {/* Fix CI failures — explicit user action; only when CI is failing */}
           {ciSummary !== null && ciSummary.failed > 0 && (

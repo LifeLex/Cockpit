@@ -120,6 +120,15 @@ interface AppStore {
   /** Approve a single review by PR ref (explicit user action). */
   approveReview: (pr: string) => Promise<void>;
 
+  /**
+   * Restack a stale review onto its parent's new head (explicit user action).
+   *
+   * A clean rebase clears the stale flag; on conflict the backend spawns the
+   * conflict-resolver agent and returns the review with an active agent run.
+   * Failure is non-fatal: it sets the store `error` and never blocks the loop.
+   */
+  restackPr: (pr: string) => Promise<void>;
+
   // -------------------------------------------------------------------------
   // Config
   // -------------------------------------------------------------------------
@@ -536,6 +545,23 @@ export const useAppStore = create<AppStore>((set, get) => ({
       await invoke<Review>("approve_review", { pr });
       await get().fetchFrontier();
       await get().fetchReviews();
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  restackPr: async (pr: string) => {
+    try {
+      const review = await invoke<Review>("restack_pr", { pr });
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      set({
+        activeReview:
+          get().activeReview?.pr === review.pr ? review : get().activeReview,
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        frontier: get().frontier.map(replace),
+        reviews: get().reviews.map(replace),
+      });
     } catch (e: unknown) {
       set({ error: String(e) });
     }

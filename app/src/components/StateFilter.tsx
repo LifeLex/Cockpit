@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { gateStateLabel } from "./GatePill";
 import type { GateState } from "../bindings/GateState";
 import type { Review } from "../bindings/Review";
 
@@ -22,24 +23,6 @@ const GATE_STATES = [
   "Reworked",
   "Approved",
 ] as const satisfies readonly GateState[];
-
-/** Human-readable label for each gate state. */
-function gateStateLabel(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "Pending";
-    case "InReview":
-      return "In Review";
-    case "Dispatched":
-      return "Dispatched";
-    case "Reworked":
-      return "Reworked";
-    case "Approved":
-      return "Approved";
-    default:
-      return assertNever(state);
-  }
-}
 
 /** Tailwind classes for an active (selected) chip of the given state. */
 function activeChipClass(state: GateState): string {

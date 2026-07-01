@@ -462,7 +462,7 @@ export function CiPanel({ pr, active }: CiPanelProps) {
           </div>
         ) : checks.length === 0 ? (
           <EmptyState
-            icon="🟢"
+            icon={CheckCircle2}
             title="No CI checks"
             description="No CI checks were found for this PR. It may not be a GitHub PR, GitHub may not be reachable, or no workflows have run yet."
           />

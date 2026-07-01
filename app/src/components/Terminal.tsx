@@ -79,26 +79,30 @@ function Terminal({ id, cwd, onClose }: TerminalProps) {
       fontFamily: "'SF Mono', 'Fira Code', 'Cascadia Code', monospace",
       fontSize: 13,
       lineHeight: 1.2,
+      // Palette derived from the Glass Cockpit design tokens in `app.css`
+      // (dark theme): background #0b0e12, foreground #e6ebf1, teal cursor
+      // #4fd4d6, and ANSI colors harmonized to the state palette.
       theme: {
-        background: "#0a0a0a",
-        foreground: "#e5e5e5",
-        cursor: "#e5e5e5",
-        selectionBackground: "#3a3a3a",
-        black: "#0a0a0a",
-        red: "#e06c75",
-        green: "#98c379",
-        yellow: "#e5c07b",
-        blue: "#61afef",
-        magenta: "#c678dd",
-        cyan: "#56b6c2",
-        white: "#e5e5e5",
-        brightBlack: "#5c6370",
-        brightRed: "#e06c75",
-        brightGreen: "#98c379",
-        brightYellow: "#e5c07b",
-        brightBlue: "#61afef",
-        brightMagenta: "#c678dd",
-        brightCyan: "#56b6c2",
+        background: "#0b0e12",
+        foreground: "#e6ebf1",
+        cursor: "#4fd4d6",
+        cursorAccent: "#0b0e12",
+        selectionBackground: "#4fd4d633",
+        black: "#0b0e12",
+        red: "#ff5c6c",
+        green: "#3ecf8e",
+        yellow: "#f2b544",
+        blue: "#5b8cff",
+        magenta: "#c084fc",
+        cyan: "#4fd4d6",
+        white: "#e6ebf1",
+        brightBlack: "#5b6675",
+        brightRed: "#ff5c6c",
+        brightGreen: "#3ecf8e",
+        brightYellow: "#f2b544",
+        brightBlue: "#5b8cff",
+        brightMagenta: "#c084fc",
+        brightCyan: "#4fd4d6",
         brightWhite: "#ffffff",
       },
     });
@@ -198,7 +202,7 @@ function Terminal({ id, cwd, onClose }: TerminalProps) {
       <div
         ref={containerRef}
         className="flex-1 min-h-0"
-        style={{ backgroundColor: "#0a0a0a" }}
+        style={{ backgroundColor: "#0b0e12" }}
       />
     </div>
   );

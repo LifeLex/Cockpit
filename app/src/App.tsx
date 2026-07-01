@@ -25,7 +25,16 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Search, LayoutGrid, Rows3 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import {
+  Search,
+  LayoutGrid,
+  Rows3,
+  FileText,
+  Eye,
+  Rocket,
+  FolderOpen,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { sortByAttention } from "./lib/attention";
 import type { CardDensity } from "./components/ReviewCard";
@@ -477,7 +486,7 @@ function App() {
     ));
   }
 
-  function renderPrsContent(items: readonly Review[], emptyIcon: string, emptyTitle: string, emptyDescription: string) {
+  function renderPrsContent(items: readonly Review[], emptyIcon: LucideIcon, emptyTitle: string, emptyDescription: string) {
     if (prFetchLoading && items.length === 0) {
       return <SkeletonList count={4} />;
     }
@@ -615,7 +624,7 @@ function App() {
               <TabsContent value="my-prs">
                 {renderPrsContent(
                   authoredPrs,
-                  "📝",
+                  FileText,
                   "No open PRs",
                   "Click Refresh to fetch your open PRs from GitHub. Make sure your repo path is configured in Settings.",
                 )}
@@ -624,7 +633,7 @@ function App() {
               <TabsContent value="review-requests">
                 {renderPrsContent(
                   reviewRequests,
-                  "👀",
+                  Eye,
                   "No review requests",
                   "No PRs are waiting for your review. Click Refresh to check again.",
                 )}
@@ -636,7 +645,7 @@ function App() {
                 ) : (
                   (renderProjectGroupedList(reviews) ?? (
                     <EmptyState
-                      icon="🚀"
+                      icon={Rocket}
                       title="No reviews yet"
                       description="Create a project or import from Linear under Projects, or switch to Mine to review existing GitHub PRs."
                       actionLabel="Go to Projects"
@@ -721,7 +730,7 @@ function App() {
             </div>
             {projects.length === 0 ? (
               <EmptyState
-                icon="📁"
+                icon={FolderOpen}
                 title="No projects yet"
                 description="Create an ad-hoc project or import one from Linear."
                 actionLabel="New Project"

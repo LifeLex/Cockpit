@@ -39,6 +39,7 @@ import { registerCustomThemes } from "@/lib/monaco-themes";
 import { attachLspClient, type LspAttachment } from "@/lib/lsp-client";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { GatePill } from "./GatePill";
 import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -98,40 +99,6 @@ interface PortalEntry {
 
 function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
-}
-
-function gateStateLabel(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "Pending";
-    case "InReview":
-      return "In Review";
-    case "Dispatched":
-      return "Dispatched";
-    case "Reworked":
-      return "Reworked";
-    case "Approved":
-      return "Approved";
-    default:
-      return assertNever(state);
-  }
-}
-
-function gateStateBadgeClass(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "bg-state-pending/20 text-state-pending border-state-pending/30";
-    case "InReview":
-      return "bg-state-in-review/20 text-state-in-review border-state-in-review/30";
-    case "Dispatched":
-      return "bg-state-dispatched/20 text-state-dispatched border-state-dispatched/30";
-    case "Reworked":
-      return "bg-state-reworked/20 text-state-reworked border-state-reworked/30";
-    case "Approved":
-      return "bg-state-approved/20 text-state-approved border-state-approved/30";
-    default:
-      return assertNever(state);
-  }
 }
 
 /** Status-LED background color for a gate state, using `--color-state-*`. */
@@ -969,15 +936,7 @@ export function DiffView({
               <span className="truncate font-display text-sm font-semibold text-foreground">
                 {review.branch}
               </span>
-              <Badge
-                variant="outline"
-                className={cn(
-                  "shrink-0",
-                  gateStateBadgeClass(review.gate_state),
-                )}
-              >
-                {gateStateLabel(review.gate_state)}
-              </Badge>
+              <GatePill state={review.gate_state} />
               {review.stale && (
                 <span className="inline-flex shrink-0 items-center gap-1 text-xs text-danger">
                   <AlertTriangle className="h-3 w-3" /> Stale

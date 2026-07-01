@@ -24,7 +24,11 @@ import { StateFilter } from "./components/StateFilter";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
-import { Search } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { Search, LayoutGrid, Rows3 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { sortByAttention } from "./lib/attention";
+import type { CardDensity } from "./components/ReviewCard";
 import type { GateState } from "./bindings/GateState";
 import type { Review } from "./bindings/Review";
 import type { Project } from "./bindings/Project";
@@ -40,6 +44,14 @@ interface CompletionEventPayload {
 type ReviewTab = "my-prs" | "review-requests" | "all";
 
 const SIDEBAR_COLLAPSED_KEY = "cockpit-sidebar-collapsed";
+const PRS_DENSITY_KEY = "cockpit-prs-density";
+
+/** Read the persisted board density, defaulting to the roomy card layout. */
+function loadDensity(): CardDensity {
+  return localStorage.getItem(PRS_DENSITY_KEY) === "compact"
+    ? "compact"
+    : "cards";
+}
 
 function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
@@ -156,6 +168,13 @@ function App() {
   });
 
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+
+  const [prsDensity, setPrsDensity] = useState<CardDensity>(loadDensity);
+
+  const setDensity = useCallback((density: CardDensity) => {
+    setPrsDensity(density);
+    localStorage.setItem(PRS_DENSITY_KEY, density);
+  }, []);
 
   const toggleSidebar = useCallback(() => {
     setSidebarCollapsed((prev) => {
@@ -437,17 +456,18 @@ function App() {
 
     return groups.map((group) => (
       <section key={group.key} className="mb-6">
-        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+        <h2 className="mb-3 font-display text-sm font-semibold uppercase tracking-wide text-muted-foreground">
           {group.title}{" "}
           <span className="ml-1 text-xs font-normal">
             ({group.reviews.length})
           </span>
         </h2>
-        <div className="space-y-3">
-          {group.reviews.map((review) => (
+        <div className={prsDensity === "compact" ? "space-y-1.5" : "space-y-3"}>
+          {sortByAttention(group.reviews).map((review) => (
             <ReviewCard
               key={review.id}
               review={review}
+              density={prsDensity}
               onAction={handleReviewAction}
               onRestack={handleRestack}
             />
@@ -528,16 +548,17 @@ function App() {
               </div>
 
               <div className="mb-4 flex items-center gap-3">
-                <div className="relative">
-                  <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                  <input
+                <div className="relative w-52">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
                     type="text"
                     value={searchQuery}
                     onChange={(e) => {
                       setSearchQuery(e.target.value);
                     }}
                     placeholder="Search PRs..."
-                    className="h-8 w-52 rounded-md border border-border bg-background pl-8 pr-3 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                    aria-label="Search PRs"
+                    className="pl-8 text-xs"
                   />
                 </div>
                 <StateFilter
@@ -549,6 +570,46 @@ function App() {
                     setShowStale((prev) => !prev);
                   }}
                 />
+
+                {/* Density toggle: roomy cards vs. dense telemetry rows. */}
+                <div
+                  className="ml-auto flex shrink-0 items-center rounded-lg border border-border p-0.5"
+                  role="group"
+                  aria-label="Board density"
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDensity("cards");
+                    }}
+                    aria-pressed={prsDensity === "cards"}
+                    title="Card view"
+                    className={cn(
+                      "rounded-md p-1.5 transition-colors",
+                      prsDensity === "cards"
+                        ? "bg-muted text-foreground"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    <LayoutGrid className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDensity("compact");
+                    }}
+                    aria-pressed={prsDensity === "compact"}
+                    title="Compact view"
+                    className={cn(
+                      "rounded-md p-1.5 transition-colors",
+                      prsDensity === "compact"
+                        ? "bg-muted text-foreground"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    <Rows3 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
               </div>
 
               <TabsContent value="my-prs">

@@ -1,16 +1,14 @@
-import { Card, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  GitPullRequest,
-  MessageSquare,
-  AlertTriangle,
-  Bot,
-  Layers,
-} from "lucide-react";
+import { Layers } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Review } from "../bindings/Review";
 import type { GateState } from "../bindings/GateState";
+import { cardSignal } from "../lib/card-signal";
+import type { SignalTone } from "../lib/card-signal";
+import { diffStats } from "../diff-parser";
+
+/** Presentation density for the board. */
+export type CardDensity = "cards" | "compact";
 
 interface ReviewCardProps {
   readonly review: Review;
@@ -20,60 +18,47 @@ interface ReviewCardProps {
    * reviews; explicit user action operating on the review's own branch.
    */
   readonly onRestack: (pr: string) => void;
+  /** Presentation density; defaults to the roomy card layout. */
+  readonly density?: CardDensity;
 }
 
 function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
 }
 
-function gateStateLabel(state: GateState): string {
+/** Status-LED color for a gate state, using the `--color-state-*` tokens. */
+function ledColorClass(state: GateState): string {
   switch (state) {
     case "Pending":
-      return "Pending";
+      return "bg-state-pending";
     case "InReview":
-      return "In Review";
+      return "bg-state-in-review";
     case "Dispatched":
-      return "Dispatched";
+      return "bg-state-dispatched";
     case "Reworked":
-      return "Reworked";
+      return "bg-state-reworked";
     case "Approved":
-      return "Approved";
+      return "bg-state-approved";
     default:
       return assertNever(state);
   }
 }
 
-function gateStateBorderClass(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "border-l-state-pending";
-    case "InReview":
-      return "border-l-state-in-review";
-    case "Dispatched":
-      return "border-l-state-dispatched";
-    case "Reworked":
-      return "border-l-state-reworked";
-    case "Approved":
-      return "border-l-state-approved";
+/** Text color for the reason line, keyed off its semantic tone. */
+function toneTextClass(tone: SignalTone): string {
+  switch (tone) {
+    case "attention":
+      return "text-state-in-review";
+    case "running":
+      return "text-state-dispatched";
+    case "warning":
+      return "text-warning";
+    case "done":
+      return "text-state-approved";
+    case "neutral":
+      return "text-muted-foreground";
     default:
-      return assertNever(state);
-  }
-}
-
-function gateStateBadgeClass(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "bg-state-pending/20 text-state-pending border-state-pending/30";
-    case "InReview":
-      return "bg-state-in-review/20 text-state-in-review border-state-in-review/30";
-    case "Dispatched":
-      return "bg-state-dispatched/20 text-state-dispatched border-state-dispatched/30";
-    case "Reworked":
-      return "bg-state-reworked/20 text-state-reworked border-state-reworked/30";
-    case "Approved":
-      return "bg-state-approved/20 text-state-approved border-state-approved/30";
-    default:
-      return assertNever(state);
+      return assertNever(tone);
   }
 }
 
@@ -92,9 +77,9 @@ function actionConfigForState(state: GateState): ActionConfig {
     case "Pending":
       return { label: "Review", variant: "default", muted: false };
     case "InReview":
-      return { label: "Continue", variant: "default", muted: false };
+      return { label: "Review", variant: "default", muted: false };
     case "Dispatched":
-      return { label: "Waiting…", variant: "outline", muted: true };
+      return { label: "Watch", variant: "outline", muted: true };
     case "Reworked":
       return { label: "Re-review", variant: "default", muted: false };
     case "Approved":
@@ -115,70 +100,154 @@ function parsePrDisplay(pr: string): { repo: string; number: string } {
   return { repo: "", number: pr };
 }
 
-export function ReviewCard({ review, onAction, onRestack }: ReviewCardProps) {
+/**
+ * Whether the LED should pulse. Only non-terminal running work (an actively
+ * dispatched agent) pulses; everything else is steady.
+ */
+function ledPulses(review: Review): boolean {
+  return review.gate_state === "Dispatched" && !review.stale;
+}
+
+/**
+ * Whether the whole card is de-emphasized. Approved and stale reviews are
+ * settled or blocked, so they dim to let attention items stand out.
+ */
+function isDimmed(review: Review): boolean {
+  return review.stale || review.gate_state === "Approved";
+}
+
+/** The stack relationship line, or null when the review is not in a stack. */
+function stackRelation(review: Review): string | null {
+  const parts: string[] = [];
+  if (review.parents.length > 0) {
+    parts.push(
+      review.parents.length === 1
+        ? "on parent"
+        : `on ${String(review.parents.length)} parents`,
+    );
+  }
+  if (review.children.length > 0) {
+    parts.push(`parent of ${String(review.children.length)}`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/** LED dot; pulses for running work. */
+function StatusLed({ review }: { readonly review: Review }) {
+  return (
+    <span className="relative flex h-2.5 w-2.5 shrink-0" aria-hidden="true">
+      {ledPulses(review) && (
+        <span
+          className={cn(
+            "absolute inline-flex h-full w-full animate-ping rounded-full opacity-60",
+            ledColorClass(review.gate_state),
+          )}
+        />
+      )}
+      <span
+        className={cn(
+          "relative inline-flex h-2.5 w-2.5 rounded-full",
+          ledColorClass(review.gate_state),
+        )}
+      />
+    </span>
+  );
+}
+
+/** Numeric telemetry chips (comments, diff +/-) shared by both densities. */
+function TelemetryChips({ review }: { readonly review: Review }) {
+  const { additions, deletions } = diffStats(review.diff.raw);
+  const hasDiff = additions > 0 || deletions > 0;
+  return (
+    <>
+      {review.comments.length > 0 && (
+        <span className="inline-flex items-center gap-1 font-mono tabular-nums text-muted-foreground">
+          <span className="text-state-in-review">{"●"}</span>
+          {review.comments.length}
+        </span>
+      )}
+      {hasDiff && (
+        <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
+          <span className="text-success">+{additions}</span>
+          <span className="text-danger">
+            {"−"}
+            {deletions}
+          </span>
+        </span>
+      )}
+    </>
+  );
+}
+
+/** Restack button; only meaningful for stale reviews. */
+function RestackButton({
+  review,
+  onRestack,
+}: {
+  readonly review: Review;
+  readonly onRestack: (pr: string) => void;
+}) {
+  const running = review.agent !== null;
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      className="border-warning/40 text-warning hover:bg-warning/10"
+      disabled={running}
+      onClick={() => {
+        onRestack(review.pr);
+      }}
+      title="Rebase this review onto its parent's new head"
+    >
+      <Layers className="h-3.5 w-3.5" />
+      {running ? "Restacking…" : "Restack"}
+    </Button>
+  );
+}
+
+/**
+ * A review-forward PR card. Leads with a status LED and the state-derived
+ * reason ("why this needs you"), then the title and secondary refs, telemetry
+ * chips, and a single primary action. Supports a dense `compact` density that
+ * renders the same data as an aligned telemetry row.
+ */
+export function ReviewCard({
+  review,
+  onAction,
+  onRestack,
+  density = "cards",
+}: ReviewCardProps) {
   const { repo, number: prNumber } = parsePrDisplay(review.pr);
   const action = actionConfigForState(review.gate_state);
+  const signal = cardSignal(review);
+  const relation = stackRelation(review);
+  const dimmed = isDimmed(review);
 
-  return (
-    <Card
-      className={cn(
-        "border-l-4 p-0 transition-colors hover:bg-card/50",
-        gateStateBorderClass(review.gate_state),
-      )}
-    >
-      <CardContent className="p-4">
-        {/* Top row: PR icon + branch + repo slug + gate state badge */}
-        <div className="flex items-center justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <GitPullRequest className="h-4 w-4 shrink-0 text-muted-foreground" />
-            <span className="truncate text-sm font-semibold text-foreground">
-              {review.branch}
-            </span>
-            {repo !== "" && (
-              <span className="shrink-0 text-xs text-muted-foreground">
-                {repo}#{prNumber}
-              </span>
-            )}
-          </div>
-          <Badge
-            variant="outline"
-            className={cn(
-              "shrink-0",
-              gateStateBadgeClass(review.gate_state),
-            )}
-          >
-            {gateStateLabel(review.gate_state)}
-          </Badge>
-        </div>
-
-        {/* Middle row: issue ref, base branch, comment count, stale, agent */}
-        <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-          <span>{review.issue}</span>
-          <span className="text-muted-foreground">
-            base: {review.base}
+  if (density === "compact") {
+    return (
+      <div
+        className={cn(
+          "group flex items-center gap-3 rounded-lg border border-border bg-card px-3 py-2 transition-colors hover:bg-card/60",
+          dimmed && "opacity-60 hover:opacity-100",
+        )}
+      >
+        <StatusLed review={review} />
+        <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
+          {review.branch}
+        </span>
+        <span className={cn("shrink-0 text-xs font-medium", toneTextClass(signal.tone))}>
+          {signal.reason}
+        </span>
+        <span className="hidden shrink-0 items-center gap-3 text-xs sm:flex">
+          <TelemetryChips review={review} />
+        </span>
+        {repo !== "" && (
+          <span className="hidden shrink-0 font-mono text-xs text-muted-foreground md:inline">
+            {repo}#{prNumber}
           </span>
-          {review.comments.length > 0 && (
-            <span className="inline-flex items-center gap-1 text-muted-foreground">
-              <MessageSquare className="h-3 w-3" />
-              {review.comments.length}
-            </span>
-          )}
-          {review.stale && (
-            <span className="inline-flex items-center gap-1 text-danger">
-              <AlertTriangle className="h-3 w-3" />
-              Stale
-            </span>
-          )}
-          {review.agent != null && (
-            <span className="inline-flex items-center gap-1 text-warning">
-              <Bot className="h-3 w-3" />
-              PID {review.agent.pid}
-            </span>
-          )}
-        </div>
-
-        {/* Bottom row: context-aware action button */}
-        <div className="mt-3 flex items-center gap-2">
+        )}
+        <div className="flex shrink-0 items-center gap-2 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
+          {review.stale && <RestackButton review={review} onRestack={onRestack} />}
           <Button
             variant={action.variant}
             size="sm"
@@ -189,26 +258,76 @@ export function ReviewCard({ review, onAction, onRestack }: ReviewCardProps) {
           >
             {action.label}
           </Button>
-
-          {/* Restack — only for stale reviews; explicit user action on the
-              review's own branch. Disabled while the conflict-resolver runs. */}
-          {review.stale && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="border-danger/40 text-danger hover:bg-danger/10"
-              disabled={review.agent != null}
-              onClick={() => {
-                onRestack(review.pr);
-              }}
-              title="Rebase this review onto its parent's new head"
-            >
-              <Layers className="h-3.5 w-3.5" />
-              {review.agent != null ? "Restacking…" : "Restack"}
-            </Button>
-          )}
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={cn(
+        "rounded-xl border border-border bg-card p-4 transition-colors hover:bg-card/60",
+        dimmed && "opacity-70 hover:opacity-100",
+      )}
+    >
+      <div className="flex items-start gap-3">
+        <span className="mt-1">
+          <StatusLed review={review} />
+        </span>
+
+        <div className="min-w-0 flex-1">
+          {/* Reason line — the card's headline signal. */}
+          <div
+            className={cn(
+              "text-xs font-semibold uppercase tracking-wide",
+              toneTextClass(signal.tone),
+            )}
+          >
+            {signal.reason}
+          </div>
+
+          {/* Title = the branch/PR subject. */}
+          <div className="mt-1 truncate text-sm font-semibold text-foreground">
+            {review.branch}
+          </div>
+
+          {/* Secondary refs (mono, faint). */}
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 font-mono text-xs text-muted-foreground">
+            {repo !== "" && (
+              <span>
+                {repo}#{prNumber}
+              </span>
+            )}
+            <span>{review.issue}</span>
+            {relation !== null && (
+              <span className="inline-flex items-center gap-1 text-muted-foreground">
+                <Layers className="h-3 w-3" />
+                {relation}
+              </span>
+            )}
+          </div>
+
+          {/* Telemetry chips. */}
+          <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+            <TelemetryChips review={review} />
+          </div>
+        </div>
+
+        {/* Primary action; secondary (Restack) as ghost when stale. */}
+        <div className="flex shrink-0 flex-col items-end gap-2">
+          <Button
+            variant={action.variant}
+            size="sm"
+            className={action.muted ? "opacity-60" : undefined}
+            onClick={() => {
+              onAction(review.pr);
+            }}
+          >
+            {action.label}
+          </Button>
+          {review.stale && <RestackButton review={review} onRestack={onRestack} />}
+        </div>
+      </div>
+    </div>
   );
 }

@@ -104,6 +104,10 @@ export function ReviewWorkspace({
     setActiveTab((prev) => (prev === "agent" ? "diff" : "agent"));
   }, []);
 
+  const openAgentTab = useCallback(() => {
+    setActiveTab("agent");
+  }, []);
+
   const switchToShellTab = useCallback(() => {
     setActiveTab("shell");
   }, []);
@@ -177,6 +181,7 @@ export function ReviewWorkspace({
               onAddComment={onAddComment}
               onRequestChanges={onRequestChanges}
               onMirrorComments={onMirrorComments}
+              onOpenAgent={openAgentTab}
             />
           </div>
         )}
@@ -187,9 +192,7 @@ export function ReviewWorkspace({
         )}
         {mountedTabs.has("agent") && (
           <div className={cn("flex min-h-0 flex-1 flex-col", activeTab !== "agent" && "hidden")}>
-            <div className="flex-1 min-h-0 [&>div]:max-h-none [&>div]:h-full [&>div]:shrink">
-              <AgentPanel visible onClose={() => { setActiveTab("diff"); }} />
-            </div>
+            <AgentPanel visible onClose={() => { setActiveTab("diff"); }} />
           </div>
         )}
         {mountedTabs.has("shell") && (

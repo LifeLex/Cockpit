@@ -37,7 +37,6 @@ import { elapsedSince } from "@/lib/relative-time";
 import { useAppStore } from "../store";
 import { registerCustomThemes } from "@/lib/monaco-themes";
 import { attachLspClient, type LspAttachment } from "@/lib/lsp-client";
-import { AgentPanel } from "./AgentPanel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
@@ -77,6 +76,8 @@ interface DiffViewProps {
   ) => Promise<void>;
   readonly onRequestChanges: () => Promise<void>;
   readonly onMirrorComments: () => Promise<MirrorResult | null>;
+  /** Switch the enclosing workspace to the canonical Agent tab. */
+  readonly onOpenAgent: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +477,7 @@ export function DiffView({
   onAddComment,
   onRequestChanges,
   onMirrorComments,
+  onOpenAgent,
 }: DiffViewProps) {
   // -- Agent C: editor theme from store --
   const editorTheme = useAppStore((s) => s.editorTheme);
@@ -496,9 +498,6 @@ export function DiffView({
   const [diffMode, setDiffMode] = useState<"split" | "unified">("split");
   const [stackOpen, setStackOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [agentPanelVisible, setAgentPanelVisible] = useState(
-    review.gate_state === "Dispatched",
-  );
 
   // -- Inline comment state --
   const [activeCommentLine, setActiveCommentLine] = useState<number | null>(
@@ -1143,14 +1142,12 @@ export function DiffView({
         <div className="flex shrink-0 items-center gap-2">
           {/* Secondary cluster: ghost/outline actions. */}
           <div className="flex items-center gap-1.5">
-            {/* Agent panel toggle. */}
+            {/* Jump to the canonical Agent tab (activity timeline). */}
             <Button
-              variant={agentPanelVisible ? "outline" : "ghost"}
+              variant="ghost"
               size="sm"
-              onClick={() => {
-                setAgentPanelVisible((prev) => !prev);
-              }}
-              title="Toggle agent panel"
+              onClick={onOpenAgent}
+              title="Open the agent activity timeline"
             >
               <Bot className="h-3.5 w-3.5" />
               Agent
@@ -1544,14 +1541,6 @@ export function DiffView({
             </span>
           )}
       </div>
-
-      {/* Agent B: agent activity panel */}
-      <AgentPanel
-        visible={agentPanelVisible}
-        onClose={() => {
-          setAgentPanelVisible(false);
-        }}
-      />
     </div>
   );
 }

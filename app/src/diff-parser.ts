@@ -119,6 +119,36 @@ function parseDiff(raw: string): readonly FileDiff[] {
   return results;
 }
 
+/** Added / removed line counts for a raw unified diff. */
+interface DiffStats {
+  /** Number of added (`+`) content lines. */
+  readonly additions: number;
+  /** Number of removed (`-`) content lines. */
+  readonly deletions: number;
+}
+
+/**
+ * Count added and removed lines in a raw unified diff.
+ *
+ * Only content lines are counted: the `+++`/`---` file headers are excluded so
+ * a single-file diff does not report a phantom +1/-1.
+ */
+function diffStats(raw: string): DiffStats {
+  let additions = 0;
+  let deletions = 0;
+  for (const line of raw.split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) {
+      continue;
+    }
+    if (line.startsWith("+")) {
+      additions += 1;
+    } else if (line.startsWith("-")) {
+      deletions += 1;
+    }
+  }
+  return { additions, deletions };
+}
+
 /**
  * Extract the list of changed file paths from a raw unified diff.
  */
@@ -135,5 +165,5 @@ function extractFilePaths(raw: string): readonly string[] {
   return files;
 }
 
-export { parseDiff, extractFilePaths };
-export type { FileDiff };
+export { parseDiff, extractFilePaths, diffStats };
+export type { FileDiff, DiffStats };

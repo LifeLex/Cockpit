@@ -61,25 +61,34 @@ function WorkspaceTabBar({
   readonly active: WorkspaceTab;
   readonly onSelect: (tab: WorkspaceTab) => void;
 }) {
+  // Styling mirrors the `ui/Tabs` `line` variant so in-content tabs read the
+  // same across the app: a transparent bar with a baseline border and an
+  // underline (via the `after` pseudo-element) on the active tab.
   return (
-    <div className="flex shrink-0 items-center gap-0 border-b border-border bg-card px-2">
-      {TABS.map((tab) => (
-        <button
-          key={tab.key}
-          type="button"
-          onClick={() => {
-            onSelect(tab.key);
-          }}
-          className={cn(
-            "cursor-pointer border-x-0 border-t-0 border-b-2 bg-transparent px-4 py-2 text-xs font-medium transition-colors",
-            active === tab.key
-              ? "border-b-primary text-foreground"
-              : "border-b-transparent text-muted-foreground hover:text-foreground hover:border-b-muted-foreground/40",
-          )}
-        >
-          {tab.label}
-        </button>
-      ))}
+    <div className="flex shrink-0 items-center gap-1 border-b border-border bg-card px-2">
+      {TABS.map((tab) => {
+        const isActive = active === tab.key;
+        return (
+          <button
+            key={tab.key}
+            type="button"
+            aria-selected={isActive}
+            onClick={() => {
+              onSelect(tab.key);
+            }}
+            className={cn(
+              "relative cursor-pointer border-none bg-transparent px-3 py-2 text-sm font-medium transition-colors",
+              "after:absolute after:inset-x-0 after:bottom-[-1px] after:h-0.5 after:bg-foreground after:opacity-0 after:transition-opacity",
+              "focus-visible:outline-1 focus-visible:outline-ring",
+              isActive
+                ? "text-foreground after:opacity-100"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {tab.label}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -102,6 +111,10 @@ export function ReviewWorkspace({
 
   const toggleAgentTab = useCallback(() => {
     setActiveTab((prev) => (prev === "agent" ? "diff" : "agent"));
+  }, []);
+
+  const openAgentTab = useCallback(() => {
+    setActiveTab("agent");
   }, []);
 
   const switchToShellTab = useCallback(() => {
@@ -177,6 +190,7 @@ export function ReviewWorkspace({
               onAddComment={onAddComment}
               onRequestChanges={onRequestChanges}
               onMirrorComments={onMirrorComments}
+              onOpenAgent={openAgentTab}
             />
           </div>
         )}
@@ -187,9 +201,7 @@ export function ReviewWorkspace({
         )}
         {mountedTabs.has("agent") && (
           <div className={cn("flex min-h-0 flex-1 flex-col", activeTab !== "agent" && "hidden")}>
-            <div className="flex-1 min-h-0 [&>div]:max-h-none [&>div]:h-full [&>div]:shrink">
-              <AgentPanel visible onClose={() => { setActiveTab("diff"); }} />
-            </div>
+            <AgentPanel visible onClose={() => { setActiveTab("diff"); }} />
           </div>
         )}
         {mountedTabs.has("shell") && (

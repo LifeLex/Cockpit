@@ -1,7 +1,10 @@
+import type { LucideIcon } from "lucide-react";
+
 import { Button } from "@/components/ui/button";
 
 interface EmptyStateProps {
-  readonly icon: string;
+  /** Lucide icon component rendered inside a tokened tile. */
+  readonly icon: LucideIcon;
   readonly title: string;
   readonly description: string;
   readonly actionLabel?: string | undefined;
@@ -9,7 +12,7 @@ interface EmptyStateProps {
 }
 
 export function EmptyState({
-  icon,
+  icon: Icon,
   title,
   description,
   actionLabel,
@@ -17,8 +20,11 @@ export function EmptyState({
 }: EmptyStateProps) {
   return (
     <div className="flex flex-col items-center justify-center rounded-xl border border-border/50 bg-card px-8 py-12 text-center">
-      <span className="text-5xl" role="img" aria-label={title}>
-        {icon}
+      <span
+        className="flex h-14 w-14 items-center justify-center rounded-xl border border-border/60 bg-muted/40 text-muted-foreground"
+        aria-hidden="true"
+      >
+        <Icon className="h-6 w-6" strokeWidth={1.75} />
       </span>
       <h3 className="mt-4 text-base font-semibold text-foreground">
         {title}

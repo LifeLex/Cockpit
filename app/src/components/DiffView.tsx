@@ -33,12 +33,13 @@ import type { CiSummary } from "../bindings/CiSummary";
 import { summarizeChecks, ciState, parseCiUpdate } from "@/lib/ci";
 import { parseDiff, extractFilePaths } from "../diff-parser";
 import type { FileDiff } from "../diff-parser";
+import { elapsedSince } from "@/lib/relative-time";
 import { useAppStore } from "../store";
 import { registerCustomThemes } from "@/lib/monaco-themes";
 import { attachLspClient, type LspAttachment } from "@/lib/lsp-client";
-import { AgentPanel } from "./AgentPanel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { GatePill } from "./GatePill";
 import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -53,8 +54,6 @@ import {
   Bot,
   Hash,
   GitBranch,
-  ChevronDown,
-  ChevronRight,
   CheckCircle2,
   XCircle,
   Loader2,
@@ -78,6 +77,8 @@ interface DiffViewProps {
   ) => Promise<void>;
   readonly onRequestChanges: () => Promise<void>;
   readonly onMirrorComments: () => Promise<MirrorResult | null>;
+  /** Switch the enclosing workspace to the canonical Agent tab. */
+  readonly onOpenAgent: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -100,38 +101,57 @@ function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
 }
 
-function gateStateLabel(state: GateState): string {
+/** Status-LED background color for a gate state, using `--color-state-*`. */
+function gateLedColorClass(state: GateState): string {
   switch (state) {
     case "Pending":
-      return "Pending";
+      return "bg-state-pending";
     case "InReview":
-      return "In Review";
+      return "bg-state-in-review";
     case "Dispatched":
-      return "Dispatched";
+      return "bg-state-dispatched";
     case "Reworked":
-      return "Reworked";
+      return "bg-state-reworked";
     case "Approved":
-      return "Approved";
+      return "bg-state-approved";
     default:
       return assertNever(state);
   }
 }
 
-function gateStateBadgeClass(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "bg-state-pending/20 text-state-pending border-state-pending/30";
-    case "InReview":
-      return "bg-state-in-review/20 text-state-in-review border-state-in-review/30";
-    case "Dispatched":
-      return "bg-state-dispatched/20 text-state-dispatched border-state-dispatched/30";
-    case "Reworked":
-      return "bg-state-reworked/20 text-state-reworked border-state-reworked/30";
-    case "Approved":
-      return "bg-state-approved/20 text-state-approved border-state-approved/30";
-    default:
-      return assertNever(state);
-  }
+/**
+ * The status LED for the identity zone: a gate-state-colored dot that pulses
+ * only while an agent is actively dispatched (mirrors the card LED).
+ */
+function StatusLed({ review }: { readonly review: Review }) {
+  const pulses = review.gate_state === "Dispatched" && !review.stale;
+  const color = gateLedColorClass(review.gate_state);
+  return (
+    <span className="relative flex h-2.5 w-2.5 shrink-0" aria-hidden="true">
+      {pulses && (
+        <span
+          className={cn(
+            "absolute inline-flex h-full w-full animate-ping rounded-full opacity-60",
+            color,
+          )}
+        />
+      )}
+      <span
+        className={cn("relative inline-flex h-2.5 w-2.5 rounded-full", color)}
+      />
+    </span>
+  );
+}
+
+/**
+ * The human-readable agent reason line shown in place of a raw PID: e.g.
+ * `Agent working · 3m`. Returns null when no agent is attached. `now` is
+ * injected for deterministic tests and defaults to the wall clock.
+ */
+function agentReasonLine(review: Review, now: number = Date.now()): string | null {
+  if (review.agent === null) return null;
+  const elapsed = elapsedSince(review.agent.started_at, now);
+  return `Agent working · ${elapsed}`;
 }
 
 /**
@@ -229,14 +249,14 @@ function lineCounts(
 
 function statusIndicator(
   status: FileStatus,
-): { readonly label: string; readonly className: string } {
+): { readonly label: string; readonly className: string; readonly title: string } {
   switch (status) {
     case "added":
-      return { label: "+", className: "text-success font-bold" };
+      return { label: "+", className: "text-success", title: "Added" };
     case "modified":
-      return { label: "M", className: "text-warning font-bold" };
+      return { label: "±", className: "text-warning", title: "Modified" };
     case "deleted":
-      return { label: "-", className: "text-danger font-bold" };
+      return { label: "−", className: "text-danger", title: "Deleted" };
     default:
       return assertNever(status);
   }
@@ -424,6 +444,7 @@ export function DiffView({
   onAddComment,
   onRequestChanges,
   onMirrorComments,
+  onOpenAgent,
 }: DiffViewProps) {
   // -- Agent C: editor theme from store --
   const editorTheme = useAppStore((s) => s.editorTheme);
@@ -444,9 +465,6 @@ export function DiffView({
   const [diffMode, setDiffMode] = useState<"split" | "unified">("split");
   const [stackOpen, setStackOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [agentPanelVisible, setAgentPanelVisible] = useState(
-    review.gate_state === "Dispatched",
-  );
 
   // -- Inline comment state --
   const [activeCommentLine, setActiveCommentLine] = useState<number | null>(
@@ -516,6 +534,9 @@ export function DiffView({
 
   // -- Relocated PR-info: stack parents/children --
   const hasStack = review.parents.length > 0 || review.children.length > 0;
+
+  // -- Agent reason line (replaces the raw PID readout) --
+  const agentReason = useMemo(() => agentReasonLine(review), [review]);
 
   // -- Close inline form on file change --
   useEffect(() => {
@@ -892,135 +913,122 @@ export function DiffView({
       {/* ----------------------------------------------------------------- */}
       {/* Header                                                            */}
       {/* ----------------------------------------------------------------- */}
-      <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card px-4 py-2">
-        <Button variant="ghost" size="sm" onClick={onBack}>
-          <ArrowLeft className="h-4 w-4" />
-          Back
-        </Button>
+      <header className="flex shrink-0 items-center gap-4 border-b border-border bg-card px-4 py-2">
+        {/* ============================================================= */}
+        {/* Zone 1 — Identity (left)                                       */}
+        {/* ============================================================= */}
+        <div className="flex min-w-0 flex-1 items-center gap-3">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onBack}
+            title="Back to the board"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Back
+          </Button>
 
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="truncate text-sm font-semibold">
-            {review.branch}
-          </span>
+          <StatusLed review={review} />
 
-          {/* PR link */}
-          {prHref !== null ? (
-            <a
-              href={prHref}
-              onClick={(e) => {
-                e.preventDefault();
-                void openExternal(prHref);
-              }}
-              className="inline-flex shrink-0 items-center gap-1 text-xs text-primary hover:underline"
-              title="Open PR on GitHub"
-            >
-              {review.pr}
-              <ExternalLink className="h-3 w-3" />
-            </a>
-          ) : (
-            <span className="shrink-0 text-xs text-muted-foreground">
-              {review.pr}
-            </span>
-          )}
-
-          {/* Issue link */}
-          {issueHref !== null ? (
-            <a
-              href={issueHref}
-              onClick={(e) => {
-                e.preventDefault();
-                void openExternal(issueHref);
-              }}
-              className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground hover:text-foreground hover:underline"
-              title="Open issue on Linear"
-            >
-              <Hash className="h-3 w-3" />
-              {review.issue}
-            </a>
-          ) : (
-            <span className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
-              <Hash className="h-3 w-3" />
-              {review.issue}
-            </span>
-          )}
-
-          {/* Repository link */}
-          {review.repo_slug !== null &&
-            (repoHref !== null ? (
-              <a
-                href={repoHref}
-                onClick={(e) => {
-                  e.preventDefault();
-                  void openExternal(repoHref);
-                }}
-                className="inline-flex shrink-0 items-center gap-1 font-mono text-xs text-muted-foreground hover:text-foreground hover:underline"
-                title="Open repository on GitHub"
-              >
-                {review.repo_slug}
-                <ExternalLink className="h-3 w-3" />
-              </a>
-            ) : (
-              <span className="shrink-0 font-mono text-xs text-muted-foreground">
-                {review.repo_slug}
+          <div className="flex min-w-0 flex-col">
+            {/* Title row: PR subject + gate-state pill + inline flags. */}
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="truncate font-display text-sm font-semibold text-foreground">
+                {review.branch}
               </span>
-            ))}
+              <GatePill state={review.gate_state} />
+              {review.stale && (
+                <span className="inline-flex shrink-0 items-center gap-1 text-xs text-danger">
+                  <AlertTriangle className="h-3 w-3" /> Stale
+                </span>
+              )}
+            </div>
+
+            {/* Refs line: mono, faint; PR / issue / repo links via opener. */}
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-0.5 font-mono text-xs text-muted-foreground">
+              {prHref !== null ? (
+                <a
+                  href={prHref}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    void openExternal(prHref);
+                  }}
+                  className="inline-flex shrink-0 items-center gap-1 text-primary hover:underline"
+                  title="Open PR on GitHub"
+                >
+                  {review.pr}
+                  <ExternalLink className="h-3 w-3" />
+                </a>
+              ) : (
+                <span className="shrink-0">{review.pr}</span>
+              )}
+
+              {issueHref !== null ? (
+                <a
+                  href={issueHref}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    void openExternal(issueHref);
+                  }}
+                  className="inline-flex shrink-0 items-center gap-1 hover:text-foreground hover:underline"
+                  title="Open issue on Linear"
+                >
+                  <Hash className="h-3 w-3" />
+                  {review.issue}
+                </a>
+              ) : (
+                <span className="inline-flex shrink-0 items-center gap-1">
+                  <Hash className="h-3 w-3" />
+                  {review.issue}
+                </span>
+              )}
+
+              {review.repo_slug !== null &&
+                (repoHref !== null ? (
+                  <a
+                    href={repoHref}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      void openExternal(repoHref);
+                    }}
+                    className="inline-flex shrink-0 items-center gap-1 hover:text-foreground hover:underline"
+                    title="Open repository on GitHub"
+                  >
+                    {review.repo_slug}
+                    <ExternalLink className="h-3 w-3" />
+                  </a>
+                ) : (
+                  <span className="shrink-0">{review.repo_slug}</span>
+                ))}
+
+              {/* Agent reason line replaces the raw PID readout. */}
+              {agentReason !== null && (
+                <span className="inline-flex shrink-0 items-center gap-1 text-state-dispatched">
+                  <Bot className="h-3 w-3" />
+                  {agentReason}
+                </span>
+              )}
+            </div>
+          </div>
         </div>
 
-        <Badge
-          variant="outline"
-          className={cn("shrink-0", gateStateBadgeClass(review.gate_state))}
-        >
-          {gateStateLabel(review.gate_state)}
-        </Badge>
-
-        {review.stale && (
-          <span className="inline-flex items-center gap-1 text-xs text-danger">
-            <AlertTriangle className="h-3 w-3" /> Stale
-          </span>
-        )}
-
-        {review.agent != null && (
-          <span className="inline-flex items-center gap-1 text-xs text-warning">
-            <Bot className="h-3 w-3" /> PID {review.agent.pid}
-          </span>
-        )}
-
-        {/* CI checks badge */}
-        {ciSummary !== null && ciSummary.total > 0 && (
-          <span
-            className={cn(
-              "inline-flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs",
-              ciBadgeState === "pass" &&
-                "border-success/30 bg-success/15 text-success",
-              ciBadgeState === "fail" &&
-                "border-danger/30 bg-danger/15 text-danger",
-              ciBadgeState === "pending" &&
-                "border-warning/30 bg-warning/15 text-warning",
-            )}
-            title={`CI: ${String(ciSummary.passed)} passed, ${String(ciSummary.failed)} failed, ${String(ciSummary.pending)} pending`}
-          >
-            {ciBadgeState === "pass" && <CheckCircle2 className="h-3 w-3" />}
-            {ciBadgeState === "fail" && <XCircle className="h-3 w-3" />}
-            {ciBadgeState === "pending" && (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            )}
-            {String(ciSummary.passed)}/{String(ciSummary.total)}
-          </span>
-        )}
-
-        {/* Split / Unified toggle + actions */}
-        <div className="ml-auto flex items-center gap-2">
+        {/* ============================================================= */}
+        {/* Zone 2 — View controls (center)                               */}
+        {/* ============================================================= */}
+        <div className="flex shrink-0 items-center gap-2 rounded-lg border border-border bg-muted/30 px-2 py-1">
+          {/* Split / Unified segmented control. */}
           <div className="flex overflow-hidden rounded-md border border-border">
             <button
               type="button"
               onClick={() => {
                 setDiffMode("split");
               }}
+              aria-pressed={diffMode === "split"}
               className={cn(
-                "cursor-pointer border-none px-3 py-1 text-xs",
+                "cursor-pointer border-none px-3 py-1 text-xs font-medium transition-colors",
                 diffMode === "split"
                   ? "bg-accent text-accent-foreground"
-                  : "bg-muted text-muted-foreground hover:bg-accent",
+                  : "bg-transparent text-muted-foreground hover:bg-accent/50",
               )}
             >
               Split
@@ -1030,95 +1038,142 @@ export function DiffView({
               onClick={() => {
                 setDiffMode("unified");
               }}
+              aria-pressed={diffMode === "unified"}
               className={cn(
-                "cursor-pointer border-none px-3 py-1 text-xs",
+                "cursor-pointer border-none px-3 py-1 text-xs font-medium transition-colors",
                 diffMode === "unified"
                   ? "bg-accent text-accent-foreground"
-                  : "bg-muted text-muted-foreground hover:bg-accent",
+                  : "bg-transparent text-muted-foreground hover:bg-accent/50",
               )}
             >
               Unified
             </button>
           </div>
 
-          {review.comments.length > 0 && (
-            <span className="flex items-center gap-1 text-xs text-muted-foreground">
-              <MessageSquare className="h-3 w-3" />
-              {String(review.comments.length)}
+          {/* CI checks badge. */}
+          {ciSummary !== null && ciSummary.total > 0 && (
+            <span
+              className={cn(
+                "inline-flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-xs tabular-nums",
+                ciBadgeState === "pass" &&
+                  "border-success/30 bg-success/15 text-success",
+                ciBadgeState === "fail" &&
+                  "border-danger/30 bg-danger/15 text-danger",
+                ciBadgeState === "pending" &&
+                  "border-warning/30 bg-warning/15 text-warning",
+              )}
+              title={`CI: ${String(ciSummary.passed)} passed, ${String(ciSummary.failed)} failed, ${String(ciSummary.pending)} pending`}
+            >
+              {ciBadgeState === "pass" && <CheckCircle2 className="h-3 w-3" />}
+              {ciBadgeState === "fail" && <XCircle className="h-3 w-3" />}
+              {ciBadgeState === "pending" && (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              )}
+              {String(ciSummary.passed)}/{String(ciSummary.total)}
             </span>
           )}
 
-          {/* Agent B: agent panel toggle */}
-          <Button
-            variant={agentPanelVisible ? "default" : "outline"}
-            size="sm"
-            onClick={() => {
-              setAgentPanelVisible((prev) => !prev);
-            }}
-            title="Toggle agent panel"
-          >
-            <Bot className="h-3.5 w-3.5" />
-            Agent
-          </Button>
-
-          {/* Restack — explicit user action; only when the review is stale.
-              Operates only on the review's own branch (Invariant 5 / §9). */}
-          {review.stale && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="border-danger/40 text-danger hover:bg-danger/10"
-              onClick={() => void handleRestack()}
-              disabled={restacking || review.agent != null}
-              title="Rebase this review onto its parent's new head"
+          {/* Stack strip toggle. */}
+          {hasStack && (
+            <button
+              type="button"
+              onClick={() => {
+                setStackOpen((prev) => !prev);
+              }}
+              aria-expanded={stackOpen}
+              className={cn(
+                "inline-flex shrink-0 cursor-pointer items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs transition-colors",
+                stackOpen
+                  ? "border-border bg-accent text-accent-foreground"
+                  : "border-transparent bg-transparent text-muted-foreground hover:bg-accent/50",
+              )}
+              title="Toggle stack"
             >
-              <Layers className="h-3.5 w-3.5" />
-              {restacking || review.agent != null ? "Restacking…" : "Restack"}
-            </Button>
+              <GitBranch className="h-3 w-3" />
+              Stack
+            </button>
           )}
+        </div>
 
-          {/* Fix CI failures — explicit user action; only when CI is failing */}
-          {ciSummary !== null && ciSummary.failed > 0 && (
+        {/* ============================================================= */}
+        {/* Zone 3 — Actions (far right)                                   */}
+        {/* ============================================================= */}
+        <div className="flex shrink-0 items-center gap-2">
+          {/* Secondary cluster: ghost/outline actions. */}
+          <div className="flex items-center gap-1.5">
+            {/* Jump to the canonical Agent tab (activity timeline). */}
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
-              className="border-danger/40 text-danger hover:bg-danger/10"
-              onClick={() => void handleFixCi()}
-              disabled={fixingCi || review.gate_state === "Dispatched"}
-              title="Dispatch an agent to fix the failing CI checks"
+              onClick={onOpenAgent}
+              title="Open the agent activity timeline"
             >
-              <Wrench className="h-3.5 w-3.5" />
-              {fixingCi ? "Dispatching..." : "Fix CI failures"}
+              <Bot className="h-3.5 w-3.5" />
+              Agent
             </Button>
-          )}
 
-          {review.source === "ReviewRequested" ? (
-            review.gate_state === "InReview" && review.comments.length > 0 && (
+            {/* Restack — explicit user action; only when the review is stale.
+                Operates only on the review's own branch (Invariant 5 / §9). */}
+            {review.stale && (
               <Button
+                variant="outline"
                 size="sm"
-                className="bg-success text-white hover:bg-success/90"
-                onClick={() => void handleSubmitReview()}
-                disabled={submitting}
+                className="border-danger/40 text-danger hover:bg-danger/10"
+                onClick={() => void handleRestack()}
+                disabled={restacking || review.agent != null}
+                title="Rebase this review onto its parent's new head"
+              >
+                <Layers className="h-3.5 w-3.5" />
+                {restacking || review.agent != null ? "Restacking…" : "Restack"}
+              </Button>
+            )}
+
+            {/* Fix CI failures — explicit user action; only when CI is failing. */}
+            {ciSummary !== null && ciSummary.failed > 0 && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="border-danger/40 text-danger hover:bg-danger/10"
+                onClick={() => void handleFixCi()}
+                disabled={fixingCi || review.gate_state === "Dispatched"}
+                title="Dispatch an agent to fix the failing CI checks"
+              >
+                <Wrench className="h-3.5 w-3.5" />
+                {fixingCi ? "Dispatching..." : "Fix CI"}
+              </Button>
+            )}
+
+            {/* Mirror — outline secondary; authored reviews with local
+                comments. Submit path uses the primary action below. */}
+            {review.source !== "ReviewRequested" && hasLocalComments && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleMirrorComments()}
+                disabled={mirroring}
+                title="Mirror local comments to the GitHub PR thread"
               >
                 <Upload className="h-3.5 w-3.5" />
-                Submit Review ({String(review.comments.length)})
+                {mirroring ? "Mirroring..." : "Mirror"}
               </Button>
-            )
-          ) : (
-            <>
-              {hasLocalComments && (
+            )}
+          </div>
+
+          {/* Primary action — one clear call to action by state. */}
+          {review.source === "ReviewRequested"
+            ? review.gate_state === "InReview" &&
+              review.comments.length > 0 && (
                 <Button
-                  variant="outline"
                   size="sm"
-                  onClick={() => void handleMirrorComments()}
-                  disabled={mirroring}
+                  className="bg-success text-white hover:bg-success/90"
+                  onClick={() => void handleSubmitReview()}
+                  disabled={submitting}
                 >
                   <Upload className="h-3.5 w-3.5" />
-                  {mirroring ? "Mirroring..." : "Mirror"}
+                  Submit Review ({String(review.comments.length)})
                 </Button>
-              )}
-
-              {canRequestChanges && (
+              )
+            : canRequestChanges && (
                 <Button
                   variant="destructive"
                   size="sm"
@@ -1129,70 +1184,57 @@ export function DiffView({
                   Request Changes ({String(review.comments.length)})
                 </Button>
               )}
-            </>
-          )}
         </div>
       </header>
 
       {/* ----------------------------------------------------------------- */}
       {/* Stack strip (collapsible) — relocated from PR Info tab            */}
       {/* ----------------------------------------------------------------- */}
-      {hasStack && (
+      {hasStack && stackOpen && (
         <div className="shrink-0 border-b border-border bg-card/50 px-4 py-1.5 text-xs">
-          <button
-            type="button"
-            onClick={() => {
-              setStackOpen((prev) => !prev);
-            }}
-            className="inline-flex cursor-pointer items-center gap-1 border-none bg-transparent text-muted-foreground hover:text-foreground"
-            aria-expanded={stackOpen}
-            title="Toggle stack"
-          >
-            {stackOpen ? (
-              <ChevronDown className="h-3 w-3" />
-            ) : (
-              <ChevronRight className="h-3 w-3" />
-            )}
+          <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
             <GitBranch className="h-3 w-3" />
-            Stack
-            <span className="text-[10px] text-muted-foreground">
-              ({String(review.parents.length)} up ·{" "}
-              {String(review.children.length)} down)
-            </span>
-          </button>
-
-          {stackOpen && (
-            <div className="mt-1.5 space-y-1.5 pl-5">
-              {review.parents.length > 0 && (
-                <div className="flex items-start gap-2">
-                  <span className="w-14 shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground">
-                    Parents
-                  </span>
-                  <div className="flex flex-wrap gap-1">
-                    {review.parents.map((p) => (
-                      <Badge key={p} variant="outline" className="text-[10px]">
-                        {p}
-                      </Badge>
-                    ))}
-                  </div>
+            Stack ({String(review.parents.length)} up ·{" "}
+            {String(review.children.length)} down)
+          </div>
+          <div className="mt-1.5 space-y-1.5 pl-5">
+            {review.parents.length > 0 && (
+              <div className="flex items-start gap-2">
+                <span className="w-14 shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  Parents
+                </span>
+                <div className="flex flex-wrap gap-1">
+                  {review.parents.map((p) => (
+                    <Badge
+                      key={p}
+                      variant="outline"
+                      className="font-mono text-[10px]"
+                    >
+                      {p}
+                    </Badge>
+                  ))}
                 </div>
-              )}
-              {review.children.length > 0 && (
-                <div className="flex items-start gap-2">
-                  <span className="w-14 shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground">
-                    Children
-                  </span>
-                  <div className="flex flex-wrap gap-1">
-                    {review.children.map((c) => (
-                      <Badge key={c} variant="outline" className="text-[10px]">
-                        {c}
-                      </Badge>
-                    ))}
-                  </div>
+              </div>
+            )}
+            {review.children.length > 0 && (
+              <div className="flex items-start gap-2">
+                <span className="w-14 shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  Children
+                </span>
+                <div className="flex flex-wrap gap-1">
+                  {review.children.map((c) => (
+                    <Badge
+                      key={c}
+                      variant="outline"
+                      className="font-mono text-[10px]"
+                    >
+                      {c}
+                    </Badge>
+                  ))}
                 </div>
-              )}
-            </div>
-          )}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -1247,8 +1289,11 @@ export function DiffView({
         {sidebarOpen && (
           <aside className="flex w-60 shrink-0 flex-col border-r border-border bg-card">
             <div className="flex items-center justify-between border-b border-border px-3 py-2">
-              <span className="text-xs font-semibold text-muted-foreground">
-                Files ({String(filePaths.length)})
+              <span className="font-display text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Files{" "}
+                <span className="font-mono tabular-nums text-muted-foreground/70">
+                  {String(filePaths.length)}
+                </span>
               </span>
               <button
                 type="button"
@@ -1288,14 +1333,16 @@ export function DiffView({
                   >
                     <span
                       className={cn(
-                        "w-4 shrink-0 text-center",
+                        "w-4 shrink-0 text-center font-mono font-semibold",
                         indicator.className,
                       )}
+                      title={indicator.title}
+                      aria-label={indicator.title}
                     >
                       {indicator.label}
                     </span>
                     <span
-                      className="flex-1 truncate text-foreground"
+                      className="flex-1 truncate font-mono text-foreground"
                       title={path}
                     >
                       {path}
@@ -1326,7 +1373,7 @@ export function DiffView({
                     >
                       <ExternalLink className="h-3 w-3" />
                     </span>
-                    <span className="flex shrink-0 items-center gap-1.5 text-[10px]">
+                    <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px] tabular-nums">
                       {commentCount > 0 && (
                         <span className="flex items-center gap-0.5 text-state-in-review">
                           <MessageSquare className="h-2.5 w-2.5" />
@@ -1340,7 +1387,8 @@ export function DiffView({
                       )}
                       {counts.deletions > 0 && (
                         <span className="text-danger">
-                          -{String(counts.deletions)}
+                          {"−"}
+                          {String(counts.deletions)}
                         </span>
                       )}
                     </span>
@@ -1452,14 +1500,6 @@ export function DiffView({
             </span>
           )}
       </div>
-
-      {/* Agent B: agent activity panel */}
-      <AgentPanel
-        visible={agentPanelVisible}
-        onClose={() => {
-          setAgentPanelVisible(false);
-        }}
-      />
     </div>
   );
 }

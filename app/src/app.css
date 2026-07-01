@@ -2,12 +2,24 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
+/* Display face: Archivo Variable. wdth.css carries both the weight and the
+   width axis so headings can render "expanded" via font-stretch. */
+@import "@fontsource-variable/archivo/wdth.css";
+/* Mono face: IBM Plex Mono, weights used across code/terminal surfaces. */
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-mono/600.css";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-  --font-heading: var(--font-sans);
   --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-display: 'Archivo Variable', 'Geist Variable', ui-sans-serif,
+    system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, 'SF Mono',
+    Menlo, Consolas, monospace;
+  /* Headings render in the display face (was aliased to --font-sans). */
+  --font-heading: var(--font-display);
 
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -53,88 +65,97 @@
 }
 
 @theme {
+  /* Brand accent — owned HUD teal, kept separate from status colors. */
+  --color-brand: #4fd4d6;
+
   /* Gate state colors (domain-specific, not covered by shadcn) */
-  --color-state-pending: oklch(0.55 0.01 260);
-  --color-state-in-review: oklch(0.65 0.18 250);
-  --color-state-dispatched: oklch(0.75 0.15 75);
-  --color-state-reworked: oklch(0.65 0.2 310);
-  --color-state-approved: oklch(0.70 0.17 155);
+  --color-state-pending: #7a8797;
+  --color-state-in-review: #5b8cff;
+  --color-state-dispatched: #f2b544;
+  --color-state-reworked: #c084fc;
+  --color-state-approved: #3ecf8e;
 
   /* Semantic accents used in domain components */
-  --color-danger: oklch(0.65 0.22 25);
-  --color-warning: oklch(0.75 0.15 75);
-  --color-success: oklch(0.70 0.17 155);
+  --color-danger: #ff5c6c;
+  --color-warning: #f2b544;
+  --color-success: #3ecf8e;
 }
 
-/* shadcn neutral light theme (default) */
+/* Glass Cockpit — light theme.
+   Near-white with a faint cool bias; card sits slightly above the ground for
+   real elevation; teal --primary matches dark; status hues darkened for
+   contrast on light surfaces. Dark is the hero, but this stays coherent. */
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.965 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.965 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.965 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.646 0.222 41.116);
-  --chart-2: oklch(0.6 0.118 184.714);
-  --chart-3: oklch(0.398 0.07 227.334);
-  --chart-4: oklch(0.828 0.189 84.429);
-  --chart-5: oklch(0.769 0.188 70.08);
+  --background: #f4f6f9;
+  --foreground: #1a2029;
+  --card: #ffffff;
+  --card-foreground: #1a2029;
+  --popover: #ffffff;
+  --popover-foreground: #1a2029;
+  --primary: #0f9ea0;
+  --primary-foreground: #ffffff;
+  --secondary: #e6eaf0;
+  --secondary-foreground: #1a2029;
+  --muted: #eaeef3;
+  --muted-foreground: #5b6675;
+  --accent: #e0e6ee;
+  --accent-foreground: #1a2029;
+  --destructive: #d83a4a;
+  --border: #d9dfe7;
+  --input: #d9dfe7;
+  --ring: #0f9ea0;
+  --chart-1: #0f9ea0;
+  --chart-2: #3a72d8;
+  --chart-3: #d99b1c;
+  --chart-4: #9d5bd0;
+  --chart-5: #1fa872;
   --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.965 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --sidebar: #eef1f5;
+  --sidebar-foreground: #1a2029;
+  --sidebar-primary: #0f9ea0;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e0e6ee;
+  --sidebar-accent-foreground: #1a2029;
+  --sidebar-border: #d9dfe7;
+  --sidebar-ring: #0f9ea0;
 }
 
-/* shadcn neutral dark theme */
+/* Glass Cockpit — dark theme (the hero).
+   Layered surfaces: ground < card/popover < muted < accent/secondary, so
+   panels read as genuinely elevated above the background (the old theme had
+   card == background). Primary is HUD teal. */
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.145 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.145 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.985 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.396 0.141 25.723);
-  --border: oklch(0.269 0 0);
-  --input: oklch(0.269 0 0);
-  --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.488 0.243 264.376);
-  --chart-2: oklch(0.696 0.17 162.48);
-  --chart-3: oklch(0.769 0.188 70.08);
-  --chart-4: oklch(0.627 0.265 303.9);
-  --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.985 0 0);
-  --sidebar-primary-foreground: oklch(0.205 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(0.269 0 0);
-  --sidebar-ring: oklch(0.556 0 0);
+  --background: #0b0e12;
+  --foreground: #e6ebf1;
+  --card: #12161c;
+  --card-foreground: #e6ebf1;
+  --popover: #12161c;
+  --popover-foreground: #e6ebf1;
+  --primary: #4fd4d6;
+  --primary-foreground: #04191a;
+  --secondary: #222b35;
+  --secondary-foreground: #e6ebf1;
+  --muted: #1a2028;
+  --muted-foreground: #8b97a6;
+  --accent: #222b35;
+  --accent-foreground: #e6ebf1;
+  --destructive: #ff5c6c;
+  --border: #232a33;
+  --input: #232a33;
+  --ring: #4fd4d6;
+  --chart-1: #4fd4d6;
+  --chart-2: #5b8cff;
+  --chart-3: #f2b544;
+  --chart-4: #c084fc;
+  --chart-5: #3ecf8e;
+  --sidebar: #0e1217;
+  --sidebar-foreground: #e6ebf1;
+  --sidebar-primary: #4fd4d6;
+  --sidebar-primary-foreground: #04191a;
+  --sidebar-accent: #222b35;
+  --sidebar-accent-foreground: #e6ebf1;
+  --sidebar-border: #232a33;
+  --sidebar-ring: #4fd4d6;
 }
 
 @layer base {
@@ -145,6 +166,17 @@
     @apply bg-background text-foreground font-sans;
     -webkit-font-smoothing: antialiased;
   }
+}
+
+/* Display face: Archivo in its expanded (wdth 125) cut with tightened
+   tracking, giving headings the "glass cockpit" instrument-panel character.
+   Applied wherever the font-heading / font-display roles are used. */
+.font-heading,
+.font-display {
+  font-family: var(--font-display);
+  font-stretch: 125%;
+  font-variation-settings: "wdth" 125;
+  letter-spacing: -0.01em;
 }
 
 /* Scrollbar styling */
@@ -185,8 +217,8 @@
   width: 16px;
   height: 16px;
   border-radius: 3px;
-  background-color: oklch(0.65 0.18 250);
-  color: oklch(0.98 0 0);
+  background-color: var(--color-state-in-review);
+  color: #ffffff;
   font-size: 13px;
   font-weight: 700;
   line-height: 1;
@@ -194,10 +226,14 @@
 
 /* Subtle background on lines that have comments */
 .inline-comment-line-bg {
-  background-color: oklch(0.65 0.18 250 / 0.08) !important;
+  background-color: color-mix(
+    in oklch,
+    var(--color-state-in-review) 8%,
+    transparent
+  ) !important;
 }
 
 /* Left-border accent for commented lines in the glyph margin */
 .inline-comment-line-glyph {
-  border-left: 3px solid oklch(0.65 0.18 250);
+  border-left: 3px solid var(--color-state-in-review);
 }

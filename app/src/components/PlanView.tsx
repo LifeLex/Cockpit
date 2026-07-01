@@ -6,8 +6,8 @@ import type { Comment } from "../bindings/Comment";
 import type { Anchor } from "../bindings/Anchor";
 import type { BatchStatus } from "../bindings/BatchStatus";
 import { Card, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { GatePill } from "./GatePill";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
@@ -28,7 +28,6 @@ import {
   CheckCheck,
   Loader2,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -36,40 +35,6 @@ import { cn } from "@/lib/utils";
 
 function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
-}
-
-function gateStateLabel(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "Pending";
-    case "InReview":
-      return "In Review";
-    case "Dispatched":
-      return "Dispatched";
-    case "Reworked":
-      return "Reworked";
-    case "Approved":
-      return "Approved";
-    default:
-      return assertNever(state);
-  }
-}
-
-function gateStateBadgeClass(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "bg-state-pending/20 text-state-pending border-state-pending/30";
-    case "InReview":
-      return "bg-state-in-review/20 text-state-in-review border-state-in-review/30";
-    case "Dispatched":
-      return "bg-state-dispatched/20 text-state-dispatched border-state-dispatched/30";
-    case "Reworked":
-      return "bg-state-reworked/20 text-state-reworked border-state-reworked/30";
-    case "Approved":
-      return "bg-state-approved/20 text-state-approved border-state-approved/30";
-    default:
-      return assertNever(state);
-  }
 }
 
 /** Check whether an anchor targets a specific plan step by index. */
@@ -548,12 +513,7 @@ function PlanGate({
             </p>
           </div>
         </div>
-        <Badge
-          variant="outline"
-          className={cn("shrink-0", gateStateBadgeClass(gateState))}
-        >
-          {gateStateLabel(gateState)}
-        </Badge>
+        <GatePill state={gateState} />
       </div>
 
       {/* Batch progress (after approval) */}

@@ -8,9 +8,9 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { gateStateLabel, gateToneClass } from "./GatePill";
 import type { Project } from "../bindings/Project";
 import type { ProjectSource } from "../bindings/ProjectSource";
-import type { GateState } from "../bindings/GateState";
 
 function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
@@ -25,40 +25,6 @@ function sourceLabel(source: ProjectSource): string {
     return "Linear";
   }
   return assertNever(source);
-}
-
-function gateStateLabel(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "Pending";
-    case "InReview":
-      return "In Review";
-    case "Dispatched":
-      return "Dispatched";
-    case "Reworked":
-      return "Reworked";
-    case "Approved":
-      return "Approved";
-    default:
-      return assertNever(state);
-  }
-}
-
-function gateStateBadgeClass(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "bg-state-pending/20 text-state-pending border-state-pending/30";
-    case "InReview":
-      return "bg-state-in-review/20 text-state-in-review border-state-in-review/30";
-    case "Dispatched":
-      return "bg-state-dispatched/20 text-state-dispatched border-state-dispatched/30";
-    case "Reworked":
-      return "bg-state-reworked/20 text-state-reworked border-state-reworked/30";
-    case "Approved":
-      return "bg-state-approved/20 text-state-approved border-state-approved/30";
-    default:
-      return assertNever(state);
-  }
 }
 
 interface ProjectCardProps {
@@ -102,7 +68,7 @@ export function ProjectCard({ project, prCount, onOpen }: ProjectCardProps) {
               {plan !== null && (
                 <Badge
                   variant="outline"
-                  className={cn("shrink-0", gateStateBadgeClass(plan.gate_state))}
+                  className={cn("shrink-0", gateToneClass(plan.gate_state))}
                 >
                   <ClipboardList />
                   {gateStateLabel(plan.gate_state)}

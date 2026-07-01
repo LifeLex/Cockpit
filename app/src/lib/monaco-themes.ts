@@ -27,6 +27,58 @@ interface MonacoThemeDef {
 }
 
 // ---------------------------------------------------------------------------
+// Custom theme: Glass Cockpit (default dark)
+//
+// Derived from the app design tokens in `app.css` (dark theme block) so the
+// diff editor reads as part of the app rather than a bolted-on Monaco default:
+//   background #0b0e12, card #12161c, foreground #e6ebf1, border #232a33,
+//   brand/teal #4fd4d6, success #3ecf8e, danger #ff5c6c, warning #f2b544,
+//   in-review blue #5b8cff, reworked magenta #c084fc.
+// ---------------------------------------------------------------------------
+
+const glassCockpitTheme: editor.IStandaloneThemeData = {
+  base: "vs-dark",
+  inherit: true,
+  rules: [
+    { token: "comment", foreground: "8b97a6", fontStyle: "italic" },
+    { token: "keyword", foreground: "c084fc" },
+    { token: "string", foreground: "3ecf8e" },
+    { token: "number", foreground: "5b8cff" },
+    { token: "type", foreground: "f2b544" },
+    { token: "type.identifier", foreground: "f2b544" },
+    { token: "function", foreground: "4fd4d6" },
+    { token: "variable", foreground: "e6ebf1" },
+    { token: "constant", foreground: "5b8cff" },
+    { token: "operator", foreground: "c084fc" },
+    { token: "delimiter", foreground: "8b97a6" },
+    { token: "tag", foreground: "4fd4d6" },
+    { token: "attribute.name", foreground: "5b8cff" },
+    { token: "attribute.value", foreground: "3ecf8e" },
+    { token: "regexp", foreground: "3ecf8e" },
+  ],
+  colors: {
+    "editor.background": "#0b0e12",
+    "editor.foreground": "#e6ebf1",
+    "editor.lineHighlightBackground": "#12161c",
+    "editor.selectionBackground": "#4fd4d633",
+    "editor.inactiveSelectionBackground": "#4fd4d61f",
+    "editorCursor.foreground": "#4fd4d6",
+    "editorWhitespace.foreground": "#2a323d",
+    "editorLineNumber.foreground": "#5b6675",
+    "editorLineNumber.activeForeground": "#8b97a6",
+    "editorIndentGuide.background": "#1a2028",
+    "editorIndentGuide.activeBackground": "#232a33",
+    "editorGutter.background": "#0b0e12",
+    "diffEditor.insertedTextBackground": "#3ecf8e26",
+    "diffEditor.removedTextBackground": "#ff5c6c26",
+    "diffEditor.insertedLineBackground": "#3ecf8e14",
+    "diffEditor.removedLineBackground": "#ff5c6c14",
+    "diffEditorGutter.insertedLineBackground": "#3ecf8e26",
+    "diffEditorGutter.removedLineBackground": "#ff5c6c26",
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Custom theme: GitHub Dark
 // ---------------------------------------------------------------------------
 
@@ -158,8 +210,10 @@ const solarizedDarkTheme: editor.IStandaloneThemeData = {
  * on editor mount.
  */
 export const MONACO_THEMES = [
+  // Custom default: derived from the app's Glass Cockpit design tokens.
+  { id: "glass-cockpit", label: "Glass Cockpit (Default)", builtin: false, data: glassCockpitTheme },
   // Built-in themes: Monaco knows these natively, no defineTheme needed.
-  { id: "vs-dark", label: "Dark (Default)", builtin: true, data: undefined },
+  { id: "vs-dark", label: "Dark", builtin: true, data: undefined },
   { id: "vs", label: "Light", builtin: true, data: undefined },
   { id: "hc-black", label: "High Contrast Dark", builtin: true, data: undefined },
   { id: "hc-light", label: "High Contrast Light", builtin: true, data: undefined },

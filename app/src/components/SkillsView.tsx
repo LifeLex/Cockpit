@@ -216,7 +216,7 @@ export function SkillsView() {
             <p className="text-sm text-muted-foreground">Loading skills...</p>
           ) : skills.length === 0 ? (
             <EmptyState
-              icon="🧩"
+              icon={Blocks}
               title="No skills yet"
               description="Create a skill or sync from your configured GitHub source."
               actionLabel="New skill"

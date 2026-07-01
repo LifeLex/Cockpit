@@ -10,8 +10,8 @@ import {
   CommandShortcut,
 } from "@/components/ui/command";
 import { useAppStore } from "../store";
-import type { GateState } from "../bindings/GateState";
 import type { Review } from "../bindings/Review";
+import { GatePill } from "./GatePill";
 import { invoke } from "@tauri-apps/api/core";
 import { comboFor, Kbd } from "@/lib/shortcuts";
 import type { ShortcutId } from "@/lib/shortcuts";
@@ -41,47 +41,6 @@ function ShortcutHint({ id }: { readonly id: ShortcutId }) {
       <Kbd combo={combo} />
     </CommandShortcut>
   );
-}
-
-/** Human-readable label for a gate state, used in the "Jump to Review" group. */
-function gateStateLabel(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "Pending";
-    case "InReview":
-      return "In Review";
-    case "Dispatched":
-      return "Dispatched";
-    case "Reworked":
-      return "Reworked";
-    case "Approved":
-      return "Approved";
-    default: {
-      const _exhaustive: never = state;
-      return String(_exhaustive);
-    }
-  }
-}
-
-/** Tailwind badge color classes for gate states. */
-function gateStateBadgeClass(state: GateState): string {
-  switch (state) {
-    case "Pending":
-      return "bg-muted text-muted-foreground";
-    case "InReview":
-      return "bg-blue-500/15 text-blue-600";
-    case "Dispatched":
-      return "bg-yellow-500/15 text-yellow-600";
-    case "Reworked":
-      return "bg-green-500/15 text-green-600";
-    case "Approved":
-      return "bg-emerald-500/15 text-emerald-600";
-    default: {
-      const _exhaustive: never = state;
-      void _exhaustive;
-      return "bg-muted text-muted-foreground";
-    }
-  }
 }
 
 /**
@@ -211,11 +170,7 @@ export function CommandPalette({
                   }}
                 >
                   <span className="flex-1 truncate">{review.branch}</span>
-                  <span
-                    className={`ml-2 inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${gateStateBadgeClass(review.gate_state)}`}
-                  >
-                    {gateStateLabel(review.gate_state)}
-                  </span>
+                  <GatePill state={review.gate_state} className="ml-2" />
                 </CommandItem>
               ))}
             </CommandGroup>

@@ -142,7 +142,7 @@ interface AppStore {
   /** Error from the last config operation, if any. */
   readonly configError: string | null;
 
-  /** Active Monaco editor theme ID, loaded from config. Defaults to "vs-dark". */
+  /** Active Monaco editor theme ID, loaded from config. Defaults to "glass-cockpit". */
   readonly editorTheme: string;
 
   /** Fetch configuration from the backend. */
@@ -281,7 +281,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   config: null,
   configLoading: false,
   configError: null,
-  editorTheme: "vs-dark",
+  editorTheme: "glass-cockpit",
   projects: [],
   projectsLoading: false,
   kickoffLoading: false,
@@ -584,7 +584,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       set({
         config,
         configLoading: false,
-        editorTheme: config.editor_theme ?? "vs-dark",
+        editorTheme: config.editor_theme ?? "glass-cockpit",
       });
     } catch (e: unknown) {
       set({ configError: String(e), configLoading: false });
@@ -598,7 +598,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       set({
         config,
         configLoading: false,
-        editorTheme: config.editor_theme ?? "vs-dark",
+        editorTheme: config.editor_theme ?? "glass-cockpit",
       });
     } catch (e: unknown) {
       set({ configError: String(e), configLoading: false });

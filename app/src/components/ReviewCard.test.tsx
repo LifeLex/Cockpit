@@ -52,8 +52,8 @@ describe("ReviewCard", () => {
     // unreachable without forcing an invalid value.
     const labels: Record<(typeof ALL_GATE_STATES)[number], string> = {
       Pending: "Review",
-      InReview: "Continue",
-      Dispatched: "Waiting…",
+      InReview: "Review",
+      Dispatched: "Watch",
       Reworked: "Re-review",
       Approved: "View",
     };
@@ -70,5 +70,52 @@ describe("ReviewCard", () => {
       ).toBeInTheDocument();
       unmount();
     }
+  });
+
+  it("leads with a state-derived reason line", () => {
+    render(
+      <ReviewCard
+        review={makeReview({ gate_state: "Reworked" })}
+        onAction={vi.fn()}
+        onRestack={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/agent reworked/i)).toBeInTheDocument();
+  });
+
+  it("shows a Restack reason for a stale review", () => {
+    render(
+      <ReviewCard
+        review={makeReview({ stale: true })}
+        onAction={vi.fn()}
+        onRestack={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/restack needed/i)).toBeInTheDocument();
+  });
+
+  it("surfaces the stack relationship when the review has children", () => {
+    render(
+      <ReviewCard
+        review={makeReview({ children: ["child-1", "child-2"] })}
+        onAction={vi.fn()}
+        onRestack={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/parent of 2/i)).toBeInTheDocument();
+  });
+
+  it("renders the compact density as a telemetry row with an action", () => {
+    render(
+      <ReviewCard
+        review={makeReview({ gate_state: "Pending" })}
+        onAction={vi.fn()}
+        onRestack={vi.fn()}
+        density="compact"
+      />,
+    );
+    expect(
+      screen.getByRole("button", { name: "Review" }),
+    ).toBeInTheDocument();
   });
 });

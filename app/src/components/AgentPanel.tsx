@@ -1,246 +1,262 @@
 /**
- * Agent activity timeline — renders streaming JSONL events from a
- * Claude Code agent run as a real-time activity feed.
+ * Agent activity timeline — the product's signature surface for watching an
+ * agent rework a PR in real time.
  *
- * Listens for Tauri `"agent-event"` events, maintains a list in local
- * state, and renders each event type with appropriate styling.
- * Subagent spawns (Agent/Skill tools) are visualised inline.
+ * Listens for Tauri `"agent-event"` events, maintains a local list, and renders
+ * each event as a row on a vertical timeline rail: an SVG icon tile (no emoji)
+ * colored by event tone, a bold title, a faint mono detail line, and a
+ * right-aligned tabular-nums elapsed timestamp. A header LED pulses while the
+ * agent runs and stops on a terminal Complete / Error event.
+ *
+ * Presentation (icon + tone + copy per event variant) lives in
+ * `@/lib/agent-event`; this component owns streaming, layout, and lifecycle.
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { Event } from "../bindings/Event";
-
-function assertNever(x: never): never {
-  throw new Error(`unreachable: ${String(x)}`);
-}
+import {
+  presentEvent,
+  toneTileClass,
+  AgentMark,
+  type EventPresentation,
+} from "@/lib/agent-event";
+import { X, Trash2 } from "lucide-react";
+import { cn } from "@/lib/utils";
 
 /** Internal event entry with a local sequence number for keying. */
 interface TimelineEntry {
   readonly seq: number;
   readonly event: Event;
+  /** Wall-clock ms when received (for the elapsed-since-start stamp). */
   readonly timestamp: number;
 }
 
 interface AgentPanelProps {
   /** Whether the panel is visible. */
   readonly visible: boolean;
-  /** Callback to hide the panel. */
+  /** Callback to hide the panel / return to the diff. */
   readonly onClose: () => void;
 }
 
-/** Format milliseconds as a human-readable duration. */
-function formatDuration(ms: number): string {
+/** Terminal lifecycle of the run, derived from the received events. */
+type RunPhase = "idle" | "running" | "complete" | "failed";
+
+/** Format milliseconds as a compact, monospace-friendly duration. */
+function formatElapsed(ms: number): string {
   if (ms < 1000) return `${String(ms)}ms`;
-  const seconds = ms / 1000;
-  if (seconds < 60) return `${seconds.toFixed(1)}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  return `${String(minutes)}m ${remainingSeconds.toFixed(0)}s`;
+  const totalSeconds = Math.floor(ms / 1000);
+  if (totalSeconds < 60) return `${String(totalSeconds)}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes)}m ${String(seconds).padStart(2, "0")}s`;
 }
 
-/** Format cost in USD. */
-function formatCost(usd: number): string {
-  if (usd < 0.01) return `$${usd.toFixed(4)}`;
-  return `$${usd.toFixed(2)}`;
-}
-
-/** Determine the icon/prefix for a tool name. */
-function toolIcon(name: string): string {
-  switch (name) {
-    case "Read":
-      return "\u{1F4C4}"; // page facing up
-    case "Edit":
-      return "\u{270F}\u{FE0F}"; // pencil
-    case "Write":
-      return "\u{1F4DD}"; // memo
-    case "Bash":
-      return "\u{1F4BB}"; // laptop
-    case "Agent":
-    case "Skill":
-    case "Task":
-      return "\u{25C8}"; // diamond
-    default:
-      return "\u{2699}\u{FE0F}"; // gear
+/** Derive the run phase from the current entry list. */
+function runPhase(entries: readonly TimelineEntry[]): RunPhase {
+  if (entries.length === 0) return "idle";
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const kind = entries[i]?.event.kind;
+    if (kind === "Complete") return "complete";
+    if (kind === "Error") return "failed";
   }
+  return "running";
 }
 
-/** Render a single timeline event. */
-function renderEvent(entry: TimelineEntry): React.ReactNode {
-  const { event } = entry;
+/** The pulsing/steady header LED, honoring reduced-motion. */
+function HeaderLed({ phase }: { readonly phase: RunPhase }) {
+  const color =
+    phase === "running"
+      ? "bg-state-dispatched"
+      : phase === "complete"
+        ? "bg-success"
+        : phase === "failed"
+          ? "bg-danger"
+          : "bg-muted-foreground";
+  return (
+    <span className="relative flex h-2.5 w-2.5 shrink-0" aria-hidden="true">
+      {phase === "running" && (
+        <span
+          className={cn(
+            "absolute inline-flex h-full w-full rounded-full opacity-60 animate-ping motion-reduce:hidden",
+            color,
+          )}
+        />
+      )}
+      <span
+        className={cn("relative inline-flex h-2.5 w-2.5 rounded-full", color)}
+      />
+    </span>
+  );
+}
 
-  switch (event.kind) {
-    case "Init":
-      return (
-        <div className="flex items-center gap-2 text-muted-foreground">
-          <span className="text-primary">{"\u{2721}"}</span>
-          <span>
-            Started &middot; {event.model} &middot; {String(event.tools.length)} tools
-          </span>
-        </div>
-      );
+/** A single timeline row: rail node + icon tile + title/detail + timestamp. */
+function TimelineRow({
+  presentation,
+  elapsedLabel,
+  isLast,
+  running,
+}: {
+  readonly presentation: EventPresentation;
+  readonly elapsedLabel: string;
+  readonly isLast: boolean;
+  readonly running: boolean;
+}) {
+  const { icon: Icon, tone, title, detail } = presentation;
+  return (
+    <li className="relative flex gap-3 pb-4 last:pb-0">
+      {/* Rail: vertical connector behind the tile, hidden on the last row. */}
+      {!isLast && (
+        <span
+          aria-hidden="true"
+          className="absolute left-[13px] top-7 bottom-0 w-px bg-border"
+        />
+      )}
 
-    case "Thinking":
-      return (
-        <div className="flex items-center gap-2 text-muted-foreground">
-          <span>{"\u{1F4AD}"}</span>
-          <span>thinking &middot; {String(event.estimated_tokens)} tokens</span>
-        </div>
-      );
+      {/* Icon tile */}
+      <span
+        className={cn(
+          "relative z-10 flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md",
+          toneTileClass(tone),
+        )}
+      >
+        <Icon className="h-3.5 w-3.5" />
+      </span>
 
-    case "ToolUse":
-      return (
-        <div className="flex items-center gap-2">
-          <span>{toolIcon(event.name)}</span>
-          <span className="font-medium text-foreground">{event.name}</span>
-          <span className="text-muted-foreground truncate">{event.input_summary}</span>
-        </div>
-      );
-
-    case "ToolResult":
-      return (
-        <div className="flex items-center gap-2">
-          <span>{event.success ? "\u{2713}" : "\u{2717}"}</span>
-          <span
-            className={
-              event.success
-                ? "text-success text-xs"
-                : "text-danger text-xs"
-            }
-          >
-            {event.success ? "ok" : "error"}
-          </span>
-          {event.summary !== "" && (
-            <span className="text-muted-foreground text-xs truncate max-w-[400px]">
-              {event.summary}
+      {/* Body */}
+      <div className="flex min-w-0 flex-1 items-baseline gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="font-display text-[13px] font-semibold text-foreground">
+              {title}
             </span>
+            {isLast && running && (
+              <span
+                aria-hidden="true"
+                className="inline-block h-2.5 w-2.5 rounded-full border-2 border-current border-t-transparent text-muted-foreground animate-spin motion-reduce:hidden"
+              />
+            )}
+          </div>
+          {detail !== "" && (
+            <p className="mt-0.5 truncate font-mono text-xs text-muted-foreground">
+              {detail}
+            </p>
           )}
         </div>
-      );
+        <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground/70">
+          {elapsedLabel}
+        </span>
+      </div>
+    </li>
+  );
+}
 
-    case "Text":
-      return (
-        <div className="text-foreground text-sm whitespace-pre-wrap max-h-[80px] overflow-y-auto">
-          {event.content}
-        </div>
-      );
+/** Calm, emoji-free empty state shown before any event arrives. */
+function EmptyState() {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
+      <AgentMark className="h-6 w-6 text-muted-foreground/50" />
+      <p className="font-display text-sm text-muted-foreground">
+        Waiting for the agent…
+      </p>
+      <p className="max-w-[32ch] text-xs text-muted-foreground/70">
+        Activity will stream here as the agent reworks this PR.
+      </p>
+    </div>
+  );
+}
 
-    case "SubagentSpawn":
-      return (
-        <div className="flex items-center gap-2">
-          <span className="text-primary">{"\u{25C8}"}</span>
-          <span className="font-medium text-foreground">Agent</span>
-          <span className="text-muted-foreground truncate">{event.prompt}</span>
-          <span className="inline-block w-3 h-3 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-        </div>
-      );
-
-    case "SubagentResult":
-      return (
-        <div className="flex items-center gap-2">
-          <span className="text-success">{"\u{25C8}"}</span>
-          <span className="text-success text-xs">done</span>
-          <span className="text-muted-foreground text-xs truncate max-w-[400px]">
-            {event.result}
-          </span>
-        </div>
-      );
-
-    case "RateLimit":
-      return (
-        <div className="flex items-center gap-2 text-warning">
-          <span>{"\u{26A0}\u{FE0F}"}</span>
-          <span className="text-xs">Rate limited: {event.status}</span>
-        </div>
-      );
-
-    case "Complete":
-      return (
-        <div className="flex items-center gap-2 text-success font-medium">
-          <span>{"\u{2713}"}</span>
-          <span>
-            Complete &middot; {formatDuration(event.duration_ms)} &middot;{" "}
-            {formatCost(event.cost_usd)} &middot; {String(event.output_tokens)} tokens
-          </span>
-        </div>
-      );
-
-    case "Error":
-      return (
-        <div className="flex items-center gap-2 text-danger">
-          <span>{"\u{2717}"}</span>
-          <span>{event.message}</span>
-        </div>
-      );
-
-    default:
-      return assertNever(event);
-  }
+/** Terminal banner shown after the run finishes. */
+function EndBanner({ phase }: { readonly phase: "complete" | "failed" }) {
+  const complete = phase === "complete";
+  return (
+    <div
+      className={cn(
+        "mt-1 flex items-center gap-2 rounded-md border px-3 py-2 text-xs",
+        complete
+          ? "border-success/30 bg-success/10 text-success"
+          : "border-danger/30 bg-danger/10 text-danger",
+      )}
+    >
+      <span
+        className={cn(
+          "inline-block h-2 w-2 rounded-full",
+          complete ? "bg-success" : "bg-danger",
+        )}
+      />
+      <span className="font-medium">
+        {complete ? "Reworked — ready to re-review" : "Failed"}
+      </span>
+    </div>
+  );
 }
 
 export function AgentPanel({ visible, onClose }: AgentPanelProps) {
   const [entries, setEntries] = useState<readonly TimelineEntry[]>([]);
-  const [startTime] = useState(() => Date.now());
+  const [startTime, setStartTime] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const seqRef = useRef(0);
 
-  // Track whether the agent is still running: at least one event received
-  // and no terminal event yet.
-  const isRunning = entries.length > 0 && !entries.some(
-    (e) => e.event.kind === "Complete" || e.event.kind === "Error",
-  );
+  const phase = runPhase(entries);
+  const isRunning = phase === "running";
 
-  // Elapsed time counter while running.
+  // Count tool uses and total thinking tokens for the header telemetry.
+  let toolCount = 0;
+  let thinkingTokens = 0;
+  for (const e of entries) {
+    if (e.event.kind === "ToolUse") toolCount += 1;
+    if (e.event.kind === "Thinking") {
+      thinkingTokens = Math.max(thinkingTokens, e.event.estimated_tokens);
+    }
+  }
+
+  // Elapsed timer while running.
   useEffect(() => {
-    if (!isRunning) return;
+    if (!isRunning || startTime === null) return;
     const interval = setInterval(() => {
       setElapsed(Date.now() - startTime);
-    }, 100);
-    return () => { clearInterval(interval); };
+    }, 200);
+    return () => {
+      clearInterval(interval);
+    };
   }, [isRunning, startTime]);
 
   // Listen for agent events from Tauri.
   useEffect(() => {
     const unlisten = listen<Event>("agent-event", (tauriEvent) => {
       const event = tauriEvent.payload;
+      const now = Date.now();
+      setStartTime((prev) => prev ?? now);
 
-      // For Thinking events, update in place instead of appending.
+      // Thinking events collapse in place: keep the latest token count on a
+      // single row instead of spamming the rail.
       if (event.kind === "Thinking") {
         setEntries((prev) => {
           const lastIdx = prev.length - 1;
           const last = lastIdx >= 0 ? prev[lastIdx] : undefined;
           if (last !== undefined && last.event.kind === "Thinking") {
-            // Replace the last thinking entry.
             const updated = [...prev];
-            updated[lastIdx] = {
-              ...last,
-              event,
-              timestamp: Date.now(),
-            };
+            updated[lastIdx] = { ...last, event, timestamp: now };
             return updated;
           }
-          // New thinking entry.
           seqRef.current += 1;
-          return [
-            ...prev,
-            { seq: seqRef.current, event, timestamp: Date.now() },
-          ];
+          return [...prev, { seq: seqRef.current, event, timestamp: now }];
         });
         return;
       }
 
       seqRef.current += 1;
-      const entry: TimelineEntry = {
-        seq: seqRef.current,
-        event,
-        timestamp: Date.now(),
-      };
-      setEntries((prev) => [...prev, entry]);
+      setEntries((prev) => [
+        ...prev,
+        { seq: seqRef.current, event, timestamp: now },
+      ]);
     });
 
     return () => {
-      void unlisten.then((f) => { f(); });
+      void unlisten.then((f) => {
+        f();
+      });
     };
   }, []);
 
@@ -255,57 +271,100 @@ export function AgentPanel({ visible, onClose }: AgentPanelProps) {
   const handleClear = useCallback(() => {
     setEntries([]);
     seqRef.current = 0;
+    setStartTime(null);
+    setElapsed(0);
   }, []);
 
   if (!visible) return null;
 
+  const modeLabel = phase === "failed" ? "failed" : isRunning ? "running" : "idle";
+  // Once any event has arrived, startTime is set; captured here so the render
+  // path never needs a non-null assertion.
+  const anchor = startTime;
+
   return (
-    <div className="border-t border-border bg-card flex flex-col max-h-[300px] shrink-0">
+    <div className="flex h-full min-h-0 flex-col bg-card">
       {/* Header */}
-      <div className="px-4 py-2 border-b border-border flex items-center gap-3 shrink-0">
-        <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-          Agent Activity
+      <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
+        <HeaderLed phase={phase} />
+        <AgentMark className="h-4 w-4 text-brand" />
+        <span className="font-display text-sm font-semibold text-foreground">
+          Agent
         </span>
-        {isRunning && (
-          <span className="text-xs text-warning">
-            {formatDuration(elapsed)}
+        <span className="font-mono text-xs text-muted-foreground">
+          · {modeLabel}
+        </span>
+
+        {anchor !== null && (
+          <span className="font-mono text-xs tabular-nums text-muted-foreground">
+            {formatElapsed(isRunning ? elapsed : lastElapsed(entries, anchor))}
           </span>
         )}
-        {isRunning && (
-          <span className="inline-block w-2 h-2 bg-warning rounded-full animate-pulse" />
-        )}
-        <div className="ml-auto flex items-center gap-2">
+
+        <div className="ml-auto flex items-center gap-3">
+          {(toolCount > 0 || thinkingTokens > 0) && (
+            <span className="flex items-center gap-2 font-mono text-[11px] tabular-nums text-muted-foreground/80">
+              {toolCount > 0 && <span>{String(toolCount)} tools</span>}
+              {thinkingTokens > 0 && (
+                <span>{String(thinkingTokens)} tok</span>
+              )}
+            </span>
+          )}
           <button
+            type="button"
             onClick={handleClear}
-            className="text-xs text-muted-foreground hover:text-foreground bg-transparent border-none cursor-pointer"
+            title="Clear activity"
+            className="flex cursor-pointer items-center gap-1 border-none bg-transparent text-xs text-muted-foreground hover:text-foreground"
           >
+            <Trash2 className="h-3.5 w-3.5" />
             Clear
           </button>
           <button
+            type="button"
             onClick={onClose}
-            className="text-xs text-muted-foreground hover:text-foreground bg-transparent border-none cursor-pointer"
+            title="Close"
+            className="flex cursor-pointer items-center border-none bg-transparent text-muted-foreground hover:text-foreground"
           >
-            Close
+            <X className="h-4 w-4" />
           </button>
         </div>
       </div>
 
       {/* Timeline */}
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto px-4 py-2 space-y-1 text-[13px] font-mono"
-      >
-        {entries.length === 0 && (
-          <span className="text-muted-foreground text-xs">
-            Waiting for agent events...
-          </span>
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+        {entries.length === 0 || anchor === null ? (
+          <EmptyState />
+        ) : (
+          <>
+            <ol className="list-none">
+              {entries.map((entry, idx) => (
+                <TimelineRow
+                  key={entry.seq}
+                  presentation={presentEvent(entry.event)}
+                  elapsedLabel={formatElapsed(
+                    Math.max(0, entry.timestamp - anchor),
+                  )}
+                  isLast={idx === entries.length - 1}
+                  running={isRunning}
+                />
+              ))}
+            </ol>
+            {(phase === "complete" || phase === "failed") && (
+              <EndBanner phase={phase} />
+            )}
+          </>
         )}
-        {entries.map((entry) => (
-          <div key={entry.seq} className="py-0.5">
-            {renderEvent(entry)}
-          </div>
-        ))}
       </div>
     </div>
   );
+}
+
+/** Elapsed from start to the last received event (for the frozen final stamp). */
+function lastElapsed(
+  entries: readonly TimelineEntry[],
+  startTime: number,
+): number {
+  const last = entries[entries.length - 1];
+  if (last === undefined) return 0;
+  return Math.max(0, last.timestamp - startTime);
 }

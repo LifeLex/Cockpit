@@ -26,6 +26,7 @@ import {
   FolderTree,
   ListTree,
   SlidersHorizontal,
+  ChevronDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -41,9 +42,9 @@ const APP_THEME_OPTIONS = [
   { value: "system", label: "System" },
 ] as const;
 
-/** Shared field styling for native `<select>` controls. */
+/** Shared field styling for the tokened `<select>` control. */
 const SELECT_CLASS =
-  "h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
+  "h-9 w-full appearance-none rounded-md border border-border bg-card px-3 py-1 text-sm text-foreground shadow-sm transition-colors hover:border-ring/60 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50";
 
 /**
  * One labelled settings row: a description column on the left and the control
@@ -550,18 +551,20 @@ export function SettingsView() {
           </CardHeader>
           <CardContent className="flex flex-col gap-6">
             <SettingsRow label="App theme" description="Overall color scheme.">
-              <div className="flex gap-4">
-                {APP_THEME_OPTIONS.map((opt) => (
-                  <label
-                    key={opt.value}
-                    className="flex cursor-pointer items-center gap-2 text-sm"
-                  >
-                    <input
-                      type="radio"
-                      name="app-theme"
-                      value={opt.value}
-                      checked={appTheme === opt.value}
-                      onChange={() => {
+              <div
+                role="radiogroup"
+                aria-label="App theme"
+                className="inline-flex w-fit items-center gap-1 rounded-lg border border-border bg-muted p-[3px]"
+              >
+                {APP_THEME_OPTIONS.map((opt) => {
+                  const selected = appTheme === opt.value;
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      role="radio"
+                      aria-checked={selected}
+                      onClick={() => {
                         setAppTheme(opt.value);
                         if (opt.value === "dark") {
                           document.documentElement.classList.add("dark");
@@ -569,11 +572,17 @@ export function SettingsView() {
                           document.documentElement.classList.remove("dark");
                         }
                       }}
-                      className="accent-primary"
-                    />
-                    {opt.label}
-                  </label>
-                ))}
+                      className={cn(
+                        "cursor-pointer rounded-md border border-transparent px-3 py-1 text-sm font-medium transition-colors focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50",
+                        selected
+                          ? "bg-card text-foreground shadow-sm"
+                          : "bg-transparent text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
               </div>
             </SettingsRow>
 
@@ -582,20 +591,26 @@ export function SettingsView() {
               htmlFor="editor-theme"
               description="Theme used by the Monaco diff editor."
             >
-              <select
-                id="editor-theme"
-                value={editorTheme}
-                onChange={(e) => {
-                  setEditorTheme(e.target.value);
-                }}
-                className={SELECT_CLASS}
-              >
-                {MONACO_THEMES.map((theme) => (
-                  <option key={theme.id} value={theme.id}>
-                    {theme.label}
-                  </option>
-                ))}
-              </select>
+              <div className="relative">
+                <select
+                  id="editor-theme"
+                  value={editorTheme}
+                  onChange={(e) => {
+                    setEditorTheme(e.target.value);
+                  }}
+                  className={cn(SELECT_CLASS, "pr-9")}
+                >
+                  {MONACO_THEMES.map((theme) => (
+                    <option key={theme.id} value={theme.id}>
+                      {theme.label}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown
+                  className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+                  aria-hidden="true"
+                />
+              </div>
             </SettingsRow>
           </CardContent>
         </Card>

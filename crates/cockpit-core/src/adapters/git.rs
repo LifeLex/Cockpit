@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use git2::{BranchType, Oid, Repository, WorktreeAddOptions, WorktreePruneOptions};
+use git2::{BranchType, DiffFormat, Oid, Repository, WorktreeAddOptions, WorktreePruneOptions};
 use tokio::process::Command;
 
 /// Errors from git worktree operations.
@@ -157,6 +157,40 @@ pub fn reconcile(worktree_path: &Path) -> Result<git2::Oid, Error> {
 
     let commit = head.peel_to_commit()?;
     Ok(commit.id())
+}
+
+/// Produce a unified diff of the changes between two revisions in a worktree.
+///
+/// Resolves `from` and `to` as revisions (SHAs, refs, or any revspec git
+/// understands) within `worktree` and returns the `from..to` patch in standard
+/// unified-diff format — the same `diff --git` / `@@` shape that `gh pr diff`
+/// emits, so it parses with the frontend's unified-diff parser.
+///
+/// Used for interdiff re-review: showing the reviewer only the changes since
+/// their last dispatch rather than the full PR again.
+///
+/// An unknown revision or invalid SHA yields [`Error::Git2`] rather than
+/// panicking. Identical `from` and `to` produce an empty string.
+pub fn diff_range(worktree: &Path, from: &str, to: &str) -> Result<String, Error> {
+    let repo = Repository::open(worktree)?;
+    let from_tree = repo.revparse_single(from)?.peel_to_tree()?;
+    let to_tree = repo.revparse_single(to)?.peel_to_tree()?;
+
+    let diff = repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?;
+
+    let mut patch = String::new();
+    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        // Context/added/removed lines carry their prefix in `origin`; file and
+        // hunk headers already include their prefix in `content`, so only
+        // prepend the marker for the three body-line kinds.
+        if matches!(line.origin(), ' ' | '+' | '-') {
+            patch.push(line.origin());
+        }
+        patch.push_str(&String::from_utf8_lossy(line.content()));
+        true
+    })?;
+
+    Ok(patch)
 }
 
 /// Remove a worktree and clean up its directory.
@@ -767,6 +801,61 @@ mod tests {
     fn reconcile_nonexistent_path() {
         let result = reconcile(Path::new("/nonexistent/path"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn diff_range_two_commits() {
+        let (repo, dir) = scratch_repo_with_file();
+
+        // scratch_repo_with_file seeds base.txt with "line 1\n" on `main`.
+        // Replace line 1 and append a line so the patch has both -/+ lines.
+        commit_file(&repo, "base.txt", b"line one\nline 2\n", "edit base");
+
+        let patch = diff_range(dir.path(), "HEAD~1", "HEAD").unwrap();
+
+        assert!(
+            patch.contains("@@"),
+            "diff should contain a hunk header, got:\n{patch}"
+        );
+        assert!(
+            patch.contains("-line 1"),
+            "diff should show the removed line, got:\n{patch}"
+        );
+        assert!(
+            patch.contains("+line one"),
+            "diff should show the added line, got:\n{patch}"
+        );
+        assert!(
+            patch.contains("base.txt"),
+            "diff should name the changed file, got:\n{patch}"
+        );
+    }
+
+    #[test]
+    fn diff_range_unknown_revision() {
+        let (_repo, dir) = scratch_repo_with_file();
+
+        // A well-formed but nonexistent SHA must error, not panic.
+        let result = diff_range(
+            dir.path(),
+            "HEAD",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
+        assert!(
+            matches!(result, Err(Error::Git2(_))),
+            "unknown revision should yield Error::Git2, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn diff_range_identical_is_empty() {
+        let (_repo, dir) = scratch_repo_with_file();
+
+        let patch = diff_range(dir.path(), "HEAD", "HEAD").unwrap();
+        assert!(
+            patch.is_empty(),
+            "identical revisions should produce an empty diff, got:\n{patch}"
+        );
     }
 
     #[test]

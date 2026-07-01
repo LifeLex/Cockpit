@@ -6,6 +6,7 @@ import {
   MessageSquare,
   AlertTriangle,
   Bot,
+  Layers,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Review } from "../bindings/Review";
@@ -14,6 +15,11 @@ import type { GateState } from "../bindings/GateState";
 interface ReviewCardProps {
   readonly review: Review;
   readonly onAction: (pr: string) => void;
+  /**
+   * Restack a stale review onto its parent's new head. Wired only for stale
+   * reviews; explicit user action operating on the review's own branch.
+   */
+  readonly onRestack: (pr: string) => void;
 }
 
 function assertNever(x: never): never {
@@ -109,7 +115,7 @@ function parsePrDisplay(pr: string): { repo: string; number: string } {
   return { repo: "", number: pr };
 }
 
-export function ReviewCard({ review, onAction }: ReviewCardProps) {
+export function ReviewCard({ review, onAction, onRestack }: ReviewCardProps) {
   const { repo, number: prNumber } = parsePrDisplay(review.pr);
   const action = actionConfigForState(review.gate_state);
 
@@ -183,6 +189,24 @@ export function ReviewCard({ review, onAction }: ReviewCardProps) {
           >
             {action.label}
           </Button>
+
+          {/* Restack — only for stale reviews; explicit user action on the
+              review's own branch. Disabled while the conflict-resolver runs. */}
+          {review.stale && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="border-danger/40 text-danger hover:bg-danger/10"
+              disabled={review.agent != null}
+              onClick={() => {
+                onRestack(review.pr);
+              }}
+              title="Rebase this review onto its parent's new head"
+            >
+              <Layers className="h-3.5 w-3.5" />
+              {review.agent != null ? "Restacking…" : "Restack"}
+            </Button>
+          )}
         </div>
       </CardContent>
     </Card>

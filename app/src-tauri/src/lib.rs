@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 use cockpit_core::gate::{AgentOutcome, Gated};
-use cockpit_core::model::{AgentMode, PrRef, ProjectId};
+use cockpit_core::model::{AgentMode, GateState, PrRef, Project, ProjectId, Review};
 
 use state::AppState;
 
@@ -81,6 +81,26 @@ pub fn run() {
     // into `.manage()` (which takes ownership of the Arc).
     let hook_sessions = app_state.sessions.clone();
     let hook_completion_tx = app_state.completion_tx.clone();
+
+    // Restore persisted session state (D5) before any observer runs, so the
+    // flush task's baseline revision reflects the loaded data. A missing or
+    // corrupt file yields `None` (persist::load never panics — Invariant 1), so
+    // a fresh start is the normal first-launch path.
+    if let Ok(home) = cockpit_core::config::cockpit_home()
+        && let Some(persisted) = cockpit_core::persist::load(&home)
+    {
+        app_state
+            .reviews
+            .hydrate(sanitize_loaded_reviews(persisted.reviews));
+        app_state
+            .projects
+            .hydrate(sanitize_loaded_projects(persisted.projects));
+    }
+
+    // Clone the (Arc-backed) store handles for the background flush task before
+    // app_state is moved into `.manage()`.
+    let flush_reviews = app_state.reviews.clone();
+    let flush_projects = app_state.projects.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -177,10 +197,56 @@ pub fn run() {
                 });
             }
 
+            // Background persistence flush (D5). Once per ~second, snapshot the
+            // store revisions; when either changed since the last save, persist
+            // the whole session to disk. `save_atomic` is blocking file IO, so
+            // it runs on the blocking pool — the async loop never blocks
+            // (Invariant 1). Save failures are logged and retried on the next
+            // tick, never fatal.
+            tauri::async_runtime::spawn(async move {
+                let mut last = flush_reviews
+                    .revision()
+                    .wrapping_add(flush_projects.revision());
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                    let current = flush_reviews
+                        .revision()
+                        .wrapping_add(flush_projects.revision());
+                    if current == last {
+                        continue;
+                    }
+
+                    let snapshot = cockpit_core::persist::PersistedState {
+                        version: cockpit_core::persist::STATE_VERSION,
+                        reviews: flush_reviews.list(),
+                        projects: flush_projects.list(),
+                    };
+
+                    // Persist off the async runtime — save_atomic is sync IO.
+                    let saved =
+                        tokio::task::spawn_blocking(
+                            move || match cockpit_core::config::cockpit_home() {
+                                Ok(home) => cockpit_core::persist::save_atomic(&home, &snapshot)
+                                    .map_err(|e| e.to_string()),
+                                Err(e) => Err(e.to_string()),
+                            },
+                        )
+                        .await;
+
+                    match saved {
+                        // Only advance the baseline on a durable save, so a
+                        // failed flush is retried rather than silently skipped.
+                        Ok(Ok(())) => last = current,
+                        Ok(Err(msg)) => eprintln!("persist flush: save failed: {msg}"),
+                        Err(e) => eprintln!("persist flush: save task panicked: {e}"),
+                    }
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::get_version,
             commands::list_reviews,
             commands::get_frontier,
             commands::get_review,
@@ -201,6 +267,7 @@ pub fn run() {
             commands::plan_open,
             commands::batch_status,
             commands::approve_review,
+            commands::merge_review,
             commands::get_config,
             commands::save_config,
             commands::get_agent_prompt,
@@ -228,6 +295,51 @@ pub fn run() {
         // INVARIANT: if Tauri fails to start there is nothing to recover --
         // the app cannot function without the event loop.
         .expect("error running tauri application");
+}
+
+/// Sanitize reviews loaded from disk before hydrating the store (D5).
+///
+/// Two fix-ups make persisted state safe to resume:
+///   * The process that owned each agent handle is dead after a restart, so
+///     every `agent` handle is dropped.
+///   * A review left `Dispatched` at shutdown had an in-flight agent that will
+///     never report back, so it is returned to `InReview` via
+///     `mark_agent_failed`, which preserves its comments (Invariant 4) so the
+///     pending rework can be re-dispatched.
+///
+/// The `mark_agent_failed` call is guarded by the `Dispatched` check, so its
+/// only failure mode is unreachable here; the `Result` is ignored deliberately.
+fn sanitize_loaded_reviews(reviews: Vec<Review>) -> Vec<Review> {
+    reviews
+        .into_iter()
+        .map(|mut review| {
+            review.agent = None;
+            if review.gate_state == GateState::Dispatched {
+                let _ = review.mark_agent_failed();
+            }
+            review
+        })
+        .collect()
+}
+
+/// Sanitize projects loaded from disk before hydrating the store (D5).
+///
+/// Mirrors [`sanitize_loaded_reviews`] for each project's optional plan: drop
+/// the dead planner `agent` handle, and return a `Dispatched` plan to
+/// `InReview` (comments preserved) so a pending plan rework can be re-dispatched.
+fn sanitize_loaded_projects(projects: Vec<Project>) -> Vec<Project> {
+    projects
+        .into_iter()
+        .map(|mut project| {
+            if let Some(plan) = project.plan.as_mut() {
+                plan.agent = None;
+                if plan.gate_state == GateState::Dispatched {
+                    let _ = plan.mark_agent_failed();
+                }
+            }
+            project
+        })
+        .collect()
 }
 
 /// Reconcile a Fix/Restack agent completion against git HEAD and return the

@@ -18,19 +18,13 @@ use cockpit_core::gate::Gated;
 use cockpit_core::kickoff::{self, KickoffResult};
 use cockpit_core::model::{
     AgentMode, Anchor, Artifact, Comment, CommentId, CommentOrigin, DiffData, DiffSide, GateState,
-    PrRef, Project, ProjectId, ProjectPlan, ProjectRef, Review,
+    PrRef, Project, ProjectId, ProjectPlan, ProjectRef, Review, ReviewSource,
 };
 use cockpit_core::plan_parser;
 use cockpit_core::restack;
 
 use crate::error::CommandError;
 use crate::state::AppState;
-
-/// Return the cockpit-core crate version — trivial command to prove IPC round-trip.
-#[tauri::command]
-pub fn get_version() -> String {
-    cockpit_core::VERSION.to_string()
-}
 
 /// List all reviews currently in the store.
 #[tauri::command]
@@ -45,7 +39,9 @@ pub fn get_frontier(state: State<'_, Arc<AppState>>) -> Result<Vec<Review>, Comm
         .reviews
         .list()
         .into_iter()
-        .filter(|r| !r.stale && r.gate_state != GateState::Approved)
+        .filter(|r| {
+            !r.stale && r.gate_state != GateState::Approved && r.gate_state != GateState::Merged
+        })
         .collect();
     Ok(frontier)
 }
@@ -160,6 +156,13 @@ pub async fn request_changes(
         return Err(CommandError::from(e));
     }
 
+    // D7: dispatching rework makes this review's descendants stale — once its
+    // HEAD advances they sit on an old base and need a restack. Mark them at
+    // dispatch time (SPEC §7), immediately after the successful transition.
+    if let Some(id) = state.reviews.get(&pr_ref).map(|r| r.id) {
+        state.reviews.mark_descendants_stale(&id);
+    }
+
     // Spawn the fixer agent via the shared Fix-loop path (no CI logs here).
     // Spawn failure is non-fatal — the gate transition already succeeded so we
     // return the Dispatched review regardless and log the spawn error.
@@ -168,6 +171,50 @@ pub async fn request_changes(
     state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
         message: format!("Review not found: {pr}"),
     })
+}
+
+/// Maximum number of PR-body characters carried into a rework intent.
+///
+/// A very long PR description would otherwise dominate the prompt; truncating
+/// keeps the fixer focused while still giving it the leading context.
+const MAX_INTENT_BODY_CHARS: usize = 8000;
+
+/// Compose the rework intent from a review's PR title, body, and issue ref.
+///
+/// Lays out the parts as `<title>` / `<body>` / `Issue: <ref>` separated by
+/// blank lines, skipping any empty part so there are no stray blank lines. The
+/// body is truncated to [`MAX_INTENT_BODY_CHARS`] characters on a `char`
+/// boundary (D4).
+fn compose_fix_intent(title: &str, body: &str, issue: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let title = title.trim();
+    if !title.is_empty() {
+        parts.push(title.to_string());
+    }
+
+    let body = truncate_on_char_boundary(body.trim(), MAX_INTENT_BODY_CHARS);
+    if !body.is_empty() {
+        parts.push(body.to_string());
+    }
+
+    let issue = issue.trim();
+    if !issue.is_empty() {
+        parts.push(format!("Issue: {issue}"));
+    }
+
+    parts.join("\n\n")
+}
+
+/// Return the prefix of `s` holding at most `max_chars` characters.
+///
+/// Slices on a `char` boundary (never mid-codepoint), so the result is always
+/// valid UTF-8.
+fn truncate_on_char_boundary(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
 }
 
 /// Dispatch the diff-gate Fix loop for a review already transitioned to
@@ -201,8 +248,11 @@ async fn dispatch_fix_agent(
     // (fall back to no skills — never block the loop).
     let skills = cockpit_core::skills::relevant_for_diff(&review.diff.raw);
     let artifact = Artifact::Diff(review.diff.clone());
+    // Compose the rework intent from the PR title/body/issue so the fixer has
+    // the full context, not just the bare issue ref (D4).
+    let intent = compose_fix_intent(&review.title, &review.body, review.issue.as_str());
     let rework_input = cockpit_core::prompt::ReworkInput {
-        intent: review.issue.as_str(),
+        intent: &intent,
         custom_preamble: preamble.as_deref(),
         approved_plan: None,
         artifact: &artifact,
@@ -516,6 +566,11 @@ pub async fn fix_ci(
 
     if let Some(e) = transition_err {
         return Err(CommandError::from(e));
+    }
+
+    // D7: same as request_changes — dispatching rework staled the descendants.
+    if let Some(id) = state.reviews.get(&pr_ref).map(|r| r.id) {
+        state.reviews.mark_descendants_stale(&id);
     }
 
     // Reuse the shared Fix-loop spawn path, carrying the CI logs into the
@@ -997,6 +1052,127 @@ pub fn approve_review(state: State<'_, Arc<AppState>>, pr: String) -> Result<Rev
     })
 }
 
+/// Merge an approved review's PR (`Approved` -> `Merged`) and GC its worktree.
+///
+/// This is a guarded side effect (Invariant 5 / `SPEC.md` §9): it only ever
+/// runs from this explicit user command, never automatically or from agent
+/// output. It requires the review to be [`GateState::Approved`] and refuses
+/// [`ReviewSource::ReviewRequested`] PRs — cockpit merges the user's own work,
+/// not teammates' review requests.
+///
+/// On a successful `gh pr merge` (squash) it advances the gate to `Merged`,
+/// marks the review's descendants stale (they now sit on an old base and need a
+/// restack), then GCs the worktree — but only when it lives under the
+/// cockpit-managed worktrees directory, never the user's main checkout. The
+/// prune is best-effort: a failure is logged, not surfaced as an error
+/// (Invariant 1).
+#[tauri::command]
+pub async fn merge_review(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+) -> Result<Review, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    // Guard: only an approved review may merge.
+    if review.gate_state != GateState::Approved {
+        return Err(CommandError {
+            message: format!(
+                "Review {pr} is not approved (state: {:?}); approve it before merging",
+                review.gate_state
+            ),
+        });
+    }
+
+    // Guard: never merge a teammate's review-requested PR.
+    if review.source == ReviewSource::ReviewRequested {
+        return Err(CommandError {
+            message: format!(
+                "Review {pr} is a review-requested PR; cockpit does not merge teammates' PRs"
+            ),
+        });
+    }
+
+    let Some(pr_number) = pr_number_from_ref(&pr) else {
+        return Err(CommandError {
+            message: format!("Could not parse a PR number from: {pr}"),
+        });
+    };
+
+    // Guarded side effect: merge via `gh` (squash). A failure here leaves the
+    // review Approved and is surfaced to the caller.
+    github::merge_pr(
+        review.repo_slug.as_deref(),
+        pr_number,
+        github::MergeMethod::Squash,
+    )
+    .await?;
+
+    // Advance the gate to Merged (Approved -> Merged is the only legal edge).
+    let mut transition_err: Option<cockpit_core::gate::Error> = None;
+    state.reviews.update(&pr_ref, |r| {
+        if let Err(e) = r.mark_merged() {
+            transition_err = Some(e);
+        }
+    });
+    if let Some(e) = transition_err {
+        return Err(CommandError::from(e));
+    }
+
+    // Descendants now sit on an old base — mark them stale so the UI prompts a
+    // restack.
+    state.reviews.mark_descendants_stale(&review.id);
+
+    // Worktree GC: prune the merged review's worktree, but ONLY when it lives
+    // under the cockpit-managed worktrees dir (never the user's main checkout).
+    // Best-effort (Invariant 1): any failure is logged, never surfaced.
+    prune_merged_worktree(&pr, &review.worktree, &review.branch);
+
+    state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })
+}
+
+/// Best-effort GC of a merged review's git worktree.
+///
+/// Only prunes when `worktree` is under [`cockpit_core::config::worktrees_dir`]
+/// so the user's main checkout is never touched. `git2::Repository` is not
+/// `Send`; this helper is synchronous and holds no handle across an `.await`,
+/// so callers must invoke it outside any await span. Every failure mode (no
+/// worktrees dir, worktree outside it, repo won't open, prune errors) is logged
+/// and swallowed — merge already succeeded, so GC must never fail the command.
+fn prune_merged_worktree(pr: &str, worktree: &std::path::Path, branch: &str) {
+    let Ok(worktrees_dir) = cockpit_core::config::worktrees_dir() else {
+        eprintln!("merge_review: could not resolve worktrees dir; skipping prune for {pr}");
+        return;
+    };
+    if !worktree.starts_with(&worktrees_dir) {
+        // Not a cockpit-managed worktree (e.g. an imported PR pointing at the
+        // main checkout) — leave it alone.
+        return;
+    }
+
+    let repo_path = Config::load()
+        .ok()
+        .and_then(|c| c.repo_path)
+        .unwrap_or_else(|| PathBuf::from("."));
+    match git2::Repository::discover(&repo_path) {
+        Ok(repo) => {
+            if let Err(e) = cockpit_core::adapters::git::prune_worktree(&repo, branch) {
+                eprintln!("merge_review: prune_worktree failed for {pr}: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "merge_review: could not open repo at {} for prune: {e}",
+                repo_path.display()
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Settings / Config commands
 // ---------------------------------------------------------------------------
@@ -1330,11 +1506,15 @@ pub async fn restack_pr(
             .map(str::to_owned);
         let prompt =
             restack::assemble_conflict_prompt(&review, &parent_branch, preamble.as_deref());
+        // Key the session + stream by the PR ref (not the ReviewId): the
+        // Restack completion handler resolves reviews by PrRef, so keying by
+        // ReviewId here would leave restack completions unmatched. Mirrors the
+        // Fix path (see `try_spawn_agent`).
         let spawn_result = cockpit_core::adapters::agent::spawn_agent(
             &worktree_path,
             &prompt,
             cockpit_core::model::AgentMode::Restack,
-            review.id.as_str(),
+            review.pr.as_str(),
             &state.sessions,
             &hook_url,
             &spawn_config,
@@ -1346,7 +1526,7 @@ pub async fn restack_pr(
 
         // Start streaming agent stdout to the frontend.
         let stream_ctx = crate::streaming::StreamContext {
-            object_id: review.id.as_str().to_string(),
+            object_id: review.pr.as_str().to_string(),
             mode: cockpit_core::model::AgentMode::Restack,
             completion_tx: state.completion_tx.clone(),
         };

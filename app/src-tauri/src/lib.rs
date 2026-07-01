@@ -252,9 +252,13 @@ pub fn run() {
             commands::get_review,
             commands::open_review,
             commands::get_review_diff,
+            commands::get_interdiff,
             commands::add_comment,
             commands::request_changes,
             commands::mirror_comments,
+            commands::submit_github_review,
+            commands::kill_agent,
+            commands::ensure_review_worktree,
             commands::fetch_ci_checks,
             commands::list_ci_checks,
             commands::ci_run_logs_by_link,
@@ -359,13 +363,25 @@ fn sanitize_loaded_projects(projects: Vec<Project>) -> Vec<Project> {
 async fn reconcile_fix_completion(state: &AppState, object_id: &str) -> &'static str {
     let pr_ref = PrRef::new(object_id);
 
-    // Snapshot the worktree path, dropping the store lock before the blocking
-    // git read and the diff refresh below.
-    let Some(worktree) = state.reviews.get(&pr_ref).map(|r| r.worktree) else {
+    // A completion can arrive for a review that is no longer `Dispatched`: the
+    // agent was killed (kill_agent already reconciled it to InReview) or a
+    // duplicate completion (Stop hook + stream-end) already settled it. Applying
+    // a transition now would be illegal and only log noise, so report the
+    // review's already-settled outcome without touching it.
+    let Some(review) = state.reviews.get(&pr_ref) else {
         // No stored review resolved for this object id — no rework can have
         // landed.
         return "failed";
     };
+    match review.gate_state {
+        GateState::Dispatched => {}
+        GateState::Reworked => return "reworked",
+        _ => return "failed",
+    }
+
+    // Snapshot the worktree path, dropping the store lock before the blocking
+    // git read and the diff refresh below.
+    let worktree = review.worktree;
 
     // `git2` reconcile is blocking; run it off the async runtime.
     let head =

@@ -8,3 +8,4 @@ pub mod agent_stream;
 pub mod git;
 pub mod github;
 pub mod linear;
+pub mod lsp;

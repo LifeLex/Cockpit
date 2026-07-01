@@ -5,6 +5,7 @@ import type { DiffData } from "./DiffData";
 import type { GateState } from "./GateState";
 import type { IssueRef } from "./IssueRef";
 import type { PrRef } from "./PrRef";
+import type { ProjectId } from "./ProjectId";
 import type { ReviewId } from "./ReviewId";
 import type { ReviewSource } from "./ReviewSource";
 
@@ -87,4 +88,9 @@ agent: AgentRun | null,
  * operations like fetching diffs via `gh --repo`. `None` for reviews
  * created from the local repo context (kickoff).
  */
-repo_slug: string | null, };
+repo_slug: string | null, 
+/**
+ * The first-class [`Project`] this review belongs to, if any. `None` for
+ * ungrouped reviews (e.g. GitHub-imported PRs with no project attached).
+ */
+project: ProjectId | null, };

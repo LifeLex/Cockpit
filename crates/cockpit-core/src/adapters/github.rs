@@ -79,6 +79,111 @@ pub struct CheckRun {
     pub conclusion: Option<String>,
 }
 
+/// A single CI check as returned by `gh pr checks --json`.
+///
+/// `gh pr checks` reports each check's `bucket` — a normalized rollup of the
+/// raw state that groups the many possible GitHub statuses into a handful of
+/// outcomes (`pass`, `fail`, `pending`, `skipping`, `cancel`). The bucket is
+/// the reliable signal for summarizing pass/fail; `state` is the raw value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct CiCheck {
+    /// Name of the check (e.g. "build", "lint").
+    pub name: String,
+    /// Raw check state (e.g. "SUCCESS", "FAILURE", "PENDING", "SKIPPED").
+    pub state: String,
+    /// Normalized outcome bucket from `gh` (e.g. "pass", "fail", "pending").
+    pub bucket: String,
+    /// Deep link to the check run's details page (used to extract the run id).
+    pub link: String,
+    /// Workflow name the check belongs to, when available.
+    #[serde(default)]
+    pub workflow: String,
+}
+
+/// Rollup of a set of [`CiCheck`]s into pass/fail/pending counts.
+///
+/// Drives the diff-gate CI badge. Neutral and skipped checks count as passing:
+/// they do not indicate a failure and should not block or alarm the reviewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct CiSummary {
+    /// Checks that passed (includes neutral/skipped/cancelled).
+    pub passed: u32,
+    /// Total number of checks.
+    pub total: u32,
+    /// Checks that failed.
+    pub failed: u32,
+    /// Checks still pending (queued or in progress).
+    pub pending: u32,
+}
+
+/// Classification of a single check's outcome, derived from its bucket/state.
+///
+/// Kept private: the public surface is [`CiSummary`] via [`summarize`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckOutcome {
+    /// Passed, or a non-blocking outcome (neutral, skipped, cancelled).
+    Pass,
+    /// Failed (failure, timed out, action required, startup failure, etc.).
+    Fail,
+    /// Not yet concluded (queued, in progress, pending).
+    Pending,
+}
+
+impl CiCheck {
+    /// Classify this check's outcome from its `bucket` (falling back to `state`).
+    ///
+    /// `gh`'s `bucket` field is the normalized signal; when a fixture or older
+    /// `gh` omits it, the raw `state` is used. Neutral/skipped/cancelled all map
+    /// to [`CheckOutcome::Pass`] — they do not represent a failure.
+    fn outcome(&self) -> CheckOutcome {
+        let signal = if self.bucket.is_empty() {
+            self.state.as_str()
+        } else {
+            self.bucket.as_str()
+        };
+        match signal.to_ascii_lowercase().as_str() {
+            // gh buckets.
+            "pass" | "skipping" | "cancel" => CheckOutcome::Pass,
+            "fail" => CheckOutcome::Fail,
+            "pending" => CheckOutcome::Pending,
+            // Raw GitHub states (used when bucket is absent).
+            "success" | "neutral" | "skipped" | "cancelled" | "canceled" => CheckOutcome::Pass,
+            "failure" | "timed_out" | "action_required" | "startup_failure" | "stale" => {
+                CheckOutcome::Fail
+            }
+            "queued" | "in_progress" | "waiting" | "requested" | "expected" => {
+                CheckOutcome::Pending
+            }
+            // Unknown signal: treat conservatively as pending so it is neither a
+            // false pass nor a false failure.
+            _ => CheckOutcome::Pending,
+        }
+    }
+}
+
+/// Roll up a slice of [`CiCheck`]s into a [`CiSummary`].
+///
+/// Pure and deterministic. Neutral, skipped, and cancelled checks count toward
+/// `passed`. `passed + failed + pending == total`.
+pub fn summarize(checks: &[CiCheck]) -> CiSummary {
+    let mut summary = CiSummary {
+        passed: 0,
+        total: checks.len() as u32,
+        failed: 0,
+        pending: 0,
+    };
+    for check in checks {
+        match check.outcome() {
+            CheckOutcome::Pass => summary.passed += 1,
+            CheckOutcome::Fail => summary.failed += 1,
+            CheckOutcome::Pending => summary.pending += 1,
+        }
+    }
+    summary
+}
+
 // ---------------------------------------------------------------------------
 // Core functions
 // ---------------------------------------------------------------------------
@@ -124,8 +229,12 @@ pub async fn pr_diff(pr_number: u64) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Fetch CI check statuses for a PR via `gh pr checks --json`.
-pub async fn pr_checks(pr_number: u64) -> Result<Vec<CheckRun>, Error> {
+/// Fetch legacy CI check statuses for a PR via `gh pr checks --json`.
+///
+/// Superseded by [`pr_checks`], which returns the richer [`CiCheck`] shape used
+/// by the diff-gate CI badge. Retained for callers that only need the raw
+/// status/conclusion pair.
+pub async fn pr_check_runs(pr_number: u64) -> Result<Vec<CheckRun>, Error> {
     let output = Command::new("gh")
         .args([
             "pr",
@@ -144,6 +253,161 @@ pub async fn pr_checks(pr_number: u64) -> Result<Vec<CheckRun>, Error> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout).map_err(|e| Error::ParseOutput(e.to_string()))
+}
+
+/// Fetch CI checks for a PR via `gh pr checks <n> --json name,state,bucket,link,workflow`.
+///
+/// When `repo_slug` is `Some`, targets that repository with `--repo` so the
+/// call works cross-repo without a `current_dir`. Parses into the [`CiCheck`]
+/// shape used by the diff-gate badge; roll it up with [`summarize`].
+///
+/// This is a STATUS-tier read: it never mutates state and never blocks the
+/// review loop. `gh` exits non-zero when a PR has no checks at all — callers
+/// (e.g. the Tauri `fetch_ci_checks` command) treat that as an empty result.
+pub async fn pr_checks(repo_slug: Option<&str>, pr_number: u64) -> Result<Vec<CiCheck>, Error> {
+    let pr = pr_number.to_string();
+    let mut args: Vec<&str> = vec![
+        "pr",
+        "checks",
+        &pr,
+        "--json",
+        "name,state,bucket,link,workflow",
+    ];
+    if let Some(slug) = repo_slug {
+        args.push("--repo");
+        args.push(slug);
+    }
+
+    let output = Command::new("gh").args(&args).output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout).map_err(|e| Error::ParseOutput(e.to_string()))
+}
+
+/// Maximum characters of concatenated failed-CI logs kept for the rework prompt.
+///
+/// GitHub Actions logs can run to megabytes; the tail is where failures and
+/// assertion output live, so we keep the tail and drop the head. This bounds the
+/// prompt so a huge log can never blow up dispatch (Invariant 1: never block the
+/// loop on GitHub).
+const MAX_CI_LOG_CHARS: usize = 20_000;
+
+/// Extract a GitHub Actions run id from a check's `link` (details URL).
+///
+/// Check links look like
+/// `https://github.com/owner/repo/actions/runs/1234567890/job/987` or
+/// `.../actions/runs/1234567890`. Returns the numeric run id following
+/// `/runs/`, or `None` when the URL is not a recognizable Actions run link.
+pub fn run_id_from_link(link: &str) -> Option<u64> {
+    let after = link.split("/runs/").nth(1)?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+/// Truncate CI log text to [`MAX_CI_LOG_CHARS`], keeping the tail.
+///
+/// When truncation occurs a short marker is prepended so the reader (and the
+/// agent) knows the head was dropped. Splits on a `char` boundary so multi-byte
+/// UTF-8 is never sliced mid-character.
+fn truncate_tail(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let skip = char_count - max_chars;
+    let tail: String = text.chars().skip(skip).collect();
+    format!("[... {skip} earlier characters truncated ...]\n{tail}")
+}
+
+/// Fetch the concatenated logs of a PR's failed CI checks (LOG tier).
+///
+/// Finds the failed checks (via [`summarize`]'s classification), extracts each
+/// distinct run id from the check `link`, runs `gh run view <run-id>
+/// --log-failed`, concatenates the outputs, and truncates to a sane cap keeping
+/// the tail (see [`MAX_CI_LOG_CHARS`]).
+///
+/// This is an ON-DEMAND read fed into the diff-gate rework prompt only from an
+/// explicit user "Fix CI" action — it is never auto-fired and never blocks the
+/// loop. Returns an empty string when there are no failed checks.
+pub async fn failed_ci_logs(repo_slug: Option<&str>, pr_number: u64) -> Result<String, Error> {
+    let checks = pr_checks(repo_slug, pr_number).await?;
+
+    // Collect the distinct run ids of failed checks, preserving first-seen order
+    // so the output is deterministic and a shared run id is fetched once.
+    let mut run_ids: Vec<u64> = Vec::new();
+    for check in &checks {
+        if summarize(std::slice::from_ref(check)).failed == 0 {
+            continue;
+        }
+        if let Some(id) = run_id_from_link(&check.link)
+            && !run_ids.contains(&id)
+        {
+            run_ids.push(id);
+        }
+    }
+
+    let mut combined = String::new();
+    for id in run_ids {
+        match run_view_log_failed(repo_slug, id).await {
+            Ok(log) => {
+                if !combined.is_empty() {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(&format!("=== run {id} (failed jobs) ===\n"));
+                combined.push_str(&log);
+            }
+            // A single run's log fetch failing is non-fatal: keep whatever we
+            // have. Never block the Fix action on a GitHub read (Invariant 1).
+            Err(e) => {
+                eprintln!("failed_ci_logs: gh run view {id} failed: {e}");
+            }
+        }
+    }
+
+    Ok(truncate_tail(&combined, MAX_CI_LOG_CHARS))
+}
+
+/// Fetch the failed-job logs for a single CI run (LOG tier).
+///
+/// Runs `gh run view <run_id> --log-failed` for the given run, scoped to
+/// `repo_slug` when provided, and truncates the output to [`MAX_CI_LOG_CHARS`]
+/// keeping the tail (see [`truncate_tail`]). Unlike [`failed_ci_logs`], which
+/// aggregates every failed run of a PR, this reads exactly one run so the CI
+/// panel can show per-pipeline logs.
+///
+/// This is an ON-DEMAND read for the CI panel; it is never auto-fired against
+/// the review loop and, per Invariant 1, callers treat a `gh` error as
+/// non-fatal (empty logs) rather than a blocked UI.
+pub async fn run_logs(repo_slug: Option<&str>, run_id: u64) -> Result<String, Error> {
+    let raw = run_view_log_failed(repo_slug, run_id).await?;
+    Ok(truncate_tail(&raw, MAX_CI_LOG_CHARS))
+}
+
+/// Run `gh run view <run-id> --log-failed`, optionally scoped to a repo.
+async fn run_view_log_failed(repo_slug: Option<&str>, run_id: u64) -> Result<String, Error> {
+    let id = run_id.to_string();
+    let mut args: Vec<&str> = vec!["run", "view", &id, "--log-failed"];
+    if let Some(slug) = repo_slug {
+        args.push("--repo");
+        args.push(slug);
+    }
+
+    let output = Command::new("gh").args(&args).output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Parse a Linear issue identifier from a branch name.
@@ -490,6 +754,7 @@ pub fn build_review_from_pr(
         stale: false,
         agent: None,
         repo_slug: slug,
+        project: None,
     }
 }
 
@@ -937,6 +1202,95 @@ mod tests {
             .filter(|c| c.origin == CommentOrigin::Local)
             .count();
         assert_eq!(local_count, 2, "only Local comments should be mirrored");
+    }
+
+    // -- CiCheck / summarize --
+
+    /// Fixture in the `gh pr checks --json name,state,bucket,link,workflow`
+    /// shape (bucket present), covering pass/fail/pending/skipping.
+    const GH_CHECKS_BUCKET: &str = r#"[
+        {"name":"build","state":"SUCCESS","bucket":"pass","link":"https://github.com/o/r/actions/runs/111/job/1","workflow":"CI"},
+        {"name":"test","state":"FAILURE","bucket":"fail","link":"https://github.com/o/r/actions/runs/222/job/2","workflow":"CI"},
+        {"name":"lint","state":"PENDING","bucket":"pending","link":"https://github.com/o/r/actions/runs/333/job/3","workflow":"CI"},
+        {"name":"license","state":"SKIPPED","bucket":"skipping","link":"","workflow":"CI"},
+        {"name":"deploy","state":"CANCELLED","bucket":"cancel","link":"","workflow":"CD"}
+    ]"#;
+
+    /// Fixture with the raw-state shape only (no bucket), incl. NEUTRAL/SKIPPED.
+    const GH_CHECKS_RAW_STATE: &str = r#"[
+        {"name":"build","state":"success","bucket":"","link":"https://github.com/o/r/actions/runs/900","workflow":"CI"},
+        {"name":"flaky","state":"neutral","bucket":"","link":"","workflow":"CI"},
+        {"name":"skip","state":"skipped","bucket":"","link":"","workflow":"CI"},
+        {"name":"unit","state":"failure","bucket":"","link":"https://github.com/o/r/actions/runs/901/job/9","workflow":"CI"},
+        {"name":"slow","state":"in_progress","bucket":"","link":"","workflow":"CI"}
+    ]"#;
+
+    #[test]
+    fn summarize_bucket_shape() {
+        let checks: Vec<CiCheck> =
+            serde_json::from_str(GH_CHECKS_BUCKET).expect("bucket fixture parses");
+        let s = summarize(&checks);
+        // pass + skipping + cancel all count as passed.
+        assert_eq!(s.total, 5);
+        assert_eq!(s.passed, 3, "pass + skipping + cancel");
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.pending, 1);
+        assert_eq!(s.passed + s.failed + s.pending, s.total);
+    }
+
+    #[test]
+    fn summarize_raw_state_neutral_skipped_pass() {
+        let checks: Vec<CiCheck> =
+            serde_json::from_str(GH_CHECKS_RAW_STATE).expect("raw-state fixture parses");
+        let s = summarize(&checks);
+        // success + neutral + skipped => passed; failure => failed; in_progress
+        // => pending.
+        assert_eq!(s.total, 5);
+        assert_eq!(s.passed, 3, "success + neutral + skipped count as pass");
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.pending, 1);
+    }
+
+    #[test]
+    fn summarize_empty_is_all_zero() {
+        let s = summarize(&[]);
+        assert_eq!(s.total, 0);
+        assert_eq!(s.passed, 0);
+        assert_eq!(s.failed, 0);
+        assert_eq!(s.pending, 0);
+    }
+
+    #[test]
+    fn run_id_extraction() {
+        assert_eq!(
+            run_id_from_link("https://github.com/o/r/actions/runs/1234567890/job/987"),
+            Some(1234567890)
+        );
+        assert_eq!(
+            run_id_from_link("https://github.com/o/r/actions/runs/42"),
+            Some(42)
+        );
+        // No /runs/ segment.
+        assert_eq!(run_id_from_link("https://github.com/o/r/pull/5"), None);
+        // Empty link.
+        assert_eq!(run_id_from_link(""), None);
+    }
+
+    #[test]
+    fn truncate_keeps_tail() {
+        let text: String = (0..30_000).map(|_| 'x').collect();
+        let out = truncate_tail(&text, MAX_CI_LOG_CHARS);
+        assert!(out.contains("truncated"), "marker present");
+        // The kept tail is exactly MAX_CI_LOG_CHARS of the original content,
+        // plus the prepended marker line.
+        assert!(out.ends_with(&"x".repeat(MAX_CI_LOG_CHARS)));
+        assert!(out.len() > MAX_CI_LOG_CHARS);
+    }
+
+    #[test]
+    fn truncate_noop_when_under_cap() {
+        let text = "short log with a\ntail assertion failed";
+        assert_eq!(truncate_tail(text, MAX_CI_LOG_CHARS), text);
     }
 
     #[test]

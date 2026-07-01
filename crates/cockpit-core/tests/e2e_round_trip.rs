@@ -38,6 +38,7 @@ fn make_test_review(worktree: PathBuf) -> Review {
         stale: false,
         agent: None,
         repo_slug: None,
+        project: None,
     }
 }
 
@@ -81,9 +82,11 @@ async fn full_review_loop_round_trip() {
     // ---------------------------------------------------------------
     let input = ReworkInput {
         intent: "Implement feature TEST-1",
+        custom_preamble: None,
         approved_plan: None,
         artifact: &Artifact::Diff(review.diff.clone()),
         comments: &review.comments,
+        ci_failures: None,
         skills: &[],
     };
     let assembled = prompt::assemble_rework(&input);

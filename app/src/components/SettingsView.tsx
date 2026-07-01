@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../store";
 import type { Config } from "../bindings/Config";
+import type { SkillsGithub } from "../bindings/SkillsGithub";
 import { MONACO_THEMES } from "@/lib/monaco-themes";
 import {
   Card,
@@ -13,47 +14,76 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
 import {
   Save,
   FolderOpen,
-  Eye,
-  EyeOff,
   Settings,
   Undo2,
   Bot,
-  Plug,
-  Wrench,
+  GitBranch,
   Palette,
+  FolderTree,
+  ListTree,
+  SlidersHorizontal,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
+/** Transient banner shown after a save attempt. */
 type Feedback =
   | { readonly kind: "success"; readonly message: string }
   | { readonly kind: "error"; readonly message: string };
 
-/** Model choices for the AI model selector. */
-const MODEL_OPTIONS = [
-  { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-  { value: "claude-opus-4-6", label: "Claude Opus 4.6" },
-  { value: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
-] as const;
-
-/** IDE choices for the Development section. */
-const IDE_OPTIONS = [
-  { value: "cursor", label: "Cursor" },
-  { value: "code", label: "VS Code" },
-  { value: "zed", label: "Zed" },
-  { value: "intellij", label: "IntelliJ" },
-] as const;
-
-/** App theme choices. */
+/** App theme choices, mirroring the `app_theme` values understood by the store. */
 const APP_THEME_OPTIONS = [
   { value: "dark", label: "Dark" },
   { value: "light", label: "Light" },
   { value: "system", label: "System" },
 ] as const;
 
+/** Shared field styling for native `<select>` controls. */
+const SELECT_CLASS =
+  "h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
+
+/**
+ * One labelled settings row: a description column on the left and the control
+ * on the right. Keeps every field in a consistent grid so sections read as a
+ * tidy form rather than a stack of ad-hoc inputs.
+ */
+function SettingsRow({
+  label,
+  htmlFor,
+  description,
+  children,
+}: {
+  readonly label: string;
+  readonly htmlFor?: string;
+  readonly description?: ReactNode;
+  readonly children: ReactNode;
+}) {
+  return (
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)] sm:items-start sm:gap-6">
+      <div className="flex flex-col gap-1">
+        <Label htmlFor={htmlFor}>{label}</Label>
+        {description !== undefined && (
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            {description}
+          </p>
+        )}
+      </div>
+      <div className="flex flex-col gap-1.5">{children}</div>
+    </div>
+  );
+}
+
+/**
+ * Application settings screen.
+ *
+ * Loads the persisted [`Config`] via `get_config`, lets the user edit a curated
+ * subset of fields, and saves by spreading the loaded config and overriding
+ * only the edited fields. It never constructs a partial `Config` literal, which
+ * is what previously caused the type to drift when new fields were added.
+ */
 export function SettingsView() {
   const config = useAppStore((s) => s.config);
   const configLoading = useAppStore((s) => s.configLoading);
@@ -61,59 +91,61 @@ export function SettingsView() {
   const fetchConfig = useAppStore((s) => s.fetchConfig);
   const saveConfig = useAppStore((s) => s.saveConfig);
 
-  // --- AI fields ---
-  const [anthropicApiKey, setAnthropicApiKey] = useState("");
-  const [model, setModel] = useState("claude-sonnet-4-6");
-  const [dailyBudgetUsd, setDailyBudgetUsd] = useState("");
-  const [agentCommand, setAgentCommand] = useState("claude");
+  // --- Repository ---
+  const [repoPath, setRepoPath] = useState("");
 
-  // --- Integration fields ---
+  // --- Linear (optional) ---
   const [linearApiKey, setLinearApiKey] = useState("");
   const [linearProjectId, setLinearProjectId] = useState("");
-  const [githubToken, setGithubToken] = useState("");
 
-  // --- Development fields ---
-  const [repoPath, setRepoPath] = useState("");
-  const [ideCommand, setIdeCommand] = useState("");
-  const [hookPort, setHookPort] = useState(19876);
+  // --- Agent ---
+  const [agentCommand, setAgentCommand] = useState("claude");
+  const [maxParallelAgents, setMaxParallelAgents] = useState(3);
 
-  // --- Appearance fields ---
+  // --- Skills sync (owner/repo/branch/path/auto_sync) ---
+  const [skillsOwner, setSkillsOwner] = useState("");
+  const [skillsRepo, setSkillsRepo] = useState("");
+  const [skillsBranch, setSkillsBranch] = useState("main");
+  const [skillsPath, setSkillsPath] = useState("");
+  const [skillsAutoSync, setSkillsAutoSync] = useState(false);
+
+  // --- Appearance ---
   const [appTheme, setAppTheme] = useState("dark");
   const [editorTheme, setEditorTheme] = useState("vs-dark");
-  const [terminalFont, setTerminalFont] = useState("");
-  const [terminalFontSize, setTerminalFontSize] = useState(13);
+
+  // --- Advanced ---
+  const [hookPort, setHookPort] = useState(19876);
 
   // --- UI state ---
-  const [showAnthropicKey, setShowAnthropicKey] = useState(false);
-  const [showLinearKey, setShowLinearKey] = useState(false);
-  const [showGithubToken, setShowGithubToken] = useState(false);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
 
   useEffect(() => {
     void fetchConfig();
   }, [fetchConfig]);
 
-  // Populate form from loaded config.
+  // Populate the form from the loaded config. Declared as a callback so both the
+  // initial load effect and the Discard button share one source of truth.
+  const populateFromConfig = useCallback((c: Config) => {
+    setRepoPath(c.repo_path ?? "");
+    setLinearApiKey(c.linear_api_key ?? "");
+    setLinearProjectId(c.linear_project_id ?? "");
+    setAgentCommand(c.agent_command);
+    setMaxParallelAgents(c.max_parallel_agents);
+    setSkillsOwner(c.skills_github?.owner ?? "");
+    setSkillsRepo(c.skills_github?.repo ?? "");
+    setSkillsBranch(c.skills_github?.branch ?? "main");
+    setSkillsPath(c.skills_github?.path ?? "");
+    setSkillsAutoSync(c.skills_github?.auto_sync ?? false);
+    setAppTheme(c.app_theme ?? "dark");
+    setEditorTheme(c.editor_theme ?? "vs-dark");
+    setHookPort(c.hook_port);
+  }, []);
+
   useEffect(() => {
     if (config !== null) {
-      setAnthropicApiKey(config.anthropic_api_key ?? "");
-      setModel(config.model ?? "claude-sonnet-4-6");
-      setDailyBudgetUsd(
-        config.daily_budget_usd !== null ? String(config.daily_budget_usd) : "",
-      );
-      setAgentCommand(config.agent_command);
-      setLinearApiKey(config.linear_api_key ?? "");
-      setLinearProjectId(config.linear_project_id ?? "");
-      setGithubToken(config.github_token ?? "");
-      setRepoPath(config.repo_path ?? "");
-      setIdeCommand(config.ide_command ?? "");
-      setHookPort(config.hook_port);
-      setAppTheme(config.app_theme ?? "dark");
-      setEditorTheme(config.editor_theme ?? "vs-dark");
-      setTerminalFont(config.terminal_font ?? "");
-      setTerminalFontSize(config.terminal_font_size ?? 13);
+      populateFromConfig(config);
     }
-  }, [config]);
+  }, [config, populateFromConfig]);
 
   const handleBrowse = useCallback(async () => {
     const selected = await open({ directory: true });
@@ -124,49 +156,45 @@ export function SettingsView() {
 
   const handleDiscard = useCallback(() => {
     if (config !== null) {
-      setAnthropicApiKey(config.anthropic_api_key ?? "");
-      setModel(config.model ?? "claude-sonnet-4-6");
-      setDailyBudgetUsd(
-        config.daily_budget_usd !== null ? String(config.daily_budget_usd) : "",
-      );
-      setAgentCommand(config.agent_command);
-      setLinearApiKey(config.linear_api_key ?? "");
-      setLinearProjectId(config.linear_project_id ?? "");
-      setGithubToken(config.github_token ?? "");
-      setRepoPath(config.repo_path ?? "");
-      setIdeCommand(config.ide_command ?? "");
-      setHookPort(config.hook_port);
-      setAppTheme(config.app_theme ?? "dark");
-      setEditorTheme(config.editor_theme ?? "vs-dark");
-      setTerminalFont(config.terminal_font ?? "");
-      setTerminalFontSize(config.terminal_font_size ?? 13);
+      populateFromConfig(config);
     }
     setFeedback(null);
-  }, [config]);
+  }, [config, populateFromConfig]);
 
   const handleSave = useCallback(async () => {
+    if (config === null) {
+      return;
+    }
     setFeedback(null);
-    const budgetParsed = parseFloat(dailyBudgetUsd);
+
+    // A skills source is only persisted when an owner and repo are given;
+    // otherwise the whole source is cleared to null (local-only skills).
+    const skillsGithub: SkillsGithub | null =
+      skillsOwner.trim() !== "" && skillsRepo.trim() !== ""
+        ? {
+            owner: skillsOwner.trim(),
+            repo: skillsRepo.trim(),
+            branch: skillsBranch.trim() !== "" ? skillsBranch.trim() : "main",
+            path: skillsPath.trim(),
+            auto_sync: skillsAutoSync,
+          }
+        : null;
+
+    // Spread the loaded config so kept-but-unedited fields (e.g. ide_command,
+    // agent_prompts) survive round-trips, then override only edited fields.
     const next: Config = {
-      // AI
-      anthropic_api_key: anthropicApiKey || null,
-      model: model || null,
-      daily_budget_usd: !Number.isNaN(budgetParsed) ? budgetParsed : null,
-      agent_command: agentCommand,
-      // Integrations
-      linear_api_key: linearApiKey || null,
-      linear_project_id: linearProjectId || null,
-      github_token: githubToken || null,
-      // Development
-      repo_path: repoPath || null,
-      ide_command: ideCommand || null,
+      ...config,
+      repo_path: repoPath !== "" ? repoPath : null,
+      linear_api_key: linearApiKey !== "" ? linearApiKey : null,
+      linear_project_id: linearProjectId !== "" ? linearProjectId : null,
+      agent_command: agentCommand !== "" ? agentCommand : "claude",
+      max_parallel_agents: maxParallelAgents > 0 ? maxParallelAgents : 1,
+      skills_github: skillsGithub,
+      app_theme: appTheme !== "" ? appTheme : null,
+      editor_theme: editorTheme !== "" ? editorTheme : null,
       hook_port: hookPort,
-      // Appearance
-      app_theme: appTheme || null,
-      editor_theme: editorTheme || null,
-      terminal_font: terminalFont || null,
-      terminal_font_size: terminalFontSize > 0 ? terminalFontSize : null,
     };
+
     try {
       await saveConfig(next);
       setFeedback({ kind: "success", message: "Settings saved." });
@@ -174,20 +202,20 @@ export function SettingsView() {
       setFeedback({ kind: "error", message: String(e) });
     }
   }, [
-    anthropicApiKey,
-    model,
-    dailyBudgetUsd,
-    agentCommand,
+    config,
+    repoPath,
     linearApiKey,
     linearProjectId,
-    githubToken,
-    repoPath,
-    ideCommand,
-    hookPort,
+    agentCommand,
+    maxParallelAgents,
+    skillsOwner,
+    skillsRepo,
+    skillsBranch,
+    skillsPath,
+    skillsAutoSync,
     appTheme,
     editorTheme,
-    terminalFont,
-    terminalFontSize,
+    hookPort,
     saveConfig,
   ]);
 
@@ -199,7 +227,7 @@ export function SettingsView() {
 
   if (configLoading && config === null) {
     return (
-      <div className="mx-auto max-w-2xl px-6 py-8">
+      <div className="mx-auto max-w-3xl px-6 py-8">
         <p className="text-sm text-muted-foreground">
           Loading configuration...
         </p>
@@ -208,14 +236,14 @@ export function SettingsView() {
   }
 
   return (
-    <div className="mx-auto max-w-2xl px-6 py-8">
+    <div className="mx-auto max-w-3xl px-6 py-8">
       {/* Page header */}
       <div className="mb-6 flex items-center gap-3">
         <Settings className="h-6 w-6 text-muted-foreground" />
         <div>
           <h1 className="text-xl font-semibold text-foreground">Settings</h1>
           <p className="text-sm text-muted-foreground">
-            Configure AI, integrations, development, and appearance.
+            Repository, agent, skills, and appearance.
           </p>
         </div>
       </div>
@@ -224,9 +252,7 @@ export function SettingsView() {
         <p
           className={cn(
             "mb-6 text-sm",
-            feedback.kind === "success"
-              ? "text-success"
-              : "text-destructive",
+            feedback.kind === "success" ? "text-success" : "text-destructive",
           )}
         >
           {feedback.message}
@@ -240,207 +266,25 @@ export function SettingsView() {
         }}
         className="flex flex-col gap-6"
       >
-        {/* ----------------------------------------------------------------- */}
-        {/* AI Section                                                        */}
-        {/* ----------------------------------------------------------------- */}
+        {/* --------------------------------------------------------------- */}
+        {/* Repository                                                      */}
+        {/* --------------------------------------------------------------- */}
         <Card>
           <CardHeader>
             <div className="flex items-center gap-2">
-              <Bot className="h-4 w-4 text-muted-foreground" />
-              <CardTitle>AI</CardTitle>
+              <FolderTree className="h-4 w-4 text-muted-foreground" />
+              <CardTitle>Repository</CardTitle>
             </div>
             <CardDescription>
-              Anthropic credentials, model selection, and agent settings.
+              The git repository cockpit manages.
             </CardDescription>
           </CardHeader>
-          <CardContent className="flex flex-col gap-5">
-            {/* Anthropic API Key */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="anthropic-api-key">Anthropic API Key</Label>
-              <div className="flex gap-2">
-                <Input
-                  id="anthropic-api-key"
-                  type={showAnthropicKey ? "text" : "password"}
-                  value={anthropicApiKey}
-                  onChange={(e) => {
-                    setAnthropicApiKey(e.target.value);
-                  }}
-                  placeholder="sk-ant-..."
-                  className="flex-1"
-                />
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => {
-                    setShowAnthropicKey((prev) => !prev);
-                  }}
-                  aria-label={showAnthropicKey ? "Hide API key" : "Show API key"}
-                >
-                  {showAnthropicKey ? <EyeOff /> : <Eye />}
-                </Button>
-              </div>
-            </div>
-
-            {/* Model */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="model">Model</Label>
-              <select
-                id="model"
-                value={model}
-                onChange={(e) => {
-                  setModel(e.target.value);
-                }}
-                className="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-              >
-                {MODEL_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {/* Daily budget */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="daily-budget">Daily Budget Cap (USD)</Label>
-              <Input
-                id="daily-budget"
-                type="number"
-                step="0.01"
-                min="0"
-                value={dailyBudgetUsd}
-                onChange={(e) => {
-                  setDailyBudgetUsd(e.target.value);
-                }}
-                placeholder="No limit"
-              />
-              <p className="text-xs text-muted-foreground">
-                Leave empty for unlimited.
-              </p>
-            </div>
-
-            {/* Agent command */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="agent-command">Agent Command</Label>
-              <Input
-                id="agent-command"
-                type="text"
-                value={agentCommand}
-                onChange={(e) => {
-                  setAgentCommand(e.target.value);
-                }}
-                placeholder="claude"
-              />
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* ----------------------------------------------------------------- */}
-        {/* Integrations Section                                              */}
-        {/* ----------------------------------------------------------------- */}
-        <Card>
-          <CardHeader>
-            <div className="flex items-center gap-2">
-              <Plug className="h-4 w-4 text-muted-foreground" />
-              <CardTitle>Integrations</CardTitle>
-            </div>
-            <CardDescription>
-              Linear and GitHub credentials.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-5">
-            {/* Linear API Key */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="linear-api-key">Linear API Key</Label>
-              <div className="flex gap-2">
-                <Input
-                  id="linear-api-key"
-                  type={showLinearKey ? "text" : "password"}
-                  value={linearApiKey}
-                  onChange={(e) => {
-                    setLinearApiKey(e.target.value);
-                  }}
-                  placeholder="lin_api_..."
-                  className="flex-1"
-                />
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => {
-                    setShowLinearKey((prev) => !prev);
-                  }}
-                  aria-label={showLinearKey ? "Hide API key" : "Show API key"}
-                >
-                  {showLinearKey ? <EyeOff /> : <Eye />}
-                </Button>
-              </div>
-            </div>
-
-            {/* Linear Project ID */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="linear-project-id">Linear Project ID</Label>
-              <Input
-                id="linear-project-id"
-                type="text"
-                value={linearProjectId}
-                onChange={(e) => {
-                  setLinearProjectId(e.target.value);
-                }}
-                placeholder="PRJ-123"
-              />
-            </div>
-
-            <Separator />
-
-            {/* GitHub Token */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="github-token">GitHub Token</Label>
-              <div className="flex gap-2">
-                <Input
-                  id="github-token"
-                  type={showGithubToken ? "text" : "password"}
-                  value={githubToken}
-                  onChange={(e) => {
-                    setGithubToken(e.target.value);
-                  }}
-                  placeholder="ghp_..."
-                  className="flex-1"
-                />
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => {
-                    setShowGithubToken((prev) => !prev);
-                  }}
-                  aria-label={showGithubToken ? "Hide token" : "Show token"}
-                >
-                  {showGithubToken ? <EyeOff /> : <Eye />}
-                </Button>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* ----------------------------------------------------------------- */}
-        {/* Development Section                                               */}
-        {/* ----------------------------------------------------------------- */}
-        <Card>
-          <CardHeader>
-            <div className="flex items-center gap-2">
-              <Wrench className="h-4 w-4 text-muted-foreground" />
-              <CardTitle>Development</CardTitle>
-            </div>
-            <CardDescription>
-              Repository path, IDE, and hook server settings.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-5">
-            {/* Repository path */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="repo-path">Repository Path</Label>
+          <CardContent className="flex flex-col gap-6">
+            <SettingsRow
+              label="Repository path"
+              htmlFor="repo-path"
+              description="Absolute path to the checkout cockpit works against."
+            >
               <div className="flex gap-2">
                 <Input
                   id="repo-path"
@@ -464,72 +308,236 @@ export function SettingsView() {
                   Browse
                 </Button>
               </div>
-            </div>
-
-            {/* IDE */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="ide-command">IDE</Label>
-              <select
-                id="ide-command"
-                value={
-                  IDE_OPTIONS.some((o) => o.value === ideCommand)
-                    ? ideCommand
-                    : "__custom__"
-                }
-                onChange={(e) => {
-                  if (e.target.value !== "__custom__") {
-                    setIdeCommand(e.target.value);
-                  }
-                }}
-                className="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-              >
-                {IDE_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-                {!IDE_OPTIONS.some((o) => o.value === ideCommand) && ideCommand !== "" && (
-                  <option value="__custom__">
-                    Custom: {ideCommand}
-                  </option>
-                )}
-              </select>
-              {/* Allow typing a custom IDE command */}
-              {!IDE_OPTIONS.some((o) => o.value === ideCommand) && (
-                <Input
-                  type="text"
-                  value={ideCommand}
-                  onChange={(e) => {
-                    setIdeCommand(e.target.value);
-                  }}
-                  placeholder="Custom IDE command..."
-                  className="mt-1"
-                />
-              )}
-            </div>
-
-            {/* Hook port */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="hook-port">Hook Port</Label>
-              <Input
-                id="hook-port"
-                type="number"
-                value={hookPort}
-                onChange={(e) => {
-                  const parsed = parseInt(e.target.value, 10);
-                  if (!Number.isNaN(parsed)) {
-                    setHookPort(parsed);
-                  }
-                }}
-                placeholder="19876"
-              />
-            </div>
+            </SettingsRow>
           </CardContent>
         </Card>
 
-        {/* ----------------------------------------------------------------- */}
-        {/* Appearance Section                                                */}
-        {/* ----------------------------------------------------------------- */}
+        {/* --------------------------------------------------------------- */}
+        {/* Worktrees & logs (read-only)                                    */}
+        {/* --------------------------------------------------------------- */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <ListTree className="h-4 w-4 text-muted-foreground" />
+              <CardTitle>Worktrees &amp; logs</CardTitle>
+            </div>
+            <CardDescription>
+              Where cockpit keeps its working state.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <p className="text-sm text-muted-foreground">
+              Agent worktrees, run logs, plans, and installed skills live under{" "}
+              <code className="rounded bg-muted px-1 py-0.5 text-xs text-foreground">
+                $HOME/.cockpit
+              </code>{" "}
+              (
+              <code className="text-xs">worktrees/</code>,{" "}
+              <code className="text-xs">logs/</code>,{" "}
+              <code className="text-xs">plans/</code>,{" "}
+              <code className="text-xs">skills/</code>). These paths are managed
+              by cockpit and are not configurable.
+            </p>
+          </CardContent>
+        </Card>
+
+        {/* --------------------------------------------------------------- */}
+        {/* Linear (optional)                                               */}
+        {/* --------------------------------------------------------------- */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <GitBranch className="h-4 w-4 text-muted-foreground" />
+              <CardTitle>Linear</CardTitle>
+            </div>
+            <CardDescription>
+              Optional. Linear is one project source; cockpit works without it.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-6">
+            <SettingsRow
+              label="Linear API key"
+              htmlFor="linear-api-key"
+              description="Personal API key used to read your Linear projects and issues."
+            >
+              <Input
+                id="linear-api-key"
+                type="password"
+                value={linearApiKey}
+                onChange={(e) => {
+                  setLinearApiKey(e.target.value);
+                }}
+                placeholder="lin_api_..."
+              />
+            </SettingsRow>
+
+            <SettingsRow
+              label="Linear project ID"
+              htmlFor="linear-project-id"
+              description="Default project cockpit opens when using Linear as a source."
+            >
+              <Input
+                id="linear-project-id"
+                type="text"
+                value={linearProjectId}
+                onChange={(e) => {
+                  setLinearProjectId(e.target.value);
+                }}
+                placeholder="PRJ-123"
+              />
+            </SettingsRow>
+          </CardContent>
+        </Card>
+
+        {/* --------------------------------------------------------------- */}
+        {/* Agent                                                           */}
+        {/* --------------------------------------------------------------- */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Bot className="h-4 w-4 text-muted-foreground" />
+              <CardTitle>Agent</CardTitle>
+            </div>
+            <CardDescription>
+              Cockpit uses your Claude Code login (<code>claude</code> on your
+              PATH). No API key needed.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-6">
+            <SettingsRow
+              label="Agent command"
+              htmlFor="agent-command"
+              description="Executable cockpit spawns to run the agent."
+            >
+              <Input
+                id="agent-command"
+                type="text"
+                value={agentCommand}
+                onChange={(e) => {
+                  setAgentCommand(e.target.value);
+                }}
+                placeholder="claude"
+              />
+            </SettingsRow>
+
+            <SettingsRow
+              label="Max parallel agents"
+              htmlFor="max-parallel-agents"
+              description="Upper bound on implementer agents run at once during a plan fan-out."
+            >
+              <Input
+                id="max-parallel-agents"
+                type="number"
+                min={1}
+                max={64}
+                value={maxParallelAgents}
+                onChange={(e) => {
+                  const parsed = parseInt(e.target.value, 10);
+                  if (!Number.isNaN(parsed)) {
+                    setMaxParallelAgents(parsed);
+                  }
+                }}
+                placeholder="3"
+              />
+            </SettingsRow>
+          </CardContent>
+        </Card>
+
+        {/* --------------------------------------------------------------- */}
+        {/* Skills sync                                                     */}
+        {/* --------------------------------------------------------------- */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <ListTree className="h-4 w-4 text-muted-foreground" />
+              <CardTitle>Skills sync</CardTitle>
+            </div>
+            <CardDescription>
+              The GitHub source cockpit syncs installable skills from. Leave
+              owner or repo blank to keep skills local-only.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-6">
+            <SettingsRow
+              label="Owner"
+              htmlFor="skills-owner"
+              description="Repository owner (user or org)."
+            >
+              <Input
+                id="skills-owner"
+                type="text"
+                value={skillsOwner}
+                onChange={(e) => {
+                  setSkillsOwner(e.target.value);
+                }}
+                placeholder="acme"
+              />
+            </SettingsRow>
+
+            <SettingsRow label="Repository" htmlFor="skills-repo">
+              <Input
+                id="skills-repo"
+                type="text"
+                value={skillsRepo}
+                onChange={(e) => {
+                  setSkillsRepo(e.target.value);
+                }}
+                placeholder="conventions"
+              />
+            </SettingsRow>
+
+            <SettingsRow
+              label="Branch"
+              htmlFor="skills-branch"
+              description="Branch to sync from."
+            >
+              <Input
+                id="skills-branch"
+                type="text"
+                value={skillsBranch}
+                onChange={(e) => {
+                  setSkillsBranch(e.target.value);
+                }}
+                placeholder="main"
+              />
+            </SettingsRow>
+
+            <SettingsRow
+              label="Path"
+              htmlFor="skills-path"
+              description="Directory in the repo holding one skill per subdirectory."
+            >
+              <Input
+                id="skills-path"
+                type="text"
+                value={skillsPath}
+                onChange={(e) => {
+                  setSkillsPath(e.target.value);
+                }}
+                placeholder="skills"
+              />
+            </SettingsRow>
+
+            <SettingsRow
+              label="Auto-sync"
+              description="Sync skills automatically on relevant triggers."
+            >
+              <div className="flex h-9 items-center">
+                <Switch
+                  checked={skillsAutoSync}
+                  onCheckedChange={(checked) => {
+                    setSkillsAutoSync(checked);
+                  }}
+                  aria-label="Toggle automatic skills sync"
+                />
+              </div>
+            </SettingsRow>
+          </CardContent>
+        </Card>
+
+        {/* --------------------------------------------------------------- */}
+        {/* Appearance                                                      */}
+        {/* --------------------------------------------------------------- */}
         <Card>
           <CardHeader>
             <div className="flex items-center gap-2">
@@ -537,18 +545,16 @@ export function SettingsView() {
               <CardTitle>Appearance</CardTitle>
             </div>
             <CardDescription>
-              Theme, font, and editor settings.
+              Application and code editor theming.
             </CardDescription>
           </CardHeader>
-          <CardContent className="flex flex-col gap-5">
-            {/* App theme (radio group) */}
-            <div className="flex flex-col gap-2">
-              <Label>App Theme</Label>
+          <CardContent className="flex flex-col gap-6">
+            <SettingsRow label="App theme" description="Overall color scheme.">
               <div className="flex gap-4">
                 {APP_THEME_OPTIONS.map((opt) => (
                   <label
                     key={opt.value}
-                    className="flex items-center gap-2 cursor-pointer text-sm"
+                    className="flex cursor-pointer items-center gap-2 text-sm"
                   >
                     <input
                       type="radio"
@@ -559,7 +565,7 @@ export function SettingsView() {
                         setAppTheme(opt.value);
                         if (opt.value === "dark") {
                           document.documentElement.classList.add("dark");
-                        } else {
+                        } else if (opt.value === "light") {
                           document.documentElement.classList.remove("dark");
                         }
                       }}
@@ -569,18 +575,20 @@ export function SettingsView() {
                   </label>
                 ))}
               </div>
-            </div>
+            </SettingsRow>
 
-            {/* Editor theme (select) */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="editor-theme">Editor Theme</Label>
+            <SettingsRow
+              label="Editor theme"
+              htmlFor="editor-theme"
+              description="Theme used by the Monaco diff editor."
+            >
               <select
                 id="editor-theme"
                 value={editorTheme}
                 onChange={(e) => {
                   setEditorTheme(e.target.value);
                 }}
-                className="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                className={SELECT_CLASS}
               >
                 {MONACO_THEMES.map((theme) => (
                   <option key={theme.id} value={theme.id}>
@@ -588,46 +596,48 @@ export function SettingsView() {
                   </option>
                 ))}
               </select>
-            </div>
-
-            {/* Terminal font */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="terminal-font">Terminal Font</Label>
-              <Input
-                id="terminal-font"
-                type="text"
-                value={terminalFont}
-                onChange={(e) => {
-                  setTerminalFont(e.target.value);
-                }}
-                placeholder="SF Mono"
-              />
-            </div>
-
-            {/* Terminal font size */}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="terminal-font-size">Terminal Font Size</Label>
-              <Input
-                id="terminal-font-size"
-                type="number"
-                min={8}
-                max={72}
-                value={terminalFontSize}
-                onChange={(e) => {
-                  const parsed = parseInt(e.target.value, 10);
-                  if (!Number.isNaN(parsed)) {
-                    setTerminalFontSize(parsed);
-                  }
-                }}
-                placeholder="13"
-              />
-            </div>
+            </SettingsRow>
           </CardContent>
         </Card>
 
-        {/* ----------------------------------------------------------------- */}
-        {/* Actions                                                           */}
-        {/* ----------------------------------------------------------------- */}
+        {/* --------------------------------------------------------------- */}
+        {/* Advanced                                                        */}
+        {/* --------------------------------------------------------------- */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <SlidersHorizontal className="h-4 w-4 text-muted-foreground" />
+              <CardTitle>Advanced</CardTitle>
+            </div>
+            <CardDescription>Low-level runtime settings.</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-6">
+            <SettingsRow
+              label="Hook port"
+              htmlFor="hook-port"
+              description="Local port the Stop-hook listener binds to."
+            >
+              <Input
+                id="hook-port"
+                type="number"
+                min={1}
+                max={65535}
+                value={hookPort}
+                onChange={(e) => {
+                  const parsed = parseInt(e.target.value, 10);
+                  if (!Number.isNaN(parsed)) {
+                    setHookPort(parsed);
+                  }
+                }}
+                placeholder="19876"
+              />
+            </SettingsRow>
+          </CardContent>
+        </Card>
+
+        {/* --------------------------------------------------------------- */}
+        {/* Actions                                                         */}
+        {/* --------------------------------------------------------------- */}
         <div className="flex justify-end gap-3 pb-8">
           <Button
             type="button"

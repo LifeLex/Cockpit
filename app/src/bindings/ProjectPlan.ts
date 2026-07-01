@@ -30,4 +30,12 @@ comments: Array<Comment>,
 /**
  * The agent run responsible for producing / revising the plan.
  */
-agent: AgentRun | null, };
+agent: AgentRun | null, 
+/**
+ * On-disk markdown file the planner agent writes its finished plan to.
+ *
+ * Set before spawning a planner (`AgentMode::Plan`); on completion the
+ * file is read back and parsed into [`Self::doc`]. `None` for plans that
+ * were loaded directly from a document rather than produced by an agent.
+ */
+plan_path?: string, };

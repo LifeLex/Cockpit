@@ -59,17 +59,27 @@ pub enum Outcome {
 /// Assemble a conflict-resolution prompt for a stale review.
 ///
 /// The prompt tells the agent which branches conflicted and asks it
-/// to resolve the rebase conflicts in the worktree.
-pub fn assemble_conflict_prompt(review: &Review, parent_branch: &str) -> AssembledPrompt {
+/// to resolve the rebase conflicts in the worktree. `custom_preamble` is the
+/// [`AgentMode::Restack`] override from config, injected verbatim (or `None`
+/// to fall back to the builtin).
+pub fn assemble_conflict_prompt(
+    review: &Review,
+    parent_branch: &str,
+    custom_preamble: Option<&str>,
+) -> AssembledPrompt {
+    // Skills relevant to the conflicting diff; discovery failures are non-fatal.
+    let skills = crate::skills::relevant_for_diff(&review.diff.raw);
     let input = ReworkInput {
         intent: &format!(
             "Resolve rebase conflicts: branch '{}' needs to be rebased onto '{}'.",
             review.branch, parent_branch
         ),
+        custom_preamble,
         approved_plan: None,
         artifact: &Artifact::Diff(review.diff.clone()),
         comments: &[], // no comments for conflict resolution
-        skills: &[],
+        ci_failures: None,
+        skills: &skills,
     };
     prompt::assemble_rework(&input)
 }
@@ -83,13 +93,18 @@ pub fn assemble_conflict_prompt(review: &Review, parent_branch: &str) -> Assembl
 /// If the review is not stale, returns [`Error::NotStale`].
 ///
 /// On a clean rebase, clears the stale flag and updates `base_sha`.
-/// On conflict, assembles a conflict-resolution prompt and spawns the
-/// conflict-resolver agent (`AgentMode::Restack`).
+/// On conflict, assembles a conflict-resolution prompt (with the optional
+/// `custom_preamble` [`AgentMode::Restack`] override injected verbatim) and
+/// spawns the conflict-resolver agent (`AgentMode::Restack`).
 ///
 /// The `worktree_path` is the directory where the agent will run (typically
 /// the review's worktree). It is passed separately because the caller
 /// may have a real worktree on disk even though the review's `.worktree`
 /// field could be a placeholder in tests.
+// The spawn path threads the repo, review, git targets, session/hook wiring,
+// spawn config, and now the per-mode preamble; grouping them into a struct
+// would add indirection without clarity for this single call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn restack_or_resolve(
     repo: &Repository,
     review: &mut Review,
@@ -98,6 +113,7 @@ pub async fn restack_or_resolve(
     session_map: &agent::SessionMap,
     hook_url: &str,
     spawn_config: &agent::SpawnConfig,
+    custom_preamble: Option<&str>,
 ) -> Result<Outcome, Error> {
     if !review.stale {
         return Err(Error::NotStale(review.id.clone()));
@@ -119,7 +135,7 @@ pub async fn restack_or_resolve(
     }
 
     // 2. On conflict, assemble prompt and spawn conflict-resolver.
-    let prompt = assemble_conflict_prompt(review, parent_branch);
+    let prompt = assemble_conflict_prompt(review, parent_branch, custom_preamble);
     let spawn_result = agent::spawn_agent(
         worktree_path,
         &prompt,
@@ -146,7 +162,12 @@ pub async fn restack_or_resolve(
 ///
 /// Walks the `children` edges transitively (breadth-first) and sets
 /// `stale = true` on every descendant. The parent itself is *not* marked.
-pub fn mark_descendants_stale(reviews: &mut [Review], parent_id: &ReviewId) {
+///
+/// Gated to `#[cfg(test)]`: the graph-level batch restack seam (SPEC §13) is
+/// not yet wired into the loop, so this helper is currently exercised only by
+/// its own coverage. Promote it to `pub` when the batch-restack driver lands.
+#[cfg(test)]
+fn mark_descendants_stale(reviews: &mut [Review], parent_id: &ReviewId) {
     // Collect children IDs from the parent to seed the traversal.
     let mut queue: Vec<ReviewId> = reviews
         .iter()
@@ -198,53 +219,16 @@ pub fn restack_review(
     Ok(clean)
 }
 
-/// Restack all stale descendants of a parent in dependency order.
-///
-/// Walks the `children` edges transitively (breadth-first from `parent_id`)
-/// and restacks each stale descendant onto its parent's branch.
-///
-/// Returns a list of `(ReviewId, bool)` pairs — `true` if the restack was
-/// clean, `false` if there were conflicts for that review.
-pub fn restack_descendants(
-    repo: &Repository,
-    reviews: &mut [Review],
-    parent_id: &ReviewId,
-) -> Result<Vec<(ReviewId, bool)>, git::Error> {
-    // Build the ordered list of (child_id, parent_branch) pairs to process.
-    // We traverse breadth-first from parent_id so parents are restacked before
-    // their own children.
-    let order = dependency_order(reviews, parent_id);
-    let mut results = Vec::new();
-
-    for (child_id, parent_branch) in order {
-        // Find the child review and restack it.
-        // We need to work with indices because we borrow `reviews` mutably.
-        let idx = reviews.iter().position(|r| r.id == child_id);
-        if let Some(i) = idx {
-            if reviews[i].stale {
-                let fork_point = Oid::from_str(&reviews[i].base_sha).ok();
-                let clean = git::restack(repo, &reviews[i].branch, &parent_branch, fork_point)?;
-                if clean {
-                    // Update base_sha so future restacks use the correct fork point.
-                    if let Ok(base) = repo.find_branch(&parent_branch, git2::BranchType::Local) {
-                        if let Ok(tip) = base.get().peel_to_commit() {
-                            reviews[i].base_sha = tip.id().to_string();
-                        }
-                    }
-                    reviews[i].clear_stale();
-                }
-                results.push((child_id, clean));
-            }
-        }
-    }
-
-    Ok(results)
-}
-
 /// Build a breadth-first traversal order of descendants with their parent branch names.
 ///
 /// Returns `(child_id, parent_branch)` pairs in BFS order, guaranteeing that
 /// every review's parent is processed before the review itself.
+///
+/// Gated to `#[cfg(test)]`: the graph-level batch restack seam (SPEC §13) that
+/// would consume this ordering is not yet wired into the loop, so the helper is
+/// currently exercised only by its own coverage. Promote it (and add the
+/// driver that walks the order) when the batch-restack step lands.
+#[cfg(test)]
 fn dependency_order(reviews: &[Review], root_id: &ReviewId) -> Vec<(ReviewId, String)> {
     let mut order = Vec::new();
 
@@ -312,6 +296,7 @@ mod tests {
             stale: false,
             agent: None,
             repo_slug: None,
+            project: None,
         }
     }
 
@@ -566,6 +551,7 @@ mod tests {
             &session_map,
             "http://localhost:9999/hook/stop",
             &config,
+            None,
         )
         .await
         .unwrap();
@@ -624,6 +610,7 @@ mod tests {
             &session_map,
             "http://localhost:9999/hook/stop",
             &config,
+            None,
         )
         .await
         .unwrap();
@@ -651,7 +638,7 @@ mod tests {
     fn conflict_prompt_assembly() {
         let review = make_review("b", "branch-b", "branch-a", &["a"], &[]);
 
-        let prompt = assemble_conflict_prompt(&review, "branch-a");
+        let prompt = assemble_conflict_prompt(&review, "branch-a", None);
 
         assert!(
             prompt.text.contains("branch-b"),
@@ -718,6 +705,7 @@ mod tests {
             &session_map,
             "http://localhost:9999/hook/stop",
             &config,
+            None,
         )
         .await
         .unwrap_err();

@@ -6,12 +6,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::config;
 use crate::model::{AgentMode, AgentRun};
 use crate::prompt::AssembledPrompt;
 
@@ -46,6 +47,10 @@ pub enum Error {
     /// Underlying I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// Failed to resolve a cockpit path (e.g. the logs directory).
+    #[error(transparent)]
+    Config(#[from] config::Error),
 }
 
 // ---------------------------------------------------------------------------
@@ -95,12 +100,16 @@ impl SessionMap {
 
     /// Remove a session entry, returning it if it existed.
     pub fn remove(&self, session_id: &str) -> Option<SessionEntry> {
+        // INVARIANT: lock is held only for a HashMap op — no .await, no
+        // blocking I/O — so poisoning should not occur in practice.
         let mut map = self.inner.lock().expect("session map lock poisoned");
         map.remove(session_id)
     }
 
     /// Look up a session entry without removing it.
     pub fn get(&self, session_id: &str) -> Option<SessionEntry> {
+        // INVARIANT: lock is held only for a HashMap op — no .await, no
+        // blocking I/O — so poisoning should not occur in practice.
         let map = self.inner.lock().expect("session map lock poisoned");
         map.get(session_id).cloned()
     }
@@ -111,6 +120,8 @@ impl SessionMap {
     /// If multiple sessions exist for the same object (shouldn't happen in
     /// normal operation), returns an arbitrary one.
     pub fn find_by_object(&self, object_id: &str) -> Option<String> {
+        // INVARIANT: lock is held only for a HashMap op — no .await, no
+        // blocking I/O — so poisoning should not occur in practice.
         let map = self.inner.lock().expect("session map lock poisoned");
         map.iter()
             .find(|(_, entry)| entry.object_id == object_id)
@@ -153,6 +164,21 @@ impl Default for SpawnConfig {
     }
 }
 
+impl SpawnConfig {
+    /// Build a [`SpawnConfig`] honoring the user's configured agent command.
+    ///
+    /// Takes the command from [`crate::config::Config::agent_command`] (which
+    /// itself defaults to `"claude"`) so a user override in
+    /// `~/.cockpit/config.toml` is actually applied at spawn time. The Claude
+    /// CLI argument shape is unchanged from [`SpawnConfig::default`].
+    pub fn from_config(config: &config::Config) -> Self {
+        Self {
+            command: config.agent_command.clone(),
+            ..Self::default()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Spawn
 // ---------------------------------------------------------------------------
@@ -185,7 +211,7 @@ pub async fn spawn_agent(
     object_id: &str,
     session_map: &SessionMap,
     hook_url: &str,
-    config: &SpawnConfig,
+    spawn_config: &SpawnConfig,
 ) -> Result<SpawnResult, Error> {
     // 1. Verify worktree exists.
     tokio::fs::metadata(worktree_path)
@@ -195,23 +221,36 @@ pub async fn spawn_agent(
     // 2. Generate a unique session ID.
     let session_id = Uuid::new_v4().to_string();
 
-    // 3. Prepare the log directory and file.
-    let cockpit_dir = worktree_path.join(".cockpit");
-    tokio::fs::create_dir_all(&cockpit_dir).await?;
-    let log_path = cockpit_dir.join(format!("agent-{session_id}.log"));
+    // 3. Prepare the log directory and file. Logs live under the cockpit
+    //    home (not inside the worktree) so they survive worktree cleanup.
+    let logs_dir = config::logs_dir()?;
+    tokio::fs::create_dir_all(&logs_dir).await?;
+    let log_path = logs_dir.join(format!("agent-{session_id}.log"));
     let stderr_file = std::fs::File::create(&log_path)?;
 
     // 4. Build and spawn the command.
     //    Stdout is piped so we can parse JSONL lines and tee to the log.
     //    Stderr goes directly to the log file.
-    let child = Command::new(&config.command)
-        .args(&config.base_args)
+    let mut command = Command::new(&spawn_config.command);
+    command
+        .args(&spawn_config.base_args)
         .arg(&prompt.text)
-        .args(&config.tail_args)
+        .args(&spawn_config.tail_args)
         .current_dir(worktree_path)
         .env("CLAUDE_STOP_HOOK_URL", hook_url)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::from(stderr_file))
+        .stderr(std::process::Stdio::from(stderr_file));
+
+    // Auth is the user's own Claude Code login (`~/.claude`): no API key and
+    // no Agent SDK. A bundled macOS GUI app does not inherit the terminal
+    // PATH, so `~/.local/bin/claude` would be invisible. Resolve the PATH
+    // from a login shell and set it explicitly; fall back to the inherited
+    // PATH if resolution fails.
+    if let Some(path) = login_shell_path() {
+        command.env("PATH", path);
+    }
+
+    let child = command
         .spawn()
         .map_err(|e| Error::SpawnFailed(e.to_string()))?;
 
@@ -243,6 +282,53 @@ pub async fn spawn_agent(
         child,
         log_path,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Login-shell PATH resolution
+// ---------------------------------------------------------------------------
+
+/// Cache for the login-shell PATH, resolved at most once per process.
+static LOGIN_SHELL_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+/// Resolve the PATH as seen by the user's login shell, cached for the process.
+///
+/// Cockpit spawns the `claude` CLI using the user's own Claude Code login
+/// (`~/.claude`) — there is no API key and no Agent SDK. A bundled macOS GUI
+/// app is launched by `launchd` and inherits a minimal PATH that omits
+/// `~/.local/bin`, where `claude` is commonly installed. To find it, we run
+/// the user's login shell once (`$SHELL -lic 'printf %s "$PATH"'`) and capture
+/// the resulting PATH.
+///
+/// Returns `None` if `$SHELL` is unset, the shell fails, or the output is
+/// empty; callers should then fall back to the inherited PATH.
+///
+/// Exposed to the crate so other spawn sites (e.g. the LSP bridge) share the
+/// same cached resolution.
+pub(crate) fn login_shell_path() -> Option<String> {
+    LOGIN_SHELL_PATH
+        .get_or_init(resolve_login_shell_path)
+        .clone()
+}
+
+/// Perform the actual login-shell PATH capture (uncached).
+fn resolve_login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL").ok()?;
+
+    // Blocking `std::process` is intentional here: this runs at most once per
+    // process, guarded by a `OnceLock`, and the result is cached. It is not on
+    // an async hot path.
+    let output = std::process::Command::new(shell)
+        .args(["-lic", "printf %s \"$PATH\""])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() { None } else { Some(path) }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,52 +424,85 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // SpawnConfig tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn spawn_config_from_config_honors_agent_command() {
+        let config = config::Config {
+            agent_command: "my-claude".into(),
+            ..config::Config::default()
+        };
+        let spawn = SpawnConfig::from_config(&config);
+        assert_eq!(spawn.command, "my-claude");
+        // Argument shape is unchanged from the default.
+        assert_eq!(spawn.base_args, SpawnConfig::default().base_args);
+        assert_eq!(spawn.tail_args, SpawnConfig::default().tail_args);
+    }
+
+    #[test]
+    fn spawn_config_from_default_config_is_claude() {
+        let config = config::Config::default();
+        let spawn = SpawnConfig::from_config(&config);
+        assert_eq!(spawn.command, "claude");
+    }
+
+    // ---------------------------------------------------------------
     // Spawn tests
     // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn spawn_with_stub_command() {
         let dir = tempfile::tempdir().unwrap();
-        let session_map = SessionMap::new();
+        // Isolate cockpit home so logs land in a temp dir, not the real
+        // ~/.cockpit. COCKPIT_HOME is read by config::logs_dir(). temp_env
+        // serializes env access and restores it afterward, avoiding the
+        // `unsafe` set_var forbidden by the crate-wide `forbid(unsafe_code)`.
+        let home = tempfile::tempdir().unwrap();
+        temp_env::async_with_vars([("COCKPIT_HOME", Some(home.path()))], async {
+            let session_map = SessionMap::new();
 
-        let prompt = AssembledPrompt {
-            text: "hello".into(),
-            hash: "abc123hash".into(),
-        };
+            let prompt = AssembledPrompt {
+                text: "hello".into(),
+                hash: "abc123hash".into(),
+            };
 
-        let config = SpawnConfig {
-            command: "echo".into(),
-            base_args: vec![],
-            tail_args: vec![],
-        };
+            let config = SpawnConfig {
+                command: "echo".into(),
+                base_args: vec![],
+                tail_args: vec![],
+            };
 
-        let result = spawn_agent(
-            dir.path(),
-            &prompt,
-            AgentMode::Fix,
-            "review-42",
-            &session_map,
-            "http://localhost:9999/hook/stop",
-            &config,
-        )
-        .await
-        .unwrap();
+            let result = spawn_agent(
+                dir.path(),
+                &prompt,
+                AgentMode::Fix,
+                "review-42",
+                &session_map,
+                "http://localhost:9999/hook/stop",
+                &config,
+            )
+            .await
+            .unwrap();
 
-        let run = &result.run;
-        assert_eq!(run.mode, AgentMode::Fix);
-        assert_eq!(run.prompt_hash, "abc123hash");
-        assert!(run.pid > 0);
-        assert!(run.log_path.starts_with(dir.path().join(".cockpit")));
+            let run = &result.run;
+            assert_eq!(run.mode, AgentMode::Fix);
+            assert_eq!(run.prompt_hash, "abc123hash");
+            assert!(run.pid > 0);
+            assert!(run.log_path.starts_with(home.path().join("logs")));
 
-        // The session map should have exactly one entry with the right object_id.
-        // We don't know the session_id (it's a UUID), so we verify via the
-        // invariant that the map has one entry whose object_id matches.
-        let map = session_map.inner.lock().unwrap();
-        assert_eq!(map.len(), 1);
-        let entry = map.values().next().unwrap();
-        assert_eq!(entry.object_id, "review-42");
-        assert_eq!(entry.mode, AgentMode::Fix);
-        assert_eq!(entry.pid, run.pid);
+            // The session map should have exactly one entry with the right
+            // object_id. We don't know the session_id (it's a UUID), so we
+            // verify via the invariant that the map has one entry whose
+            // object_id matches.
+            let map = session_map.inner.lock().unwrap();
+            assert_eq!(map.len(), 1);
+            let entry = map.values().next().unwrap();
+            assert_eq!(entry.object_id, "review-42");
+            assert_eq!(entry.mode, AgentMode::Fix);
+            assert_eq!(entry.pid, run.pid);
+        })
+        .await;
     }
 
     #[tokio::test]

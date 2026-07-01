@@ -7,3 +7,6 @@ dist/
 .env
 .DS_Store
 .claude/worktrees/
+
+# cockpit runtime artifacts (should live in \$HOME/.cockpit, never in-tree)
+.cockpit/

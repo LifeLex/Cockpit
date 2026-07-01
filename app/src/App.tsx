@@ -1,19 +1,22 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { sendNotification } from "@tauri-apps/plugin-notification";
 import { useAppStore } from "./store";
 import type { ViewState } from "./store";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import type { ShortcutMap } from "./hooks/useKeyboardShortcuts";
+import { SHORTCUTS } from "./lib/shortcuts";
+import type { ShortcutId } from "./lib/shortcuts";
 import { Sidebar } from "./components/Sidebar";
 import { ReviewCard } from "./components/ReviewCard";
-import { DiffView } from "./components/DiffView";
+import { ProjectCard } from "./components/ProjectCard";
+import { ReviewWorkspace } from "./components/ReviewWorkspace";
 import { PlanView } from "./components/PlanView";
-import { BatchApprovePanel } from "./components/BatchApprovePanel";
-import { buildStackTrees, computeHealth } from "./lib/stack-tree";
-import type { StackTreeNode } from "./lib/stack-tree";
+import { NewProjectView } from "./components/NewProjectView";
+import { SkillsView } from "./components/SkillsView";
+import { AgentEditor } from "./components/AgentEditor";
 import { SettingsView } from "./components/SettingsView";
-import { KickoffView } from "./components/KickoffView";
 import { CommandPalette } from "./components/CommandPalette";
 import { SkeletonList } from "./components/SkeletonCard";
 import { EmptyState } from "./components/EmptyState";
@@ -21,12 +24,20 @@ import { StateFilter } from "./components/StateFilter";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
 import { Search } from "lucide-react";
 import type { GateState } from "./bindings/GateState";
 import type { Review } from "./bindings/Review";
+import type { Project } from "./bindings/Project";
+import type { AgentMode } from "./bindings/AgentMode";
 
-type ReviewTab = "my-prs" | "review-requests" | "frontier";
+/** Payload emitted by the Tauri backend on "agent-completed" events. */
+interface CompletionEventPayload {
+  readonly session_id: string;
+  readonly object_id: string;
+  readonly mode: AgentMode;
+}
+
+type ReviewTab = "my-prs" | "review-requests" | "all";
 
 const SIDEBAR_COLLAPSED_KEY = "cockpit-sidebar-collapsed";
 
@@ -34,76 +45,69 @@ function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
 }
 
-function FrontierStackNode({
-  node,
-  depth,
-  onAction,
-}: {
-  readonly node: StackTreeNode;
-  readonly depth: number;
-  readonly onAction: (pr: string) => void;
-}) {
-  return (
-    <div style={{ marginLeft: depth * 20 }}>
-      <div
-        className={cn(
-          "transition-opacity",
-          node.review.gate_state === "Approved" && "opacity-60",
-        )}
-      >
-        <ReviewCard review={node.review} onAction={onAction} />
-      </div>
-      {node.childNodes.map((child) => (
-        <FrontierStackNode
-          key={child.review.id}
-          node={child}
-          depth={depth + 1}
-          onAction={onAction}
-        />
-      ))}
-    </div>
-  );
+/** Build a desktop notification title from the agent mode. */
+function notificationTitleForMode(mode: AgentMode): string {
+  switch (mode) {
+    case "Fix":
+    case "Restack":
+      return "Rework Complete";
+    case "Plan":
+      return "Plan Rework Complete";
+    case "Implement":
+      return "Implementation Complete";
+    default:
+      return assertNever(mode);
+  }
 }
 
-function FrontierStackGroup({
-  root,
-  onAction,
-}: {
-  readonly root: StackTreeNode;
-  readonly onAction: (pr: string) => void;
-}) {
-  const health = useMemo(() => computeHealth(root), [root]);
+/** Build a desktop notification body from the agent mode and branch name. */
+function notificationBodyForMode(mode: AgentMode, branch: string): string {
+  switch (mode) {
+    case "Fix":
+      return `Fix agent finished on ${branch}`;
+    case "Restack":
+      return `Restack agent finished on ${branch}`;
+    case "Plan":
+      return `Plan agent finished reworking`;
+    case "Implement":
+      return `Implementation agent finished on ${branch}`;
+    default:
+      return assertNever(mode);
+  }
+}
 
-  return (
-    <div className="rounded-lg border border-border p-3 mb-4">
-      <div className="flex justify-between items-center mb-2 pb-2 border-b border-border">
-        <span className="text-[13px] font-bold text-muted-foreground">
-          Stack: {root.review.branch}
-        </span>
-        <span className="text-xs text-muted-foreground">
-          <span
-            className={
-              health.approved === health.total
-                ? "text-success"
-                : "text-muted-foreground"
-            }
-          >
-            {health.approved}/{health.total} approved
-          </span>
-          {health.stale > 0 && (
-            <span className="text-danger ml-2">{health.stale} stale</span>
-          )}
-        </span>
-      </div>
+/** A named group of reviews for the grouped-by-project PRs list. */
+interface ReviewGroup {
+  readonly key: string;
+  readonly title: string;
+  readonly reviews: readonly Review[];
+}
 
-      <FrontierStackNode node={root} depth={0} onAction={onAction} />
-    </div>
-  );
+/**
+ * Group reviews by their project, preserving project order from `projects`
+ * and collecting reviews with no project into a trailing "Ungrouped" section.
+ * Empty groups are omitted.
+ */
+function groupReviewsByProject(
+  reviews: readonly Review[],
+  projects: readonly Project[],
+): readonly ReviewGroup[] {
+  const groups: ReviewGroup[] = [];
+  for (const project of projects) {
+    const members = reviews.filter((r) => r.project === project.id);
+    if (members.length > 0) {
+      groups.push({ key: project.id, title: project.name, reviews: members });
+    }
+  }
+  const ungrouped = reviews.filter((r) => r.project === null);
+  if (ungrouped.length > 0) {
+    groups.push({ key: "__ungrouped__", title: "Ungrouped", reviews: ungrouped });
+  }
+  return groups;
 }
 
 function App() {
   const reviews = useAppStore((s) => s.reviews);
-  const frontier = useAppStore((s) => s.frontier);
   const plan = useAppStore((s) => s.plan);
   const loading = useAppStore((s) => s.loading);
   const error = useAppStore((s) => s.error);
@@ -112,6 +116,7 @@ function App() {
   const activeDiff = useAppStore((s) => s.activeDiff);
   const authoredPrs = useAppStore((s) => s.authoredPrs);
   const reviewRequests = useAppStore((s) => s.reviewRequests);
+  const projects = useAppStore((s) => s.projects);
   const prFetchLoading = useAppStore((s) => s.prFetchLoading);
   const fetchAuthoredPrs = useAppStore((s) => s.fetchAuthoredPrs);
   const fetchReviewRequests = useAppStore((s) => s.fetchReviewRequests);
@@ -119,6 +124,7 @@ function App() {
   const fetchFrontier = useAppStore((s) => s.fetchFrontier);
   const fetchPlan = useAppStore((s) => s.fetchPlan);
   const fetchConfig = useAppStore((s) => s.fetchConfig);
+  const listProjects = useAppStore((s) => s.listProjects);
 
   const [reviewTab, setReviewTab] = useState<ReviewTab>("my-prs");
   const [stateFilter, setStateFilter] = useState<GateState | null>(null);
@@ -127,25 +133,21 @@ function App() {
   const openReview = useAppStore((s) => s.openReview);
   const navigateToDiff = useAppStore((s) => s.navigateToDiff);
   const navigateToPlan = useAppStore((s) => s.navigateToPlan);
-  const navigateToFrontier = useAppStore((s) => s.navigateToFrontier);
+  const navigateToPrs = useAppStore((s) => s.navigateToPrs);
+  const navigateToProjects = useAppStore((s) => s.navigateToProjects);
+  const navigateToNewProject = useAppStore((s) => s.navigateToNewProject);
+  const navigateToSkills = useAppStore((s) => s.navigateToSkills);
+  const navigateToAgents = useAppStore((s) => s.navigateToAgents);
   const navigateToSettings = useAppStore((s) => s.navigateToSettings);
-  const navigateToKickoff = useAppStore((s) => s.navigateToKickoff);
   const addComment = useAppStore((s) => s.addComment);
   const requestChanges = useAppStore((s) => s.requestChanges);
   const mirrorComments = useAppStore((s) => s.mirrorComments);
   const refreshActiveReview = useAppStore((s) => s.refreshActiveReview);
   const addPlanComment = useAppStore((s) => s.addPlanComment);
-  const requestPlanChanges = useAppStore((s) => s.requestPlanChanges);
-  const approvePlan = useAppStore((s) => s.approvePlan);
+  const planRequestChanges = useAppStore((s) => s.planRequestChanges);
+  const planApprove = useAppStore((s) => s.planApprove);
   const openPlan = useAppStore((s) => s.openPlan);
-  const batchVerdicts = useAppStore((s) => s.batchVerdicts);
-  const showBatchPanel = useAppStore((s) => s.showBatchPanel);
-  const fetchBatchApprovePreview = useAppStore(
-    (s) => s.fetchBatchApprovePreview,
-  );
-  const approveReview = useAppStore((s) => s.approveReview);
-  const approveAllEligible = useAppStore((s) => s.approveAllEligible);
-  const toggleBatchPanel = useAppStore((s) => s.toggleBatchPanel);
+  const batchStatus = useAppStore((s) => s.batchStatus);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
@@ -161,46 +163,74 @@ function App() {
     });
   }, []);
 
-  const shortcuts: ShortcutMap = useMemo(
+  // Handlers keyed by shortcut id; the registry supplies the key bindings so
+  // there is exactly one source of truth for both the combo and the handler.
+  const shortcutHandlers = useMemo<Readonly<Record<ShortcutId, () => void>>>(
     () => ({
-      "meta+k": () => {
+      "command-palette": () => {
         setCommandPaletteOpen(true);
       },
-      "meta+1": () => {
-        navigateToFrontier();
+      "nav-prs": () => {
+        navigateToPrs();
       },
-      "meta+2": () => {
-        navigateToPlan();
+      "nav-projects": () => {
+        navigateToProjects();
       },
-      "meta+comma": () => {
+      "nav-skills": () => {
+        navigateToSkills();
+      },
+      "nav-agents": () => {
+        navigateToAgents();
+      },
+      "nav-settings": () => {
         navigateToSettings();
       },
-      "meta+r": () => {
+      refresh: () => {
         void fetchReviews();
         void fetchFrontier();
         void fetchAuthoredPrs();
       },
-      "meta+b": () => {
+      "toggle-sidebar": () => {
         toggleSidebar();
       },
+      "open-in-ide": () => {
+        if (view.kind === "diff" && activeReview !== null) {
+          void invoke("open_in_editor", {
+            filePath: ".",
+            repoSlug: activeReview.repo_slug,
+            branch: activeReview.branch,
+          });
+        }
+      },
       escape: () => {
-        // Only navigate back when viewing a diff or plan, not from the frontier.
+        // Only navigate back when viewing a diff or plan, not from the list.
         if (view.kind === "diff" || view.kind === "plan") {
-          navigateToFrontier();
+          navigateToPrs();
         }
       },
     }),
     [
-      navigateToFrontier,
-      navigateToPlan,
+      navigateToPrs,
+      navigateToProjects,
+      navigateToSkills,
+      navigateToAgents,
       navigateToSettings,
       fetchReviews,
       fetchFrontier,
       fetchAuthoredPrs,
       toggleSidebar,
       view.kind,
+      activeReview,
     ],
   );
+
+  const shortcuts: ShortcutMap = useMemo(() => {
+    const map: Record<string, () => void> = {};
+    for (const shortcut of SHORTCUTS) {
+      map[shortcut.combo] = shortcutHandlers[shortcut.id];
+    }
+    return map;
+  }, [shortcutHandlers]);
 
   useKeyboardShortcuts(shortcuts);
 
@@ -210,20 +240,22 @@ function App() {
     void fetchPlan();
     void fetchConfig();
     void fetchAuthoredPrs();
+    void listProjects();
 
-    const unlisten = listen("agent-completed", () => {
+    const unlisten = listen<CompletionEventPayload>("agent-completed", (event) => {
       void fetchReviews();
       void fetchFrontier();
       void fetchPlan();
       void refreshActiveReview();
 
-      // Best-effort desktop notification. The active review may be stale
-      // at this point, so we read the current value from the store.
+      // Best-effort desktop notification. Use the event payload's mode
+      // to differentiate the notification title and body.
+      const { mode } = event.payload;
       const current = useAppStore.getState().activeReview;
       const branch = current !== null ? current.branch : "a review";
       void sendNotification({
-        title: "Rework Complete",
-        body: `Agent finished on ${branch}`,
+        title: notificationTitleForMode(mode),
+        body: notificationBodyForMode(mode, branch),
       });
     });
 
@@ -232,7 +264,15 @@ function App() {
         f();
       });
     };
-  }, [fetchReviews, fetchFrontier, fetchPlan, fetchConfig, fetchAuthoredPrs, refreshActiveReview]);
+  }, [
+    fetchReviews,
+    fetchFrontier,
+    fetchPlan,
+    fetchConfig,
+    fetchAuthoredPrs,
+    listProjects,
+    refreshActiveReview,
+  ]);
 
   const filterReviews = useCallback(
     (items: readonly Review[]): readonly Review[] => {
@@ -258,24 +298,22 @@ function App() {
     [stateFilter, showStale, searchQuery],
   );
 
-  const unfilteredReviewsForTab: readonly Review[] = useMemo(() => {
+  const reviewsForTab: readonly Review[] = useMemo(() => {
     switch (reviewTab) {
       case "my-prs":
         return authoredPrs;
       case "review-requests":
         return reviewRequests;
-      case "frontier":
+      case "all":
         return reviews;
-      default: {
-        const _exhaustive: never = reviewTab;
-        throw new Error(`unreachable: ${String(_exhaustive)}`);
-      }
+      default:
+        return assertNever(reviewTab);
     }
   }, [reviewTab, authoredPrs, reviewRequests, reviews]);
 
   const handleReviewAction = useCallback(
     (pr: string) => {
-      const allReviews = [...authoredPrs, ...reviewRequests, ...frontier, ...reviews];
+      const allReviews = [...authoredPrs, ...reviewRequests, ...reviews];
       const review = allReviews.find((r) => r.pr === pr);
       if (review === undefined) return;
 
@@ -293,14 +331,39 @@ function App() {
           assertNever(review.gate_state);
       }
     },
-    [openReview, navigateToDiff, authoredPrs, reviewRequests, frontier, reviews],
+    [openReview, navigateToDiff, authoredPrs, reviewRequests, reviews],
+  );
+
+  // Opening a project routes to its plan gate when a plan exists, otherwise to
+  // the project-grouped PRs list.
+  const handleOpenProject = useCallback(
+    (project: Project) => {
+      if (project.plan !== null) {
+        navigateToPlan();
+      } else {
+        navigateToPrs();
+      }
+    },
+    [navigateToPlan, navigateToPrs],
   );
 
   const handleNavigate = useCallback(
     (kind: ViewState["kind"]) => {
       switch (kind) {
-        case "frontier":
-          navigateToFrontier();
+        case "prs":
+          navigateToPrs();
+          break;
+        case "projects":
+          navigateToProjects();
+          break;
+        case "new-project":
+          navigateToNewProject();
+          break;
+        case "skills":
+          navigateToSkills();
+          break;
+        case "agents":
+          navigateToAgents();
           break;
         case "plan":
           navigateToPlan();
@@ -308,31 +371,45 @@ function App() {
         case "settings":
           navigateToSettings();
           break;
-        case "kickoff":
-          navigateToKickoff();
-          break;
         case "diff":
           break;
         default:
           assertNever(kind);
       }
     },
-    [navigateToFrontier, navigateToPlan, navigateToSettings, navigateToKickoff],
+    [
+      navigateToPrs,
+      navigateToProjects,
+      navigateToNewProject,
+      navigateToSkills,
+      navigateToAgents,
+      navigateToPlan,
+      navigateToSettings,
+    ],
   );
 
-  // Justified cast: value is constrained to the three TabsTrigger values below
   const handleTabChange = useCallback(
     (value: unknown) => {
       if (value === null || typeof value !== "string") return;
-      const tab = value as ReviewTab;
+      let tab: ReviewTab;
+      switch (value) {
+        case "my-prs":
+        case "review-requests":
+        case "all":
+          tab = value;
+          break;
+        default:
+          return;
+      }
       setReviewTab(tab);
       setStateFilter(null);
       setShowStale(false);
       setSearchQuery("");
       if (tab === "my-prs") void fetchAuthoredPrs();
       if (tab === "review-requests") void fetchReviewRequests();
+      if (tab === "all") void fetchReviews();
     },
-    [fetchAuthoredPrs, fetchReviewRequests],
+    [fetchAuthoredPrs, fetchReviewRequests, fetchReviews],
   );
 
   const errorBanner =
@@ -342,9 +419,55 @@ function App() {
       </div>
     ) : null;
 
+  function renderProjectGroupedList(items: readonly Review[]) {
+    const filtered = filterReviews(items);
+    const groups = groupReviewsByProject(filtered, projects);
+
+    if (groups.length === 0) {
+      return null;
+    }
+
+    return groups.map((group) => (
+      <section key={group.key} className="mb-6">
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+          {group.title}{" "}
+          <span className="ml-1 text-xs font-normal">
+            ({group.reviews.length})
+          </span>
+        </h2>
+        <div className="space-y-3">
+          {group.reviews.map((review) => (
+            <ReviewCard
+              key={review.id}
+              review={review}
+              onAction={handleReviewAction}
+            />
+          ))}
+        </div>
+      </section>
+    ));
+  }
+
+  function renderPrsContent(items: readonly Review[], emptyIcon: string, emptyTitle: string, emptyDescription: string) {
+    if (prFetchLoading && items.length === 0) {
+      return <SkeletonList count={4} />;
+    }
+    const grouped = renderProjectGroupedList(items);
+    if (grouped === null) {
+      return (
+        <EmptyState
+          icon={emptyIcon}
+          title={emptyTitle}
+          description={emptyDescription}
+        />
+      );
+    }
+    return grouped;
+  }
+
   function renderContent() {
     switch (view.kind) {
-      case "frontier":
+      case "prs":
         return (
           <div className="mx-auto max-w-4xl px-6 py-8">
             {errorBanner}
@@ -353,7 +476,7 @@ function App() {
               <div className="flex items-center mb-6">
                 <TabsList variant="line">
                   <TabsTrigger value="my-prs">
-                    My PRs
+                    Mine
                     {authoredPrs.length > 0 && (
                       <span className="ml-1.5 rounded-full bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
                         {authoredPrs.length}
@@ -368,29 +491,19 @@ function App() {
                       </span>
                     )}
                   </TabsTrigger>
-                  <TabsTrigger value="frontier">
-                    Frontier
-                    {frontier.length > 0 && (
+                  <TabsTrigger value="all">
+                    All
+                    {reviews.length > 0 && (
                       <span className="ml-1.5 rounded-full bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-                        {frontier.length}
+                        {reviews.length}
                       </span>
                     )}
                   </TabsTrigger>
                 </TabsList>
 
                 <div className="ml-auto flex items-center gap-2">
-                  {reviewTab === "frontier" && frontier.length > 0 && (
-                    <Button
-                      onClick={() => {
-                        void fetchBatchApprovePreview();
-                      }}
-                      className="bg-success text-white hover:bg-success/90"
-                    >
-                      Batch Approve
-                    </Button>
-                  )}
-
-                  {(reviewTab === "my-prs" || reviewTab === "review-requests") && (
+                  {(reviewTab === "my-prs" ||
+                    reviewTab === "review-requests") && (
                     <Button
                       variant="outline"
                       onClick={() => {
@@ -404,17 +517,6 @@ function App() {
                   )}
                 </div>
               </div>
-
-              {showBatchPanel && batchVerdicts !== null && reviewTab === "frontier" && (
-                <BatchApprovePanel
-                  verdicts={batchVerdicts}
-                  onApprove={approveReview}
-                  onApproveAll={() => {
-                    void approveAllEligible();
-                  }}
-                  onClose={toggleBatchPanel}
-                />
-              )}
 
               <div className="mb-4 flex items-center gap-3">
                 <div className="relative">
@@ -430,7 +532,7 @@ function App() {
                   />
                 </div>
                 <StateFilter
-                  reviews={unfilteredReviewsForTab}
+                  reviews={reviewsForTab}
                   activeFilter={stateFilter}
                   showStale={showStale}
                   onFilterChange={setStateFilter}
@@ -441,91 +543,36 @@ function App() {
               </div>
 
               <TabsContent value="my-prs">
-                <section className="space-y-3">
-                  {prFetchLoading && authoredPrs.length === 0 && <SkeletonList count={4} />}
-                  {filterReviews(authoredPrs).map((review) => (
-                    <ReviewCard
-                      key={review.id}
-                      review={review}
-                      onAction={handleReviewAction}
-                    />
-                  ))}
-                  {!prFetchLoading && authoredPrs.length === 0 && (
-                    <EmptyState
-                      icon="📝"
-                      title="No open PRs"
-                      description="Click Refresh to fetch your open PRs from GitHub. Make sure your repo path is configured in Settings."
-                      actionLabel="Go to Settings"
-                      onAction={navigateToSettings}
-                    />
-                  )}
-                </section>
+                {renderPrsContent(
+                  authoredPrs,
+                  "📝",
+                  "No open PRs",
+                  "Click Refresh to fetch your open PRs from GitHub. Make sure your repo path is configured in Settings.",
+                )}
               </TabsContent>
 
               <TabsContent value="review-requests">
-                <section className="space-y-3">
-                  {prFetchLoading && reviewRequests.length === 0 && <SkeletonList count={4} />}
-                  {filterReviews(reviewRequests).map((review) => (
-                    <ReviewCard
-                      key={review.id}
-                      review={review}
-                      onAction={handleReviewAction}
-                    />
-                  ))}
-                  {!prFetchLoading && reviewRequests.length === 0 && (
-                    <EmptyState
-                      icon="👀"
-                      title="No review requests"
-                      description="No PRs are waiting for your review. Click Refresh to check again."
-                    />
-                  )}
-                </section>
+                {renderPrsContent(
+                  reviewRequests,
+                  "👀",
+                  "No review requests",
+                  "No PRs are waiting for your review. Click Refresh to check again.",
+                )}
               </TabsContent>
 
-              <TabsContent value="frontier">
-                <section className="space-y-3">
-                  {loading && frontier.length === 0 && <SkeletonList count={4} />}
-                  {(() => {
-                    const filtered = filterReviews(frontier);
-                    const trees = buildStackTrees(filtered);
-
-                    if (trees.length === 0 && !loading && filtered.length === 0) {
-                      return (
-                        <EmptyState
-                          icon="🚀"
-                          title="No reviews in the frontier"
-                          description="Use Kickoff to import a Linear project, or switch to My PRs to review existing GitHub PRs."
-                          actionLabel="Go to Kickoff"
-                          onAction={navigateToKickoff}
-                        />
-                      );
-                    }
-
-                    return trees.map((root) => (
-                      <FrontierStackGroup
-                        key={root.review.id}
-                        root={root}
-                        onAction={handleReviewAction}
-                      />
-                    ));
-                  })()}
-                </section>
-
-                {reviews.length > 0 && (
-                  <section className="mt-8">
-                    <h2 className="mb-3 text-lg font-semibold text-foreground">
-                      All Reviews ({filterReviews(reviews).length})
-                    </h2>
-                    <div className="space-y-3">
-                      {filterReviews(reviews).map((review) => (
-                        <ReviewCard
-                          key={review.id}
-                          review={review}
-                          onAction={handleReviewAction}
-                        />
-                      ))}
-                    </div>
-                  </section>
+              <TabsContent value="all">
+                {loading && reviews.length === 0 ? (
+                  <SkeletonList count={4} />
+                ) : (
+                  (renderProjectGroupedList(reviews) ?? (
+                    <EmptyState
+                      icon="🚀"
+                      title="No reviews yet"
+                      description="Create a project or import from Linear under Projects, or switch to Mine to review existing GitHub PRs."
+                      actionLabel="Go to Projects"
+                      onAction={navigateToProjects}
+                    />
+                  ))
                 )}
               </TabsContent>
             </Tabs>
@@ -542,7 +589,7 @@ function App() {
                 <div className="rounded-lg border border-danger bg-danger/10 px-4 py-3 text-sm text-danger">
                   Failed to load review.{" "}
                   <button
-                    onClick={navigateToFrontier}
+                    onClick={navigateToPrs}
                     className="underline hover:no-underline"
                   >
                     Back
@@ -554,10 +601,10 @@ function App() {
         }
 
         return (
-          <DiffView
+          <ReviewWorkspace
             review={activeReview}
             diff={activeDiff}
-            onBack={navigateToFrontier}
+            onBack={navigateToPrs}
             onAddComment={addComment}
             onRequestChanges={requestChanges}
             onMirrorComments={mirrorComments}
@@ -576,32 +623,72 @@ function App() {
                   void addPlanComment(anchor, body);
                 }}
                 onRequestChanges={() => {
-                  void requestPlanChanges();
+                  void planRequestChanges();
                 }}
                 onApprove={() => {
-                  void approvePlan();
+                  void planApprove();
                 }}
                 onOpen={() => {
                   void openPlan();
                 }}
+                onFetchBatchStatus={() => batchStatus()}
               />
             ) : (
               <EmptyState
                 icon="📋"
                 title="No plan loaded"
-                description="Load a plan file or kick off a project with the plan gate enabled to get started."
-                actionLabel="Go to Kickoff"
-                onAction={navigateToKickoff}
+                description="Create a project with the plan gate enabled to get started."
+                actionLabel="Go to Projects"
+                onAction={navigateToProjects}
               />
             )}
           </div>
         );
 
+      case "projects":
+        return (
+          <div className="mx-auto max-w-4xl px-6 py-8">
+            {errorBanner}
+            <div className="mb-6 flex items-center justify-between">
+              <h1 className="text-lg font-semibold text-foreground">Projects</h1>
+              <Button onClick={navigateToNewProject}>New Project</Button>
+            </div>
+            {projects.length === 0 ? (
+              <EmptyState
+                icon="📁"
+                title="No projects yet"
+                description="Create an ad-hoc project or import one from Linear."
+                actionLabel="New Project"
+                onAction={navigateToNewProject}
+              />
+            ) : (
+              <div className="space-y-3">
+                {projects.map((project) => (
+                  <ProjectCard
+                    key={project.id}
+                    project={project}
+                    prCount={
+                      reviews.filter((r) => r.project === project.id).length
+                    }
+                    onOpen={handleOpenProject}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        );
+
+      case "new-project":
+        return <NewProjectView onDone={navigateToProjects} />;
+
+      case "skills":
+        return <SkillsView />;
+
+      case "agents":
+        return <AgentEditor />;
+
       case "settings":
         return <SettingsView />;
-
-      case "kickoff":
-        return <KickoffView />;
 
       default:
         return assertNever(view);
@@ -614,14 +701,11 @@ function App() {
         <Sidebar
           activeView={view.kind}
           reviewCount={reviews.length}
-          hasPlan={plan !== null}
           onNavigate={handleNavigate}
           collapsed={sidebarCollapsed}
           onToggleCollapse={toggleSidebar}
         />
-        <main className="flex-1 overflow-y-auto">
-          {renderContent()}
-        </main>
+        <main className="flex-1 overflow-y-auto">{renderContent()}</main>
       </div>
       <CommandPalette
         open={commandPaletteOpen}

@@ -65,6 +65,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(app_state)
         .manage(shell_sessions)
         .setup(move |app| {
@@ -97,16 +98,38 @@ pub fn run() {
                             refresh_review_diff(&app_state_ref, &pr_ref).await;
                         }
                         AgentMode::Plan => {
-                            // Clear the plan's agent run and transition
-                            // to Reworked so the user can re-review.
-                            app_state_ref.plan.update(|plan| {
-                                plan.agent = None;
-                                let _ = plan.mark_reworked();
-                            });
+                            // Two planner spawns land here (both AgentMode::Plan):
+                            //   * initial generation — the plan is still
+                            //     `Pending`; leave it `Pending` (artifact-fill)
+                            //     so the user opens it when ready.
+                            //   * rework — the plan is `Dispatched`; transition
+                            //     to `Reworked` (clears ephemeral comments).
+                            // In both cases, if the planner wrote its output to
+                            // the recorded `plan_path`, ingest it: read + parse
+                            // the markdown into `doc`. Read/parse failure is
+                            // non-fatal (Invariant 1) — we log and keep the
+                            // prior doc rather than block the loop.
+                            ingest_plan_output(&app_state_ref);
                         }
                         AgentMode::Implement => {
-                            // TODO: implementation agent completion
-                            // reconciliation (Phase 2).
+                            // An implementer finished building a review's
+                            // initial code in its worktree. Clear the agent
+                            // run and re-fetch the diff so the review is ready
+                            // for human review — but do NOT auto-advance the
+                            // gate: the review stays `Pending` until a human
+                            // opens it (Invariant 5).
+                            //
+                            // Fan-out (kickoff::spawn_batch) keys the session by
+                            // ReviewId, so resolve the review by id and act on
+                            // its PrRef.
+                            if let Some(pr_ref) =
+                                resolve_review_pr(&app_state_ref, &event.object_id)
+                            {
+                                app_state_ref.reviews.update(&pr_ref, |review| {
+                                    review.agent = None;
+                                });
+                                refresh_review_diff(&app_state_ref, &pr_ref).await;
+                            }
                         }
                     }
 
@@ -144,17 +167,32 @@ pub fn run() {
             commands::add_comment,
             commands::request_changes,
             commands::mirror_comments,
+            commands::fetch_ci_checks,
+            commands::list_ci_checks,
+            commands::ci_run_logs_by_link,
+            commands::fix_ci,
             commands::get_plan,
             commands::load_plan,
             commands::add_plan_comment,
+            commands::generate_plan,
             commands::plan_request_changes,
             commands::plan_approve,
             commands::plan_open,
-            commands::batch_approve_preview,
+            commands::batch_status,
             commands::approve_review,
             commands::get_config,
             commands::save_config,
+            commands::get_agent_prompt,
+            commands::get_builtin_agent_prompt,
+            commands::save_agent_prompt,
+            commands::list_skills,
+            commands::save_skill,
+            commands::delete_skill,
+            commands::sync_skills,
             commands::kickoff,
+            commands::list_projects,
+            commands::create_project,
+            commands::attach_review,
             commands::restack_pr,
             commands::load_plan_from_path,
             commands::fetch_authored_prs,
@@ -164,11 +202,83 @@ pub fn run() {
             commands::shell::shell_resize,
             commands::shell::shell_kill,
             commands::open_in_editor,
+            commands::start_lsp_bridge,
         ])
         .run(tauri::generate_context!())
         // INVARIANT: if Tauri fails to start there is nothing to recover --
         // the app cannot function without the event loop.
         .expect("error running tauri application");
+}
+
+/// Settle plan state after a planner (`AgentMode::Plan`) completion.
+///
+/// Clears the running agent, ingests the planner's written markdown (when a
+/// `plan_path` is recorded and the file is present and non-empty) by parsing it
+/// into the plan's `doc`, and settles the gate:
+///   * `Dispatched` (rework) -> `Reworked` (also clears ephemeral comments).
+///   * `Pending` (initial artifact-fill) stays `Pending`.
+///
+/// Read/parse failures are non-fatal (Invariant 1): the prior doc is kept and
+/// the failure is logged rather than blocking the loop.
+fn ingest_plan_output(state: &AppState) {
+    use cockpit_core::gate::Gated;
+    use cockpit_core::model::GateState;
+
+    // Read + parse outside the store lock; only touch on-disk state here.
+    let parsed = state.plan.get().and_then(|plan| {
+        let path = plan.plan_path.clone()?;
+        match std::fs::read_to_string(&path) {
+            Ok(raw) if !raw.trim().is_empty() => match cockpit_core::plan_parser::parse(&raw) {
+                Ok(doc) => Some(doc),
+                Err(e) => {
+                    eprintln!(
+                        "ingest_plan_output: parse failed for {}: {e}",
+                        path.display()
+                    );
+                    None
+                }
+            },
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!(
+                    "ingest_plan_output: read failed for {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
+    });
+
+    state.plan.update(|plan| {
+        plan.agent = None;
+        if let Some(doc) = parsed {
+            plan.doc = doc;
+        }
+        if plan.gate_state == GateState::Dispatched {
+            // `mark_reworked` clears ephemeral comments (Invariant 4). A wrong
+            // starting state cannot occur here (guarded above), so the error is
+            // ignored deliberately.
+            let _ = plan.mark_reworked();
+        }
+    });
+}
+
+/// Resolve a review's [`PrRef`] from a completion event's `object_id`.
+///
+/// The object id may be a [`PrRef`] string (the Fix/Restack path keys sessions
+/// by PR) or a `ReviewId` string (the implementer fan-out keys sessions by
+/// review id). Tries the PR key first, then falls back to a scan by review id.
+fn resolve_review_pr(state: &AppState, object_id: &str) -> Option<PrRef> {
+    let pr_ref = PrRef::new(object_id);
+    if state.reviews.get(&pr_ref).is_some() {
+        return Some(pr_ref);
+    }
+    state
+        .reviews
+        .list()
+        .into_iter()
+        .find(|r| r.id.as_str() == object_id)
+        .map(|r| r.pr)
 }
 
 /// Re-fetch the PR diff from GitHub after an agent completion.

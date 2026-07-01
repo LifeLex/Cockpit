@@ -1,0 +1,14 @@
+## Intent
+
+Build a reusable widget framework
+
+## Issues
+
+- NEX-1 Define the widget trait
+- NEX-2 Add button widget (depends on NEX-1)
+- NEX-3 Wire event dispatch (depends on NEX-2)
+
+## Instruction
+
+Produce a project plan. Name the files to touch, the order of the steps, and the risks (migrations, new dependencies, breaking changes). If the goal is ambiguous or under-specified, stop and say so.
+

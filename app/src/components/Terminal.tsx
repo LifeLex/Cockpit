@@ -59,6 +59,8 @@ function Terminal({ id, cwd, onClose }: TerminalProps) {
   // Track whether the effect has already cleaned up to avoid
   // double-killing sessions in React strict mode.
   const cleanedUpRef = useRef(false);
+  // Set to true once spawn_shell resolves, so resize calls don't race.
+  const spawnedRef = useRef(false);
 
   const handleClose = useCallback(() => {
     if (onClose !== undefined) {
@@ -131,20 +133,27 @@ function Terminal({ id, cwd, onClose }: TerminalProps) {
       unlistenFn = fn;
     });
 
-    // Spawn the shell session.
-    void invoke("spawn_shell", { id, cwd });
-
-    // Handle resize events.
-    const handleResize = () => {
+    // Spawn the shell session. Resize calls are deferred until this resolves.
+    spawnedRef.current = false;
+    void invoke("spawn_shell", { id, cwd }).then(() => {
+      spawnedRef.current = true;
+      // Send initial dimensions now that the session exists.
       if (fitAddonRef.current !== null) {
         fitAddonRef.current.fit();
         const dims = fitAddonRef.current.proposeDimensions();
-        if (dims !== undefined) {
-          void invoke("shell_resize", {
-            id,
-            cols: dims.cols,
-            rows: dims.rows,
-          });
+        if (dims?.cols != null && dims.rows != null) {
+          void invoke("shell_resize", { id, cols: dims.cols, rows: dims.rows });
+        }
+      }
+    });
+
+    // Handle resize events — only after the session is spawned.
+    const handleResize = () => {
+      if (fitAddonRef.current !== null && spawnedRef.current) {
+        fitAddonRef.current.fit();
+        const dims = fitAddonRef.current.proposeDimensions();
+        if (dims?.cols != null && dims.rows != null) {
+          void invoke("shell_resize", { id, cols: dims.cols, rows: dims.rows });
         }
       }
     };

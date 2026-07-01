@@ -1,0 +1,56 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- Cockpit app icon — "Full-bleed horizon" (attitude indicator).
+       Master source; regenerate the raster set with `cargo tauri icon icon-source.svg` (via a rendered PNG). -->
+  <defs>
+    <clipPath id="tile"><rect x="40" y="40" width="944" height="944" rx="212"/></clipPath>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#63dedf"/>
+      <stop offset="1" stop-color="#2f9092"/>
+    </linearGradient>
+    <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#18212a"/>
+      <stop offset="1" stop-color="#0f151b"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <!-- base in case of any gap -->
+    <rect x="40" y="40" width="944" height="944" fill="#0f151b"/>
+
+    <!-- banked sky / ground (rotate the horizon, keep the aircraft level) -->
+    <g transform="rotate(-9 512 512)">
+      <rect x="-360" y="-460" width="1744" height="984" fill="url(#sky)"/>
+      <rect x="-360" y="524" width="1744" height="1160" fill="url(#ground)"/>
+      <rect x="-360" y="512" width="1744" height="12" fill="#0b0e12"/>
+      <!-- pitch ladder (subtle) -->
+      <g stroke="#0b0e12" stroke-opacity="0.40" stroke-width="9" stroke-linecap="round">
+        <path d="M432 400 h160"/>
+        <path d="M456 320 h112"/>
+      </g>
+      <g stroke="#e8eef4" stroke-opacity="0.30" stroke-width="9" stroke-linecap="round">
+        <path d="M440 636 h144"/>
+        <path d="M460 716 h104"/>
+      </g>
+    </g>
+
+    <!-- top sheen for depth -->
+    <rect x="40" y="40" width="944" height="470" fill="url(#sheen)"/>
+
+    <!-- fixed aircraft reference: level wings + hub -->
+    <g stroke="#f2f6fa" stroke-width="26" stroke-linecap="round">
+      <path d="M300 512 H430"/>
+      <path d="M594 512 H724"/>
+    </g>
+    <circle cx="512" cy="512" r="17" fill="#f2f6fa"/>
+
+    <!-- amber bank pointer at the top of the roll scale -->
+    <path d="M512 196 l22 -38 h-44 z" fill="#f2b544"/>
+
+    <!-- crisp inner edge for definition on light backdrops -->
+    <rect x="41.5" y="41.5" width="941" height="941" rx="210.5" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+  </g>
+</svg>

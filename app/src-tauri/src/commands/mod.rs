@@ -17,8 +17,8 @@ use cockpit_core::config::Config;
 use cockpit_core::gate::Gated;
 use cockpit_core::kickoff::{self, KickoffResult};
 use cockpit_core::model::{
-    AgentMode, Anchor, Artifact, Comment, CommentId, CommentOrigin, DiffData, GateState, PlanDoc,
-    PrRef, Project, ProjectId, ProjectPlan, ProjectRef, Review,
+    AgentMode, Anchor, Artifact, Comment, CommentId, CommentOrigin, DiffData, GateState, PrRef,
+    Project, ProjectId, ProjectPlan, ProjectRef, Review,
 };
 use cockpit_core::plan_parser;
 use cockpit_core::restack;
@@ -533,46 +533,27 @@ pub async fn fix_ci(
 // Plan gate commands
 // ---------------------------------------------------------------------------
 
-/// Return the current project plan, if one is loaded.
+/// Return the plan for the given project, if one exists.
 #[tauri::command]
-pub fn get_plan(state: State<'_, Arc<AppState>>) -> Result<Option<ProjectPlan>, CommandError> {
-    Ok(state.plan.get())
-}
-
-/// Load a plan from a file on disk and store it.
-///
-/// Parses the plan document using `cockpit-core`'s plan parser and
-/// creates a new `ProjectPlan` in `Pending` state.
-#[tauri::command]
-pub fn load_plan(
+pub fn get_plan(
     state: State<'_, Arc<AppState>>,
-    file: String,
-    project: String,
-) -> Result<ProjectPlan, CommandError> {
-    let raw = std::fs::read_to_string(&file)?;
-    let doc: PlanDoc = plan_parser::parse(&raw)?;
-    let plan = ProjectPlan {
-        project: ProjectRef::new(project),
-        doc,
-        gate_state: GateState::Pending,
-        comments: vec![],
-        agent: None,
-        plan_path: Some(PathBuf::from(file)),
-    };
-    state.plan.set(plan.clone());
-    Ok(plan)
+    project_id: String,
+) -> Result<Option<ProjectPlan>, CommandError> {
+    Ok(state.projects.plan(&ProjectId::new(&project_id)))
 }
 
-/// Add a comment anchored to a plan step or file.
+/// Add a comment anchored to a plan step or file for the given project's plan.
 ///
 /// The `anchor` string is parsed by `cockpit-core`'s plan anchor parser
 /// (format: `"step:N"` or `"file:path"`).
 #[tauri::command]
 pub fn add_plan_comment(
     state: State<'_, Arc<AppState>>,
+    project_id: String,
     anchor: String,
     body: String,
 ) -> Result<ProjectPlan, CommandError> {
+    let id = ProjectId::new(&project_id);
     let parsed_anchor: Anchor = plan_parser::parse_plan_anchor(&anchor)?;
     let comment = Comment {
         id: CommentId::new(uuid::Uuid::new_v4().to_string()),
@@ -581,47 +562,93 @@ pub fn add_plan_comment(
         origin: CommentOrigin::Local,
     };
 
-    let updated = state.plan.update(|plan| {
-        plan.comments.push(comment);
+    let mut had_plan = false;
+    state.projects.update_plan(&id, |slot| {
+        if let Some(plan) = slot.as_mut() {
+            plan.comments.push(comment);
+            had_plan = true;
+        }
     });
 
-    if !updated {
+    if !had_plan {
         return Err(CommandError {
-            message: "No project plan loaded".into(),
+            message: format!("No plan for project: {project_id}"),
         });
     }
 
-    state.plan.get().ok_or_else(|| CommandError {
-        message: "Plan disappeared after update".into(),
+    plan_for(&state, &id)
+}
+
+/// Return the plan for a project, or a "not found" [`CommandError`].
+///
+/// Small shared helper: every plan command re-reads the project's plan after
+/// mutating it so the frontend receives the current state.
+fn plan_for(state: &AppState, id: &ProjectId) -> Result<ProjectPlan, CommandError> {
+    state.projects.plan(id).ok_or_else(|| CommandError {
+        message: format!("No plan for project: {id}"),
     })
 }
 
-/// Generate the initial project plan by spawning a planner agent.
+/// Generate the plan for a project by spawning a planner agent.
 ///
-/// This is an artifact-filling spawn: it does **not** move the gate. The plan
-/// stays `Pending` while the planner (`AgentMode::Plan`) runs in the repo
-/// working directory; on Stop-hook completion the plan is left `Pending` and
-/// ready for the user to `plan_open`. Mirrors how implementers fill a review's
-/// diff while the review stays `Pending`.
+/// This is an artifact-filling spawn: it does **not** move the gate. A `Pending`
+/// [`ProjectPlan`] is created on the project (if it has none yet), its
+/// `plan_path` set to [`config::plan_file_path`], and the planner
+/// (`AgentMode::Plan`) is spawned in the repo working directory keyed by the
+/// project id so completion routes back to this project. On Stop-hook completion
+/// the plan is left `Pending` and ready for `plan_open`. Mirrors how implementers
+/// fill a review's diff while the review stays `Pending`.
 ///
-/// Requires a loaded plan (see `load_plan`/`kickoff`) and a configured repo
-/// path. Spawn failure is surfaced as an error; the plan state is unchanged.
+/// Requires a known project and a configured repo path. Spawn failure is
+/// surfaced as an error.
 #[tauri::command]
 pub async fn generate_plan(
     state: State<'_, Arc<AppState>>,
     app_handle: tauri::AppHandle,
+    project_id: String,
 ) -> Result<ProjectPlan, CommandError> {
-    let plan = state.plan.get().ok_or_else(|| CommandError {
-        message: "No project plan loaded".into(),
-    })?;
+    let id = ProjectId::new(&project_id);
+
+    if state.projects.get(&id).is_none() {
+        return Err(CommandError {
+            message: format!("Project not found: {project_id}"),
+        });
+    }
 
     // Resolve the on-disk destination the planner writes to, and ensure the
     // parent directory exists so the agent's write succeeds. This path is
-    // read back and parsed on completion (see the Plan completion arm).
-    let plan_path = cockpit_core::config::plan_file_path(plan.project.as_str())?;
+    // read back and parsed on completion (see the Plan completion arm). The
+    // plan's ProjectRef mirrors the project id so completion can route back.
+    let plan_path = cockpit_core::config::plan_file_path(&project_id)?;
     if let Some(parent) = plan_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+
+    // Ensure a Pending plan exists on the project, recording the write path.
+    // An existing plan is reused (its current doc seeds the prompt below).
+    let existed = state.projects.update_plan(&id, |slot| {
+        let plan = slot.get_or_insert_with(|| ProjectPlan {
+            project: ProjectRef::new(&project_id),
+            doc: cockpit_core::model::PlanDoc {
+                summary: String::new(),
+                steps: vec![],
+                files: vec![],
+                risks: vec![],
+                raw: String::new(),
+            },
+            gate_state: GateState::Pending,
+            comments: vec![],
+            agent: None,
+            plan_path: None,
+        });
+        plan.plan_path = Some(plan_path.clone());
+    });
+    if !existed {
+        return Err(CommandError {
+            message: format!("Project not found: {project_id}"),
+        });
+    }
+    let plan = plan_for(&state, &id)?;
 
     // Assemble the initial plan-generation prompt (intent = the project goal;
     // no comments — the plan does not exist yet). The Plan-mode custom preamble
@@ -643,19 +670,18 @@ pub async fn generate_plan(
     };
     let assembled = cockpit_core::prompt::assemble_plan_prompt(&plan_input);
 
-    let object_id = plan.project.as_str().to_string();
-    let run = spawn_plan_agent(&state, &app_handle, &object_id, &assembled).await?;
+    // The session object_id MUST be the project id so the Plan completion arm
+    // updates the right project's plan.
+    let run = spawn_plan_agent(&state, &app_handle, &project_id, &assembled).await?;
 
-    // Attach the running agent and record the write destination; the plan
-    // stays Pending (artifact-fill).
-    state.plan.update(|p| {
-        p.agent = Some(run);
-        p.plan_path = Some(plan_path);
+    // Attach the running agent; the plan stays Pending (artifact-fill).
+    state.projects.update_plan(&id, |slot| {
+        if let Some(p) = slot.as_mut() {
+            p.agent = Some(run);
+        }
     });
 
-    state.plan.get().ok_or_else(|| CommandError {
-        message: "Plan disappeared after update".into(),
-    })
+    plan_for(&state, &id)
 }
 
 /// Transition the plan to `Dispatched` and spawn a planner agent for rework.
@@ -672,25 +698,28 @@ pub async fn generate_plan(
 pub async fn plan_request_changes(
     state: State<'_, Arc<AppState>>,
     app_handle: tauri::AppHandle,
+    project_id: String,
 ) -> Result<ProjectPlan, CommandError> {
-    let mut plan = state.plan.get().ok_or_else(|| CommandError {
-        message: "No project plan loaded".into(),
-    })?;
+    let id = ProjectId::new(&project_id);
+    let mut plan = plan_for(&state, &id)?;
 
     plan.request_changes()?;
 
     // Resolve (and record) the on-disk destination for the revised plan so the
     // completion arm can read + parse it back. Reuse an existing path when the
-    // plan already has one (e.g. loaded from a file); otherwise derive it.
+    // plan already has one; otherwise derive it from the project id.
     let plan_path = match plan.plan_path.clone() {
         Some(p) => p,
-        None => cockpit_core::config::plan_file_path(plan.project.as_str())?,
+        None => cockpit_core::config::plan_file_path(&project_id)?,
     };
     if let Some(parent) = plan_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     plan.plan_path = Some(plan_path.clone());
-    state.plan.set(plan.clone());
+    let plan_snapshot = plan.clone();
+    state.projects.update_plan(&id, |slot| {
+        *slot = Some(plan_snapshot);
+    });
 
     // Assemble the rework prompt over the plan artifact + comments. Plan-mode
     // custom preamble injected verbatim (builtin fallback on load failure).
@@ -719,10 +748,14 @@ pub async fn plan_request_changes(
     };
     let assembled = cockpit_core::prompt::assemble_rework(&rework_input);
 
-    let object_id = plan.project.as_str().to_string();
-    match spawn_plan_agent(&state, &app_handle, &object_id, &assembled).await {
+    // The session object_id MUST be the project id so completion routes back.
+    match spawn_plan_agent(&state, &app_handle, &project_id, &assembled).await {
         Ok(run) => {
-            state.plan.update(|p| p.agent = Some(run));
+            state.projects.update_plan(&id, |slot| {
+                if let Some(p) = slot.as_mut() {
+                    p.agent = Some(run);
+                }
+            });
         }
         Err(e) => {
             eprintln!("plan_request_changes: planner spawn failed: {e}");
@@ -734,9 +767,7 @@ pub async fn plan_request_changes(
         }
     }
 
-    state.plan.get().ok_or_else(|| CommandError {
-        message: "Plan disappeared after update".into(),
-    })
+    plan_for(&state, &id)
 }
 
 /// Spawn a planner agent (`AgentMode::Plan`) in the repo working directory.
@@ -795,25 +826,26 @@ async fn spawn_plan_agent(
 /// The gate transition happens first and is authoritative. Fan-out failure is
 /// reported as an error but the plan remains `Approved`.
 #[tauri::command]
-pub async fn plan_approve(state: State<'_, Arc<AppState>>) -> Result<ProjectPlan, CommandError> {
-    let mut plan = state.plan.get().ok_or_else(|| CommandError {
-        message: "No project plan loaded".into(),
-    })?;
+pub async fn plan_approve(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+) -> Result<ProjectPlan, CommandError> {
+    let id = ProjectId::new(&project_id);
+    let mut plan = plan_for(&state, &id)?;
 
     plan.approve()?;
-    state.plan.set(plan.clone());
+    let approved = plan.clone();
+    state.projects.update_plan(&id, |slot| {
+        *slot = Some(approved);
+    });
 
-    // Fan out implementers for the project's frontier reviews. The plan's
-    // ProjectRef and the first-class ProjectId share the same string (see
-    // kickoff::project_from_linear), so reviews are selected by that id.
-    let project_id = ProjectId::new(plan.project.as_str());
-    // The approval stands regardless; a fan-out failure is surfaced to the
-    // caller but does not roll back the (authoritative) gate transition.
-    fan_out_implementers(&state, &plan.project, &project_id).await?;
+    // Fan out implementers for THIS project's frontier reviews only, scoped by
+    // the first-class ProjectId. The approval stands regardless; a fan-out
+    // failure is surfaced to the caller but does not roll back the
+    // (authoritative) gate transition.
+    fan_out_implementers(&state, &plan.project, &id).await?;
 
-    state.plan.get().ok_or_else(|| CommandError {
-        message: "Plan disappeared after update".into(),
-    })
+    plan_for(&state, &id)
 }
 
 /// Spawn implementer agents for a project's frontier reviews after approval.
@@ -891,36 +923,36 @@ async fn fan_out_implementers(
     Ok(())
 }
 
-/// Return the [`BatchStatus`] for the plan's project (or ungrouped reviews).
+/// Return the [`BatchStatus`] for a project's reviews.
 ///
 /// Aggregates the project's reviews into building / ready / approved counts so
-/// the frontend can show batch progress after a fan-out without polling each
-/// review individually.
+/// the frontend can show per-project batch progress after a fan-out without
+/// polling each review individually.
 #[tauri::command]
 pub fn batch_status(
     state: State<'_, Arc<AppState>>,
-    project_id: Option<String>,
+    project_id: String,
 ) -> Result<cockpit_core::store::BatchStatus, CommandError> {
-    let id = project_id.map(ProjectId::new);
-    Ok(cockpit_core::store::batch_status(
-        &state.reviews,
-        id.as_ref(),
-    ))
+    let id = ProjectId::new(&project_id);
+    Ok(cockpit_core::store::batch_status(&state.reviews, Some(&id)))
 }
 
-/// Open the plan for review (`Pending | Reworked` -> `InReview`).
+/// Open the given project's plan for review (`Pending | Reworked` -> `InReview`).
 #[tauri::command]
-pub fn plan_open(state: State<'_, Arc<AppState>>) -> Result<ProjectPlan, CommandError> {
-    let mut plan = state.plan.get().ok_or_else(|| CommandError {
-        message: "No project plan loaded".into(),
-    })?;
+pub fn plan_open(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+) -> Result<ProjectPlan, CommandError> {
+    let id = ProjectId::new(&project_id);
+    let mut plan = plan_for(&state, &id)?;
 
     plan.open()?;
-    state.plan.set(plan);
+    let opened = plan;
+    state.projects.update_plan(&id, |slot| {
+        *slot = Some(opened);
+    });
 
-    state.plan.get().ok_or_else(|| CommandError {
-        message: "Plan disappeared after update".into(),
-    })
+    plan_for(&state, &id)
 }
 
 /// Approve a single review by PR reference string (`InReview` -> `Approved`).
@@ -1111,9 +1143,16 @@ pub async fn kickoff(
     // 2. Build the issue DAG for parent/child wiring.
     let issue_dag = linear::build_issue_dag(&data);
 
-    // 3. Handle plan gate decision.
+    // 3. Build the first-class Linear-backed project that groups the reviews;
+    //    worktrees live under the cockpit home (outside the managed repo) and
+    //    are keyed via the unified `review_worktree_path` scheme so projects
+    //    never collide.
+    let mut cockpit_project = kickoff::project_from_linear(&project, format!("Project {project}"));
+
+    // 4. Handle plan gate decision: attach a Pending plan to the project itself
+    //    (per-project plan scoping), not a global slot.
     if !skip_plan {
-        let plan = ProjectPlan {
+        cockpit_project.plan = Some(ProjectPlan {
             project: project.clone(),
             doc: cockpit_core::model::PlanDoc {
                 summary: format!("Plan for project {project}"),
@@ -1126,15 +1165,8 @@ pub async fn kickoff(
             comments: vec![],
             agent: None,
             plan_path: None,
-        };
-        state.plan.set(plan);
+        });
     }
-
-    // 4. Build reviews for frontier issues. Kickoff creates a first-class
-    //    Linear-backed project that groups the reviews; worktrees live under
-    //    the cockpit home (outside the managed repo) and are keyed via the
-    //    unified `review_worktree_path` scheme so projects never collide.
-    let cockpit_project = kickoff::project_from_linear(&project, format!("Project {project}"));
 
     let mut reviews = kickoff::build_reviews_for_frontier(
         &frontier,
@@ -1147,7 +1179,9 @@ pub async fn kickoff(
         review.worktree = kickoff::review_worktree_path(review)?;
     }
 
-    // 5. Store the project and its reviews in the in-memory stores.
+    // 5. Store the project and its reviews in the in-memory stores. Snapshot the
+    //    project's plan first (it moves into the store on insert).
+    let plan = cockpit_project.plan.clone();
     state.projects.insert(cockpit_project);
     for review in &reviews {
         state.reviews.insert(review.clone());
@@ -1155,7 +1189,7 @@ pub async fn kickoff(
 
     let result = KickoffResult {
         reviews,
-        plan: state.plan.get(),
+        plan,
         issue_count: data.issues.len(),
         frontier,
     };
@@ -1415,35 +1449,6 @@ async fn fetch_prs_by_filter(
     }
 
     Ok(reviews)
-}
-
-// ---------------------------------------------------------------------------
-// Plan file loading command
-// ---------------------------------------------------------------------------
-
-/// Load a project plan from a file path on disk.
-///
-/// Parses the plan document and stores it in the app state as a new
-/// [`ProjectPlan`] in `Pending` state. The `path` argument is typically
-/// selected by the user via the file dialog.
-#[tauri::command]
-pub fn load_plan_from_path(
-    state: State<'_, Arc<AppState>>,
-    path: String,
-    project: String,
-) -> Result<ProjectPlan, CommandError> {
-    let raw = std::fs::read_to_string(&path)?;
-    let doc: PlanDoc = plan_parser::parse(&raw)?;
-    let plan = ProjectPlan {
-        project: ProjectRef::new(project),
-        doc,
-        gate_state: GateState::Pending,
-        comments: vec![],
-        agent: None,
-        plan_path: Some(PathBuf::from(path)),
-    };
-    state.plan.set(plan.clone());
-    Ok(plan)
 }
 
 // ---------------------------------------------------------------------------

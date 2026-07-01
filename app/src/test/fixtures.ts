@@ -31,6 +31,8 @@ export function makeReview(overrides: Partial<Review> = {}): Review {
     id: "rev-1",
     issue: "NEX-1",
     pr: "https://github.com/o/r/pull/1",
+    title: "Do the thing",
+    body: "",
     branch: "alejandro/nex-1-do-thing",
     base: "main",
     base_sha: "abc123",
@@ -62,11 +64,12 @@ export function makeCheck(overrides: Partial<CiCheck> = {}): CiCheck {
   };
 }
 
-/** The five gate states, for exhaustive iteration in tests. */
+/** Every gate state, for exhaustive iteration in tests. */
 export const ALL_GATE_STATES = [
   "Pending",
   "InReview",
   "Dispatched",
   "Reworked",
   "Approved",
+  "Merged",
 ] as const satisfies readonly GateState[];

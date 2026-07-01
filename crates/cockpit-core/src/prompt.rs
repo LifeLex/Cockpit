@@ -342,7 +342,7 @@ pub fn render_anchor(anchor: &Anchor, plan_doc: Option<&PlanDoc>) -> String {
             format!("plan step {idx}")
         }
         Anchor::PlanFile(path) => format!("plan file: {}", path.display()),
-        Anchor::DiffLine { path, range } => {
+        Anchor::DiffLine { path, range, .. } => {
             format!("{}:{}-{}", path.display(), range.0, range.1)
         }
     }
@@ -381,7 +381,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::model::{CommentId, CommentOrigin, DiffData, PlanStep};
+    use crate::model::{CommentId, CommentOrigin, DiffData, DiffSide, PlanStep};
 
     fn sample_plan_doc() -> PlanDoc {
         PlanDoc {
@@ -414,6 +414,7 @@ mod tests {
                 anchor: Anchor::DiffLine {
                     path: PathBuf::from("src/main.rs"),
                     range: (10, 15),
+                    side: DiffSide::New,
                 },
                 body: "This function needs error handling".into(),
                 origin: CommentOrigin::Local,
@@ -423,6 +424,7 @@ mod tests {
                 anchor: Anchor::DiffLine {
                     path: PathBuf::from("src/lib.rs"),
                     range: (42, 42),
+                    side: DiffSide::New,
                 },
                 body: "Missing doc comment on public method".into(),
                 origin: CommentOrigin::Local,
@@ -698,6 +700,7 @@ mod tests {
         let anchor = Anchor::DiffLine {
             path: PathBuf::from("src/main.rs"),
             range: (10, 15),
+            side: DiffSide::New,
         };
         assert_eq!(render_anchor(&anchor, None), "src/main.rs:10-15");
     }

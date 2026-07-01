@@ -740,6 +740,8 @@ pub fn build_review_from_pr(
         id: ReviewId::new(id_prefix),
         issue,
         pr: PrRef::new(&pr.url),
+        title: String::new(),
+        body: String::new(),
         branch: pr.head_ref_name.clone(),
         base: pr.base_ref_name.clone(),
         base_sha: String::new(),
@@ -755,6 +757,7 @@ pub fn build_review_from_pr(
         agent: None,
         repo_slug: slug,
         project: None,
+        dispatch_snapshot: None,
     }
 }
 
@@ -797,7 +800,7 @@ pub fn format_comment_body(comment: &Comment) -> String {
     let anchor_label = match &comment.anchor {
         Anchor::PlanStep(idx) => format!("**Plan step {idx}**"),
         Anchor::PlanFile(path) => format!("**Plan file:** `{}`", path.display()),
-        Anchor::DiffLine { path, range } => {
+        Anchor::DiffLine { path, range, .. } => {
             if range.0 == range.1 {
                 format!("**{}** line {}", path.display(), range.0)
             } else {
@@ -868,6 +871,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::model::DiffSide;
 
     // -- parse_issue_from_branch tests --
 
@@ -1093,6 +1097,7 @@ mod tests {
             anchor: Anchor::DiffLine {
                 path: PathBuf::from("src/main.rs"),
                 range: (42, 42),
+                side: DiffSide::New,
             },
             body: "This variable is unused.".into(),
             origin: CommentOrigin::Local,
@@ -1113,6 +1118,7 @@ mod tests {
             anchor: Anchor::DiffLine {
                 path: PathBuf::from("lib/util.rs"),
                 range: (10, 20),
+                side: DiffSide::New,
             },
             body: "Refactor this block.".into(),
             origin: CommentOrigin::Local,
@@ -1172,6 +1178,7 @@ mod tests {
                 anchor: Anchor::DiffLine {
                     path: PathBuf::from("a.rs"),
                     range: (1, 1),
+                    side: DiffSide::New,
                 },
                 body: "fix this".into(),
                 origin: CommentOrigin::Local,
@@ -1181,6 +1188,7 @@ mod tests {
                 anchor: Anchor::DiffLine {
                     path: PathBuf::from("b.rs"),
                     range: (5, 10),
+                    side: DiffSide::New,
                 },
                 body: "from github".into(),
                 origin: CommentOrigin::GitHubMirror,
@@ -1190,6 +1198,7 @@ mod tests {
                 anchor: Anchor::DiffLine {
                     path: PathBuf::from("c.rs"),
                     range: (3, 3),
+                    side: DiffSide::New,
                 },
                 body: "also fix this".into(),
                 origin: CommentOrigin::Local,

@@ -21,6 +21,8 @@ export function gateStateLabel(state: GateState): string {
       return "Reworked";
     case "Approved":
       return "Approved";
+    case "Merged":
+      return "Merged";
     default:
       return assertNever(state);
   }
@@ -42,6 +44,10 @@ export function gateToneClass(state: GateState): string {
     case "Reworked":
       return "bg-state-reworked/20 text-state-reworked border-state-reworked/30";
     case "Approved":
+      return "bg-state-approved/20 text-state-approved border-state-approved/30";
+    // Merged is terminal like Approved; reuse the approved tone until it earns
+    // its own design token in a later FE wave.
+    case "Merged":
       return "bg-state-approved/20 text-state-approved border-state-approved/30";
     default:
       return assertNever(state);

@@ -123,6 +123,8 @@ fn make_review(id: &str, branch: &str, worktree: PathBuf, project: &ProjectId) -
         id: ReviewId::new(id),
         issue: IssueRef::new(format!("ISSUE-{id}")),
         pr: PrRef::new(format!("owner/repo#{id}")),
+        title: String::new(),
+        body: String::new(),
         branch: branch.into(),
         base: "main".into(),
         base_sha: String::new(),
@@ -138,6 +140,7 @@ fn make_review(id: &str, branch: &str, worktree: PathBuf, project: &ProjectId) -
         agent: None,
         repo_slug: None,
         project: Some(project.clone()),
+        dispatch_snapshot: None,
     }
 }
 

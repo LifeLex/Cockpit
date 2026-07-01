@@ -359,6 +359,7 @@ function App() {
         case "InReview":
         case "Dispatched":
         case "Approved":
+        case "Merged":
           void navigateToDiff(pr);
           break;
         default:

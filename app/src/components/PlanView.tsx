@@ -393,6 +393,16 @@ function GateActions({
         </div>
       );
 
+    // Plans never merge (Merged is a Review-only terminal state); this case
+    // exists only to keep the GateState switch exhaustive.
+    case "Merged":
+      return (
+        <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+          <CheckCheck className="h-4 w-4" />
+          Merged.
+        </div>
+      );
+
     default:
       return assertNever(gateState);
   }

@@ -32,6 +32,9 @@ function gateStateRank(state: GateState): number {
       return 3;
     case "Approved":
       return 4;
+    // Merged is fully settled — the lowest urgency, below Approved.
+    case "Merged":
+      return 5;
     default:
       return assertNever(state);
   }

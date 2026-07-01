@@ -180,6 +180,8 @@ fn build_review(
         id: ReviewId::new(format!("r-{}", issue.as_str())),
         issue: issue.clone(),
         pr: PrRef::new(format!("pending-{}", issue.as_str())),
+        title: String::new(),
+        body: String::new(),
         branch,
         base,
         base_sha: String::new(),
@@ -195,6 +197,7 @@ fn build_review(
         agent: None,
         repo_slug: None,
         project: project.cloned(),
+        dispatch_snapshot: None,
     }
 }
 
@@ -751,6 +754,8 @@ mod tests {
             id: ReviewId::new("r-1"),
             issue: IssueRef::new("ISS-1"),
             pr: PrRef::new("p-1"),
+            title: String::new(),
+            body: String::new(),
             branch: "b-1".into(),
             base: "main".into(),
             base_sha: String::new(),
@@ -766,6 +771,7 @@ mod tests {
             agent: None,
             repo_slug: None,
             project: None,
+            dispatch_snapshot: None,
         }];
 
         wire_children(&mut reviews);
@@ -778,6 +784,8 @@ mod tests {
             id: ReviewId::new("r-NEX-1"),
             issue: IssueRef::new("NEX-1"),
             pr: PrRef::new("pending-NEX-1"),
+            title: String::new(),
+            body: String::new(),
             branch: "alejandro/nex-1-thing".into(),
             base: "main".into(),
             base_sha: String::new(),
@@ -793,6 +801,7 @@ mod tests {
             agent: None,
             repo_slug: None,
             project: None,
+            dispatch_snapshot: None,
         };
 
         let prompt = assemble_implement_prompt(&review, &ProjectRef::new("proj-1"), None);

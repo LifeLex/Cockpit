@@ -37,6 +37,9 @@ function activeChipClass(state: GateState): string {
       return "bg-state-reworked text-white";
     case "Approved":
       return "bg-state-approved text-white";
+    // Merged shares the approved tone until it earns its own token.
+    case "Merged":
+      return "bg-state-approved text-white";
     default:
       return assertNever(state);
   }
@@ -54,6 +57,8 @@ function inactiveChipClass(state: GateState): string {
     case "Reworked":
       return "bg-state-reworked/20 text-state-reworked";
     case "Approved":
+      return "bg-state-approved/20 text-state-approved";
+    case "Merged":
       return "bg-state-approved/20 text-state-approved";
     default:
       return assertNever(state);

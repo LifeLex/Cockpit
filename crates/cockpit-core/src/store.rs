@@ -244,6 +244,8 @@ mod tests {
             id: ReviewId::new(format!("r-{pr_num}")),
             issue: IssueRef::new(format!("ISSUE-{pr_num}")),
             pr: PrRef::new(format!("owner/repo#{pr_num}")),
+            title: String::new(),
+            body: String::new(),
             branch: format!("alejandro/test-{pr_num}"),
             base: "main".into(),
             base_sha: "000".into(),
@@ -259,6 +261,7 @@ mod tests {
             agent: None,
             repo_slug: None,
             project: None,
+            dispatch_snapshot: None,
         }
     }
 

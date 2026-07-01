@@ -39,6 +39,8 @@ function ledColorClass(state: GateState): string {
       return "bg-state-reworked";
     case "Approved":
       return "bg-state-approved";
+    case "Merged":
+      return "bg-state-approved";
     default:
       return assertNever(state);
   }
@@ -83,6 +85,8 @@ function actionConfigForState(state: GateState): ActionConfig {
     case "Reworked":
       return { label: "Re-review", variant: "default", muted: false };
     case "Approved":
+      return { label: "View", variant: "ghost", muted: false };
+    case "Merged":
       return { label: "View", variant: "ghost", muted: false };
     default:
       return assertNever(state);

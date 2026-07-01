@@ -17,8 +17,8 @@ use cockpit_core::config::Config;
 use cockpit_core::gate::Gated;
 use cockpit_core::kickoff::{self, KickoffResult};
 use cockpit_core::model::{
-    AgentMode, Anchor, Artifact, Comment, CommentId, CommentOrigin, DiffData, GateState, PrRef,
-    Project, ProjectId, ProjectPlan, ProjectRef, Review,
+    AgentMode, Anchor, Artifact, Comment, CommentId, CommentOrigin, DiffData, DiffSide, GateState,
+    PrRef, Project, ProjectId, ProjectPlan, ProjectRef, Review,
 };
 use cockpit_core::plan_parser;
 use cockpit_core::restack;
@@ -108,6 +108,7 @@ pub fn add_comment(
         anchor: Anchor::DiffLine {
             path: PathBuf::from(&file),
             range: (line_start, line_end),
+            side: DiffSide::New,
         },
         body,
         origin: CommentOrigin::Local,
@@ -501,6 +502,7 @@ pub async fn fix_ci(
             anchor: Anchor::DiffLine {
                 path: PathBuf::from("CI"),
                 range: (0, 0),
+                side: DiffSide::New,
             },
             body: summary,
             origin: CommentOrigin::Local,

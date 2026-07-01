@@ -64,6 +64,8 @@ export function cardSignal(review: Review, now: number = Date.now()): CardSignal
     }
     case "Approved":
       return { reason: "Approved", tone: "done" };
+    case "Merged":
+      return { reason: "Merged", tone: "done" };
     default:
       return assertNever(state);
   }

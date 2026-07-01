@@ -282,6 +282,8 @@ mod tests {
             id: ReviewId::new(id),
             issue: IssueRef::new(format!("ISSUE-{id}")),
             pr: PrRef::new(format!("owner/repo#{id}")),
+            title: String::new(),
+            body: String::new(),
             branch: branch.to_string(),
             base: base.to_string(),
             base_sha: "000".into(),
@@ -297,6 +299,7 @@ mod tests {
             agent: None,
             repo_slug: None,
             project: None,
+            dispatch_snapshot: None,
         }
     }
 

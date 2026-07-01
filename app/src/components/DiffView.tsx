@@ -29,6 +29,7 @@ import type { Comment } from "../bindings/Comment";
 import type { CommentOrigin } from "../bindings/CommentOrigin";
 import type { MirrorResult } from "../bindings/MirrorResult";
 import type { Anchor } from "../bindings/Anchor";
+import type { DiffSide } from "../bindings/DiffSide";
 import type { CiSummary } from "../bindings/CiSummary";
 import { summarizeChecks, ciState, parseCiUpdate } from "@/lib/ci";
 import { parseDiff, extractFilePaths } from "../diff-parser";
@@ -114,6 +115,8 @@ function gateLedColorClass(state: GateState): string {
       return "bg-state-reworked";
     case "Approved":
       return "bg-state-approved";
+    case "Merged":
+      return "bg-state-approved";
     default:
       return assertNever(state);
   }
@@ -188,7 +191,9 @@ function repoUrl(slug: string): string | null {
 
 function isDiffLineAnchor(
   anchor: Anchor,
-): anchor is { readonly DiffLine: { path: string; range: [number, number] } } {
+): anchor is {
+  readonly DiffLine: { path: string; range: [number, number]; side: DiffSide };
+} {
   return "DiffLine" in anchor;
 }
 

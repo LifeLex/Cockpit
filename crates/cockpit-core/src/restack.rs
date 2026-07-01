@@ -11,6 +11,7 @@
 //! The git-level cherry-pick lives in `adapters::git::restack`; this module
 //! provides the graph-level helpers that operate on `&mut [Review]`.
 
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
 use git2::{Oid, Repository};
@@ -155,27 +156,30 @@ pub async fn restack_or_resolve(
 // Graph helpers
 // ---------------------------------------------------------------------------
 
-/// Mark all descendants of a review as stale.
+/// Mark every transitive descendant of `parent_id` as stale.
 ///
-/// Called when a review enters `Dispatched` — its descendants should not be
-/// deep-reviewed until the restack completes.
+/// The loop calls this when a parent review enters `Dispatched` or merges: its
+/// descendants must not be deep-reviewed until they have been restacked onto the
+/// reworked base (SPEC §7/§13). The parent itself is left untouched.
 ///
-/// Walks the `children` edges transitively (breadth-first) and sets
-/// `stale = true` on every descendant. The parent itself is *not* marked.
-///
-/// Gated to `#[cfg(test)]`: the graph-level batch restack seam (SPEC §13) is
-/// not yet wired into the loop, so this helper is currently exercised only by
-/// its own coverage. Promote it to `pub` when the batch-restack driver lands.
-#[cfg(test)]
-fn mark_descendants_stale(reviews: &mut [Review], parent_id: &ReviewId) {
-    // Collect children IDs from the parent to seed the traversal.
+/// Traversal is breadth-first over the `children` edges and guarded by a visited
+/// set, so diamonds and (malformed) cycles terminate rather than looping forever.
+/// Child ids with no matching review in `reviews` are silently skipped.
+pub fn mark_descendants_stale(reviews: &mut [Review], parent_id: &ReviewId) {
+    // Seed the traversal with the parent's direct children.
     let mut queue: Vec<ReviewId> = reviews
         .iter()
         .filter(|r| r.id == *parent_id)
         .flat_map(|r| r.children.clone())
         .collect();
 
+    // Track visited ids so diamonds and cycles are each processed once.
+    let mut visited: HashSet<ReviewId> = HashSet::new();
+
     while let Some(id) = queue.pop() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
         for review in reviews.iter_mut() {
             if review.id == id {
                 review.mark_stale();
@@ -219,40 +223,53 @@ pub fn restack_review(
     Ok(clean)
 }
 
-/// Build a breadth-first traversal order of descendants with their parent branch names.
+/// Build the restack order for the descendants of `root_id`.
 ///
-/// Returns `(child_id, parent_branch)` pairs in BFS order, guaranteeing that
-/// every review's parent is processed before the review itself.
+/// Returns `(child_id, parent_branch)` pairs in breadth-first order, so every
+/// review's parent is restacked before the review itself. The loop consumes this
+/// after a parent enters `Dispatched` or merges, walking the pairs to rebase each
+/// stale descendant onto its new base (SPEC §7/§13).
 ///
-/// Gated to `#[cfg(test)]`: the graph-level batch restack seam (SPEC §13) that
-/// would consume this ordering is not yet wired into the loop, so the helper is
-/// currently exercised only by its own coverage. Promote it (and add the
-/// driver that walks the order) when the batch-restack step lands.
-#[cfg(test)]
-fn dependency_order(reviews: &[Review], root_id: &ReviewId) -> Vec<(ReviewId, String)> {
+/// A visited set keeps diamonds and (malformed) cycles finite — each descendant
+/// appears at most once, restacked onto the parent reached first in the BFS.
+/// Child ids with no matching review in `reviews` are skipped (they cannot be
+/// restacked), and an unknown `root_id` yields an empty order.
+pub fn dependency_order(reviews: &[Review], root_id: &ReviewId) -> Vec<(ReviewId, String)> {
     let mut order = Vec::new();
 
     // Find root's branch and children.
-    let root = reviews.iter().find(|r| r.id == *root_id);
-    let Some(root) = root else {
+    let Some(root) = reviews.iter().find(|r| r.id == *root_id) else {
         return order;
     };
 
-    let mut queue: Vec<(ReviewId, String)> = root
+    // Track visited ids so each descendant is emitted once, even across
+    // diamonds, and so cycles terminate.
+    let mut visited: HashSet<ReviewId> = HashSet::new();
+    visited.insert(root.id.clone());
+
+    let mut queue: VecDeque<(ReviewId, String)> = root
         .children
         .iter()
         .map(|child_id| (child_id.clone(), root.branch.clone()))
         .collect();
 
-    while let Some((child_id, parent_branch)) = queue.first().cloned() {
-        queue.remove(0);
-        order.push((child_id.clone(), parent_branch));
+    while let Some((child_id, parent_branch)) = queue.pop_front() {
+        // Skip nodes already emitted via another edge (or a cycle).
+        if !visited.insert(child_id.clone()) {
+            continue;
+        }
 
-        // Find this child and enqueue its children.
-        if let Some(child) = reviews.iter().find(|r| r.id == child_id) {
-            for grandchild_id in &child.children {
-                queue.push((grandchild_id.clone(), child.branch.clone()));
-            }
+        // Skip dangling edges: a child id with no matching review can't be
+        // restacked, so it never enters the order.
+        let Some(child) = reviews.iter().find(|r| r.id == child_id) else {
+            continue;
+        };
+
+        order.push((child_id, parent_branch));
+
+        // Enqueue this child's children onto the child's own branch.
+        for grandchild_id in &child.children {
+            queue.push_back((grandchild_id.clone(), child.branch.clone()));
         }
     }
 

@@ -798,6 +798,7 @@ mod tests {
             gate_state: GateState::Dispatched,
             comments: vec![],
             agent: None,
+            plan_path: None,
         };
 
         reconcile_plan(&mut plan, &plan_path).expect("reconcile should succeed");
@@ -834,6 +835,7 @@ mod tests {
             gate_state: GateState::InReview,
             comments: vec![],
             agent: None,
+            plan_path: None,
         };
 
         let err = reconcile_plan(&mut plan, &plan_path).unwrap_err();
@@ -859,6 +861,7 @@ mod tests {
             gate_state: GateState::Dispatched,
             comments: vec![],
             agent: None,
+            plan_path: None,
         };
 
         let err =

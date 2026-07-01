@@ -92,3 +92,19 @@ impl From<cockpit_core::restack::Error> for CommandError {
         }
     }
 }
+
+impl From<cockpit_core::skills::Error> for CommandError {
+    fn from(e: cockpit_core::skills::Error) -> Self {
+        Self {
+            message: e.to_string(),
+        }
+    }
+}
+
+impl From<cockpit_core::adapters::lsp::Error> for CommandError {
+    fn from(e: cockpit_core::adapters::lsp::Error) -> Self {
+        Self {
+            message: e.to_string(),
+        }
+    }
+}

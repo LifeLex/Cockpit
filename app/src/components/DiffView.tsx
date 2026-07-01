@@ -11,12 +11,12 @@ import {
   useMemo,
   useCallback,
   useEffect,
-  useLayoutEffect,
   useRef,
 } from "react";
 import { createPortal } from "react-dom";
 import {
   DiffEditor,
+  type DiffBeforeMount,
   type DiffOnMount,
   type Monaco,
   type MonacoDiffEditor,
@@ -29,15 +29,20 @@ import type { Comment } from "../bindings/Comment";
 import type { CommentOrigin } from "../bindings/CommentOrigin";
 import type { MirrorResult } from "../bindings/MirrorResult";
 import type { Anchor } from "../bindings/Anchor";
+import type { CiSummary } from "../bindings/CiSummary";
+import { summarizeChecks, ciState, parseCiUpdate } from "@/lib/ci";
 import { parseDiff, extractFilePaths } from "../diff-parser";
 import type { FileDiff } from "../diff-parser";
 import { useAppStore } from "../store";
 import { registerCustomThemes } from "@/lib/monaco-themes";
+import { attachLspClient, type LspAttachment } from "@/lib/lsp-client";
 import { AgentPanel } from "./AgentPanel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { openExternal } from "@/lib/open";
 import {
   ArrowLeft,
   ExternalLink,
@@ -46,6 +51,14 @@ import {
   Send,
   AlertTriangle,
   Bot,
+  Hash,
+  GitBranch,
+  ChevronDown,
+  ChevronRight,
+  CheckCircle2,
+  XCircle,
+  Loader2,
+  Wrench,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -118,6 +131,38 @@ function gateStateBadgeClass(state: GateState): string {
     default:
       return assertNever(state);
   }
+}
+
+/**
+ * Build a GitHub PR URL from a PrRef like `owner/repo#42`.
+ * Returns null if the format does not match.
+ */
+function prUrl(pr: string): string | null {
+  const match = /^([^#]+)#(\d+)$/.exec(pr);
+  if (match === null) return null;
+  // INVARIANT: regex matched with two capture groups
+  return `https://github.com/${match[1]}/pull/${match[2]}`;
+}
+
+/**
+ * Build a Linear issue URL from an IssueRef like `NEX-123`.
+ * Returns null if the ref does not look like a Linear identifier.
+ */
+function issueUrl(issue: string): string | null {
+  const match = /^([A-Za-z]+)-(\d+)$/.exec(issue);
+  if (match === null) return null;
+  // INVARIANT: regex matched with two capture groups
+  return `https://linear.app/issue/${match[1]}-${match[2]}`;
+}
+
+/**
+ * Build a GitHub repository URL from a repo slug like `owner/repo`.
+ * Returns null if the slug does not match `owner/repo`.
+ */
+function repoUrl(slug: string): string | null {
+  const match = /^[^/]+\/[^/]+$/.exec(slug);
+  if (match === null) return null;
+  return `https://github.com/${slug}`;
 }
 
 function isDiffLineAnchor(
@@ -382,6 +427,10 @@ export function DiffView({
   // -- Agent C: editor theme from store --
   const editorTheme = useAppStore((s) => s.editorTheme);
 
+  // -- LSP: workspace root + enable toggle from config --
+  const lspRootPath = useAppStore((s) => s.config?.repo_path ?? null);
+  const lspEnabled = useAppStore((s) => s.config?.lsp_servers.enabled ?? true);
+
   // -- Diff parsing --
   const fileDiffs = useMemo(() => parseDiff(diff.raw), [diff.raw]);
   const filePaths = useMemo(() => extractFilePaths(diff.raw), [diff.raw]);
@@ -392,6 +441,7 @@ export function DiffView({
   );
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [diffMode, setDiffMode] = useState<"split" | "unified">("split");
+  const [stackOpen, setStackOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [agentPanelVisible, setAgentPanelVisible] = useState(
     review.gate_state === "Dispatched",
@@ -411,6 +461,10 @@ export function DiffView({
   const [mirrorResult, setMirrorResult] = useState<MirrorResult | null>(null);
   const [mirroring, setMirroring] = useState(false);
 
+  // -- CI checks state --
+  const [ciSummary, setCiSummary] = useState<CiSummary | null>(null);
+  const [fixingCi, setFixingCi] = useState(false);
+
   // -- Refs --
   const activeFileRef = useRef<HTMLButtonElement | null>(null);
   const diffEditorRef = useRef<MonacoDiffEditor | null>(null);
@@ -421,6 +475,7 @@ export function DiffView({
     useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
   const commentDecorRef =
     useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
+  const lspAttachmentRef = useRef<LspAttachment | null>(null);
 
   // -- Derived --
   const currentFileDiff = useMemo(
@@ -445,6 +500,17 @@ export function DiffView({
 
   // Only open the input form when the review is InReview
   const effectiveInputLine = canAddComments ? activeCommentLine : null;
+
+  // -- Relocated PR-info: external reference links --
+  const prHref = useMemo(() => prUrl(review.pr), [review.pr]);
+  const issueHref = useMemo(() => issueUrl(review.issue), [review.issue]);
+  const repoHref = useMemo(
+    () => (review.repo_slug !== null ? repoUrl(review.repo_slug) : null),
+    [review.repo_slug],
+  );
+
+  // -- Relocated PR-info: stack parents/children --
+  const hasStack = review.parents.length > 0 || review.children.length > 0;
 
   // -- Close inline form on file change --
   useEffect(() => {
@@ -473,63 +539,78 @@ export function DiffView({
     activeFileRef.current?.scrollIntoView({ block: "nearest" });
   }, [selectedFile]);
 
-  // -- Editor mount handler (registers custom themes + inline comment gutter) --
-  const handleEditorMount = useCallback<DiffOnMount>((editor, monaco) => {
-    diffEditorRef.current = editor;
-    monacoRef.current = monaco;
-
-    // Agent C: register custom Monaco themes so they are available
+  // -- Editor before-mount handler (registers custom themes) --
+  // Themes must be defined BEFORE the editor is instantiated; registering in
+  // onMount races with `<DiffEditor theme>` and falls back to vs-dark on the
+  // first load. registerCustomThemes is idempotent, so calling it here (and
+  // again in onMount as belt-and-suspenders) is safe.
+  const handleBeforeMount = useCallback<DiffBeforeMount>((monaco) => {
     registerCustomThemes(monaco);
-
-    const modified = editor.getModifiedEditor();
-    modified.updateOptions({ glyphMargin: true });
-
-    glyphDecorRef.current = modified.createDecorationsCollection([]);
-    commentDecorRef.current = modified.createDecorationsCollection([]);
-
-    // Hover: show "+" glyph on the hovered line
-    modified.onMouseMove((e) => {
-      if (glyphDecorRef.current == null) return;
-      const target = e.target;
-      const isHoverArea =
-        target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN ||
-        target.type === monaco.editor.MouseTargetType.GUTTER_LINE_NUMBERS ||
-        target.type ===
-          monaco.editor.MouseTargetType.GUTTER_LINE_DECORATIONS ||
-        target.type === monaco.editor.MouseTargetType.CONTENT_TEXT;
-
-      if (isHoverArea && target.position != null) {
-        const ln = target.position.lineNumber;
-        glyphDecorRef.current.set([
-          {
-            range: new monaco.Range(ln, 1, ln, 1),
-            options: { glyphMarginClassName: "inline-comment-glyph" },
-          },
-        ]);
-      } else {
-        glyphDecorRef.current.clear();
-      }
-    });
-
-    // Click on gutter: toggle inline comment form
-    modified.onMouseDown((e) => {
-      const target = e.target;
-      const isGutterClick =
-        target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN ||
-        target.type === monaco.editor.MouseTargetType.GUTTER_LINE_NUMBERS;
-
-      if (isGutterClick && target.position != null) {
-        const line = target.position.lineNumber;
-        setActiveCommentLine((prev) => (prev === line ? null : line));
-      }
-    });
-
-    setEditorReady(true);
   }, []);
 
+  // -- Editor mount handler (registers custom themes + inline comment gutter) --
+  const handleEditorMount = useCallback<DiffOnMount>(
+    (editor, monaco) => {
+      diffEditorRef.current = editor;
+      monacoRef.current = monaco;
+
+      // Belt-and-suspenders: ensure themes exist and the selected theme is
+      // applied even if beforeMount timing ever changes.
+      registerCustomThemes(monaco);
+      monaco.editor.setTheme(editorTheme);
+
+      const modified = editor.getModifiedEditor();
+      modified.updateOptions({ glyphMargin: true });
+
+      glyphDecorRef.current = modified.createDecorationsCollection([]);
+      commentDecorRef.current = modified.createDecorationsCollection([]);
+
+      // Hover: show "+" glyph on the hovered line
+      modified.onMouseMove((e) => {
+        if (glyphDecorRef.current == null) return;
+        const target = e.target;
+        const isHoverArea =
+          target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN ||
+          target.type === monaco.editor.MouseTargetType.GUTTER_LINE_NUMBERS ||
+          target.type ===
+            monaco.editor.MouseTargetType.GUTTER_LINE_DECORATIONS ||
+          target.type === monaco.editor.MouseTargetType.CONTENT_TEXT;
+
+        if (isHoverArea && target.position != null) {
+          const ln = target.position.lineNumber;
+          glyphDecorRef.current.set([
+            {
+              range: new monaco.Range(ln, 1, ln, 1),
+              options: { glyphMarginClassName: "inline-comment-glyph" },
+            },
+          ]);
+        } else {
+          glyphDecorRef.current.clear();
+        }
+      });
+
+      // Click on gutter: toggle inline comment form
+      modified.onMouseDown((e) => {
+        const target = e.target;
+        const isGutterClick =
+          target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN ||
+          target.type === monaco.editor.MouseTargetType.GUTTER_LINE_NUMBERS;
+
+        if (isGutterClick && target.position != null) {
+          const line = target.position.lineNumber;
+          setActiveCommentLine((prev) => (prev === line ? null : line));
+        }
+      });
+
+      setEditorReady(true);
+    },
+    [editorTheme],
+  );
+
   // -- Sync view zones with comments + active input line --
-  // useLayoutEffect so zones render before the browser paints
-  useLayoutEffect(() => {
+  // useEffect (not useLayoutEffect) so zones are created AFTER Monaco's
+  // internal useEffect updates the editor models on file switch.
+  useEffect(() => {
     if (
       !editorReady ||
       diffEditorRef.current == null ||
@@ -600,7 +681,7 @@ export function DiffView({
           afterLineNumber: line,
           heightInPx: totalHeight,
           domNode,
-          suppressMouseDown: true,
+          suppressMouseDown: false,
         });
 
         zoneIdsRef.current.push(zoneId);
@@ -631,6 +712,56 @@ export function DiffView({
 
     setPortals(newPortals);
   }, [editorReady, commentsForFile, effectiveInputLine, selectedFile, diffMode]);
+
+  // -- LSP: attach a language client to the modified (right-hand) model --
+  // Runs once the editor is ready and whenever the selected file (and thus its
+  // language) changes. Only languages with a configured server (typescript /
+  // javascript / python) attach; everything else keeps plain highlighting.
+  // The attachment is torn down on file change and on unmount (didClose +
+  // socket close) so no stale server session or diagnostics linger.
+  useEffect(() => {
+    // Always tear down the previous attachment before (maybe) opening a new one.
+    lspAttachmentRef.current?.dispose();
+    lspAttachmentRef.current = null;
+
+    if (
+      !editorReady ||
+      !lspEnabled ||
+      lspRootPath === null ||
+      selectedFile === "" ||
+      diffEditorRef.current === null ||
+      monacoRef.current === null
+    ) {
+      return;
+    }
+
+    const languageId = detectLanguage(selectedFile);
+    const model = diffEditorRef.current.getModifiedEditor().getModel();
+    if (model === null) return;
+
+    const monaco = monacoRef.current;
+    let cancelled = false;
+
+    void attachLspClient({ monaco, model, languageId, rootPath: lspRootPath })
+      .then((attachment) => {
+        if (attachment === null) return;
+        if (cancelled) {
+          // The effect was torn down while the socket was opening.
+          attachment.dispose();
+          return;
+        }
+        lspAttachmentRef.current = attachment;
+      })
+      .catch((e: unknown) => {
+        console.error("attachLspClient failed", e);
+      });
+
+    return () => {
+      cancelled = true;
+      lspAttachmentRef.current?.dispose();
+      lspAttachmentRef.current = null;
+    };
+  }, [editorReady, lspEnabled, lspRootPath, selectedFile]);
 
   // -- Handlers --
   const handleInlineSubmit = useCallback(
@@ -669,6 +800,56 @@ export function DiffView({
     }
   }, [onRequestChanges]);
 
+  // -- CI checks: fetch on load and update via the `ci-updated` event --
+  const prRef = review.pr;
+  useEffect(() => {
+    let cancelled = false;
+
+    // Initial fetch (STATUS tier). Non-fatal: a fetch failure leaves the badge
+    // empty rather than surfacing an error — CI never blocks the review loop.
+    void invoke<CiSummary>("fetch_ci_checks", { pr: prRef })
+      .then((summary) => {
+        if (!cancelled) setCiSummary(summary);
+      })
+      .catch((e: unknown) => {
+        console.error("fetch_ci_checks failed", e);
+      });
+
+    // Live updates: the backend pushes the full checks list via `ci-updated`.
+    const unlisten = listen<unknown>("ci-updated", (event) => {
+      const update = parseCiUpdate(event.payload);
+      if (update === null || update.pr !== prRef) return;
+      setCiSummary(summarizeChecks(update.checks));
+    });
+
+    return () => {
+      cancelled = true;
+      void unlisten.then((f) => {
+        f();
+      });
+    };
+  }, [prRef]);
+
+  const ciBadgeState = useMemo(
+    () => (ciSummary !== null ? ciState(ciSummary) : "none"),
+    [ciSummary],
+  );
+
+  const handleFixCi = useCallback(async () => {
+    const confirmed = window.confirm(
+      "Dispatch an agent to fix the failing CI checks? This transitions the review to Dispatched and runs the fixer agent.",
+    );
+    if (!confirmed) return;
+    setFixingCi(true);
+    try {
+      await invoke("fix_ci", { pr: prRef });
+    } catch (e: unknown) {
+      console.error("fix_ci failed", e);
+    } finally {
+      setFixingCi(false);
+    }
+  }, [prRef]);
+
   const handleSubmitReview = useCallback(async () => {
     const commentCount = review.comments.filter((c) => isLocalOrigin(c.origin)).length;
     if (commentCount === 0) return;
@@ -693,7 +874,7 @@ export function DiffView({
   // =========================================================================
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="flex h-full flex-col">
       {/* ----------------------------------------------------------------- */}
       {/* Header                                                            */}
       {/* ----------------------------------------------------------------- */}
@@ -707,7 +888,68 @@ export function DiffView({
           <span className="truncate text-sm font-semibold">
             {review.branch}
           </span>
-          <span className="text-xs text-muted-foreground">{review.issue}</span>
+
+          {/* PR link */}
+          {prHref !== null ? (
+            <a
+              href={prHref}
+              onClick={(e) => {
+                e.preventDefault();
+                void openExternal(prHref);
+              }}
+              className="inline-flex shrink-0 items-center gap-1 text-xs text-primary hover:underline"
+              title="Open PR on GitHub"
+            >
+              {review.pr}
+              <ExternalLink className="h-3 w-3" />
+            </a>
+          ) : (
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {review.pr}
+            </span>
+          )}
+
+          {/* Issue link */}
+          {issueHref !== null ? (
+            <a
+              href={issueHref}
+              onClick={(e) => {
+                e.preventDefault();
+                void openExternal(issueHref);
+              }}
+              className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground hover:text-foreground hover:underline"
+              title="Open issue on Linear"
+            >
+              <Hash className="h-3 w-3" />
+              {review.issue}
+            </a>
+          ) : (
+            <span className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+              <Hash className="h-3 w-3" />
+              {review.issue}
+            </span>
+          )}
+
+          {/* Repository link */}
+          {review.repo_slug !== null &&
+            (repoHref !== null ? (
+              <a
+                href={repoHref}
+                onClick={(e) => {
+                  e.preventDefault();
+                  void openExternal(repoHref);
+                }}
+                className="inline-flex shrink-0 items-center gap-1 font-mono text-xs text-muted-foreground hover:text-foreground hover:underline"
+                title="Open repository on GitHub"
+              >
+                {review.repo_slug}
+                <ExternalLink className="h-3 w-3" />
+              </a>
+            ) : (
+              <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                {review.repo_slug}
+              </span>
+            ))}
         </div>
 
         <Badge
@@ -726,6 +968,29 @@ export function DiffView({
         {review.agent != null && (
           <span className="inline-flex items-center gap-1 text-xs text-warning">
             <Bot className="h-3 w-3" /> PID {review.agent.pid}
+          </span>
+        )}
+
+        {/* CI checks badge */}
+        {ciSummary !== null && ciSummary.total > 0 && (
+          <span
+            className={cn(
+              "inline-flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs",
+              ciBadgeState === "pass" &&
+                "border-success/30 bg-success/15 text-success",
+              ciBadgeState === "fail" &&
+                "border-danger/30 bg-danger/15 text-danger",
+              ciBadgeState === "pending" &&
+                "border-warning/30 bg-warning/15 text-warning",
+            )}
+            title={`CI: ${String(ciSummary.passed)} passed, ${String(ciSummary.failed)} failed, ${String(ciSummary.pending)} pending`}
+          >
+            {ciBadgeState === "pass" && <CheckCircle2 className="h-3 w-3" />}
+            {ciBadgeState === "fail" && <XCircle className="h-3 w-3" />}
+            {ciBadgeState === "pending" && (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            )}
+            {String(ciSummary.passed)}/{String(ciSummary.total)}
           </span>
         )}
 
@@ -782,6 +1047,21 @@ export function DiffView({
             Agent
           </Button>
 
+          {/* Fix CI failures — explicit user action; only when CI is failing */}
+          {ciSummary !== null && ciSummary.failed > 0 && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="border-danger/40 text-danger hover:bg-danger/10"
+              onClick={() => void handleFixCi()}
+              disabled={fixingCi || review.gate_state === "Dispatched"}
+              title="Dispatch an agent to fix the failing CI checks"
+            >
+              <Wrench className="h-3.5 w-3.5" />
+              {fixingCi ? "Dispatching..." : "Fix CI failures"}
+            </Button>
+          )}
+
           {review.source === "ReviewRequested" ? (
             review.gate_state === "InReview" && review.comments.length > 0 && (
               <Button
@@ -823,6 +1103,68 @@ export function DiffView({
           )}
         </div>
       </header>
+
+      {/* ----------------------------------------------------------------- */}
+      {/* Stack strip (collapsible) — relocated from PR Info tab            */}
+      {/* ----------------------------------------------------------------- */}
+      {hasStack && (
+        <div className="shrink-0 border-b border-border bg-card/50 px-4 py-1.5 text-xs">
+          <button
+            type="button"
+            onClick={() => {
+              setStackOpen((prev) => !prev);
+            }}
+            className="inline-flex cursor-pointer items-center gap-1 border-none bg-transparent text-muted-foreground hover:text-foreground"
+            aria-expanded={stackOpen}
+            title="Toggle stack"
+          >
+            {stackOpen ? (
+              <ChevronDown className="h-3 w-3" />
+            ) : (
+              <ChevronRight className="h-3 w-3" />
+            )}
+            <GitBranch className="h-3 w-3" />
+            Stack
+            <span className="text-[10px] text-muted-foreground">
+              ({String(review.parents.length)} up ·{" "}
+              {String(review.children.length)} down)
+            </span>
+          </button>
+
+          {stackOpen && (
+            <div className="mt-1.5 space-y-1.5 pl-5">
+              {review.parents.length > 0 && (
+                <div className="flex items-start gap-2">
+                  <span className="w-14 shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground">
+                    Parents
+                  </span>
+                  <div className="flex flex-wrap gap-1">
+                    {review.parents.map((p) => (
+                      <Badge key={p} variant="outline" className="text-[10px]">
+                        {p}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {review.children.length > 0 && (
+                <div className="flex items-start gap-2">
+                  <span className="w-14 shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground">
+                    Children
+                  </span>
+                  <div className="flex flex-wrap gap-1">
+                    {review.children.map((c) => (
+                      <Badge key={c} variant="outline" className="text-[10px]">
+                        {c}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ----------------------------------------------------------------- */}
       {/* Comment error banner                                              */}
@@ -928,8 +1270,9 @@ export function DiffView({
                     >
                       {path}
                     </span>
-                    <button
-                      type="button"
+                    <span
+                      role="button"
+                      tabIndex={0}
                       title="Open in editor"
                       onClick={(e) => {
                         e.stopPropagation();
@@ -939,10 +1282,20 @@ export function DiffView({
                           branch: review.branch,
                         });
                       }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.stopPropagation();
+                          void invoke("open_in_editor", {
+                            filePath: path,
+                            repoSlug: review.repo_slug,
+                            branch: review.branch,
+                          });
+                        }
+                      }}
                       className="shrink-0 cursor-pointer border-none bg-transparent p-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/file:opacity-100"
                     >
                       <ExternalLink className="h-3 w-3" />
-                    </button>
+                    </span>
                     <span className="flex shrink-0 items-center gap-1.5 text-[10px]">
                       {commentCount > 0 && (
                         <span className="flex items-center gap-0.5 text-state-in-review">
@@ -1002,6 +1355,7 @@ export function DiffView({
                 scrollBeyondLastLine: false,
                 fontSize: 13,
               }}
+              beforeMount={handleBeforeMount}
               onMount={handleEditorMount}
             />
           ) : (

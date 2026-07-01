@@ -259,6 +259,7 @@ mod tests {
             stale: false,
             agent: None,
             repo_slug: None,
+            project: None,
         }
     }
 
@@ -276,6 +277,7 @@ mod tests {
             gate_state: state,
             comments: vec![],
             agent: None,
+            plan_path: None,
         }
     }
 
@@ -618,5 +620,84 @@ mod tests {
         p.open().unwrap();
         p.approve().unwrap();
         assert_eq!(p.gate_state(), GateState::Approved);
+    }
+
+    // The plan gate reuses the exact same 5 states as reviews (Invariant §0.3).
+    // These tests pin the plan-gate failure edges called out for Phase 2.
+
+    #[test]
+    fn plan_gate_reuses_the_five_review_states() {
+        // Every state a Review can be in is a valid state for a ProjectPlan,
+        // and the same transition methods drive both — there are no
+        // plan-specific gate variants.
+        for state in [
+            GateState::Pending,
+            GateState::InReview,
+            GateState::Dispatched,
+            GateState::Reworked,
+            GateState::Approved,
+        ] {
+            let plan = plan_in(state);
+            assert_eq!(plan.gate_state(), state);
+        }
+    }
+
+    #[test]
+    fn planner_failed_returns_plan_to_in_review() {
+        // Initial-generation / rework planner failed: Dispatched -> InReview,
+        // comments preserved for re-dispatch.
+        let mut p = plan_in(GateState::InReview);
+        add_comment(&mut p);
+        p.request_changes().unwrap();
+        assert_eq!(p.gate_state(), GateState::Dispatched);
+
+        p.mark_agent_failed().unwrap();
+        assert_eq!(p.gate_state(), GateState::InReview);
+        assert_eq!(
+            p.comments().len(),
+            1,
+            "plan comments survive planner failure for re-dispatch"
+        );
+    }
+
+    #[test]
+    fn plan_rework_clears_comments_on_reworked() {
+        let mut p = plan_in(GateState::InReview);
+        add_comment(&mut p);
+        p.request_changes().unwrap();
+        p.mark_reworked().unwrap();
+        assert_eq!(p.gate_state(), GateState::Reworked);
+        assert!(
+            p.comments().is_empty(),
+            "plan comments are ephemeral (Invariant 4)"
+        );
+    }
+
+    #[test]
+    fn plan_stays_pending_during_initial_generation() {
+        // Initial generation is an artifact-fill: the plan is not opened, so it
+        // stays Pending while the planner runs. A completion that (wrongly)
+        // tried to mark_reworked from Pending is rejected, preserving Pending.
+        let mut p = plan_in(GateState::Pending);
+        assert!(
+            p.mark_reworked().is_err(),
+            "cannot mark_reworked from Pending"
+        );
+        assert_eq!(p.gate_state(), GateState::Pending);
+    }
+
+    #[test]
+    fn plan_approve_only_from_in_review() {
+        // Approve → fan-out is guarded: it is only legal from InReview, never
+        // directly from Pending/Reworked (must open first).
+        let mut pending = plan_in(GateState::Pending);
+        assert!(pending.approve().is_err());
+
+        let mut reworked = plan_in(GateState::Reworked);
+        assert!(reworked.approve().is_err());
+
+        let mut in_review = plan_in(GateState::InReview);
+        in_review.approve().unwrap();
+        assert_eq!(in_review.gate_state(), GateState::Approved);
     }
 }

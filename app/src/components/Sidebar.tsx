@@ -1,8 +1,9 @@
 import type { ViewState } from "../store";
 import {
   ListChecks,
-  FileText,
-  Rocket,
+  FolderKanban,
+  Sparkles,
+  Bot,
   Settings,
   PanelLeftClose,
   PanelLeftOpen,
@@ -17,13 +18,14 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { Logo } from "./Logo";
+import { Kbd, comboFor } from "@/lib/shortcuts";
+import type { ShortcutId } from "@/lib/shortcuts";
 
 type NavKind = ViewState["kind"];
 
 interface SidebarProps {
   readonly activeView: NavKind;
   readonly reviewCount: number;
-  readonly hasPlan: boolean;
   readonly onNavigate: (kind: NavKind) => void;
   readonly collapsed?: boolean | undefined;
   readonly onToggleCollapse?: (() => void) | undefined;
@@ -34,11 +36,21 @@ interface NavItemProps {
   readonly icon: React.ReactNode;
   readonly active: boolean;
   readonly badge?: string | undefined;
+  readonly shortcut?: ShortcutId | undefined;
   readonly collapsed?: boolean | undefined;
   readonly onClick: () => void;
 }
 
-function NavItem({ label, icon, active, badge, collapsed, onClick }: NavItemProps) {
+function NavItem({
+  label,
+  icon,
+  active,
+  badge,
+  shortcut,
+  collapsed,
+  onClick,
+}: NavItemProps) {
+  const combo = shortcut !== undefined ? comboFor(shortcut) : undefined;
   const button = (
     <Button
       variant="ghost"
@@ -56,10 +68,11 @@ function NavItem({ label, icon, active, badge, collapsed, onClick }: NavItemProp
         <>
           <span className="flex-1 text-left">{label}</span>
           {badge !== undefined && (
-            <Badge variant="secondary" className="ml-auto text-xs">
+            <Badge variant="secondary" className="text-xs">
               {badge}
             </Badge>
           )}
+          {combo !== undefined && <Kbd combo={combo} />}
         </>
       )}
     </Button>
@@ -68,9 +81,7 @@ function NavItem({ label, icon, active, badge, collapsed, onClick }: NavItemProp
   if (collapsed === true) {
     return (
       <Tooltip>
-        <TooltipTrigger render={<div />}>
-          {button}
-        </TooltipTrigger>
+        <TooltipTrigger render={<div />}>{button}</TooltipTrigger>
         <TooltipContent side="right" sideOffset={8}>
           {label}
         </TooltipContent>
@@ -84,7 +95,6 @@ function NavItem({ label, icon, active, badge, collapsed, onClick }: NavItemProp
 export function Sidebar({
   activeView,
   reviewCount,
-  hasPlan,
   onNavigate,
   collapsed = false,
   onToggleCollapse,
@@ -147,23 +157,48 @@ export function Sidebar({
         )}
       >
         <NavItem
-          label="Reviews"
+          label="PRs"
           icon={<ListChecks className="h-4 w-4 shrink-0" />}
-          active={activeView === "frontier" || activeView === "diff"}
+          active={activeView === "prs" || activeView === "diff"}
           badge={reviewCount > 0 ? String(reviewCount) : undefined}
+          shortcut="nav-prs"
           collapsed={collapsed}
           onClick={() => {
-            onNavigate("frontier");
+            onNavigate("prs");
           }}
         />
         <NavItem
-          label="Plan"
-          icon={<FileText className="h-4 w-4 shrink-0" />}
-          active={activeView === "plan"}
-          badge={hasPlan ? "loaded" : undefined}
+          label="Projects"
+          icon={<FolderKanban className="h-4 w-4 shrink-0" />}
+          active={
+            activeView === "projects" ||
+            activeView === "new-project" ||
+            activeView === "plan"
+          }
+          shortcut="nav-projects"
           collapsed={collapsed}
           onClick={() => {
-            onNavigate("plan");
+            onNavigate("projects");
+          }}
+        />
+        <NavItem
+          label="Skills"
+          icon={<Sparkles className="h-4 w-4 shrink-0" />}
+          active={activeView === "skills"}
+          shortcut="nav-skills"
+          collapsed={collapsed}
+          onClick={() => {
+            onNavigate("skills");
+          }}
+        />
+        <NavItem
+          label="Agents"
+          icon={<Bot className="h-4 w-4 shrink-0" />}
+          active={activeView === "agents"}
+          shortcut="nav-agents"
+          collapsed={collapsed}
+          onClick={() => {
+            onNavigate("agents");
           }}
         />
         <div className="flex-1" />
@@ -172,18 +207,10 @@ export function Sidebar({
 
         <div className="flex flex-col gap-1 py-2">
           <NavItem
-            label="Kickoff"
-            icon={<Rocket className="h-4 w-4 shrink-0" />}
-            active={activeView === "kickoff"}
-            collapsed={collapsed}
-            onClick={() => {
-              onNavigate("kickoff");
-            }}
-          />
-          <NavItem
             label="Settings"
             icon={<Settings className="h-4 w-4 shrink-0" />}
             active={activeView === "settings"}
+            shortcut="nav-settings"
             collapsed={collapsed}
             onClick={() => {
               onNavigate("settings");

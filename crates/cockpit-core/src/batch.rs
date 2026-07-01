@@ -6,7 +6,6 @@
 //! confirmation).
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::model::{GateState, Review};
 use crate::store::ReviewStore;
@@ -19,12 +18,9 @@ use crate::store::ReviewStore;
 ///
 /// Controls which reviews are deemed eligible for batch approval.
 /// The defaults represent conservative quality gates.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(
-    export,
-    export_to = "../../../app/src/bindings/",
-    rename = "BatchApproveConfig"
-)]
+// No `#[derive(TS)]`: batch-approve is a CLI-only surface (Invariant §9 removed
+// the FE batch-approve button), so exporting a binding would emit an orphan.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     /// Maximum number of files changed in the diff for auto-eligibility.
     ///
@@ -41,12 +37,9 @@ pub struct Config {
 ///
 /// Carries human-readable reasons so the user can understand *why* a review
 /// is eligible or ineligible.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(
-    export,
-    export_to = "../../../app/src/bindings/",
-    rename = "BatchVerdict"
-)]
+// No `#[derive(TS)]`: batch-approve is a CLI-only surface (Invariant §9 removed
+// the FE batch-approve button), so exporting a binding would emit an orphan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Verdict {
     /// The review passes all heuristics and may be batch-approved.
@@ -187,6 +180,7 @@ mod tests {
             stale: false,
             agent: None,
             repo_slug: None,
+            project: None,
         }
     }
 

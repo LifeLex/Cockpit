@@ -71,6 +71,12 @@ newtype_id! {
     ProjectRef
 }
 
+newtype_id! {
+    /// Locally-unique identifier for a first-class [`Project`] that groups
+    /// reviews. Distinct from [`ProjectRef`], which references a Linear project.
+    ProjectId
+}
+
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
@@ -131,6 +137,19 @@ pub enum ReviewSource {
     Frontier,
 }
 
+/// Where a first-class [`Project`] came from.
+///
+/// Linear is one *optional* source, not the entry point: a project may be
+/// created ad-hoc with no Linear backing at all.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub enum ProjectSource {
+    /// Backed by a Linear project, carrying its Linear project id.
+    Linear(String),
+    /// Created directly in cockpit with no external backing.
+    AdHoc,
+}
+
 /// A location inside the current artifact that a [`Comment`] points to.
 ///
 /// Anchors are ephemeral — they reference the *current* artifact version only
@@ -155,8 +174,11 @@ pub enum Anchor {
 ///
 /// Using an enum makes illegal states unrepresentable: a reviewed object holds
 /// exactly one artifact kind, never both or neither.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../app/src/bindings/")]
+//
+// No `#[derive(TS)]`: the frontend never consumes an `Artifact` directly (it
+// switches on `GateState` and reads the concrete `PlanDoc`/`DiffData`), so
+// exporting a binding would only emit an orphan `.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Artifact {
     /// A project plan document.
     Plan(PlanDoc),
@@ -259,6 +281,31 @@ pub struct ProjectPlan {
     pub comments: Vec<Comment>,
     /// The agent run responsible for producing / revising the plan.
     pub agent: Option<AgentRun>,
+    /// On-disk markdown file the planner agent writes its finished plan to.
+    ///
+    /// Set before spawning a planner (`AgentMode::Plan`); on completion the
+    /// file is read back and parsed into [`Self::doc`]. `None` for plans that
+    /// were loaded directly from a document rather than produced by an agent.
+    #[serde(default)]
+    #[ts(optional)]
+    pub plan_path: Option<PathBuf>,
+}
+
+/// A first-class project that groups reviews.
+///
+/// Reviews may belong to a project (via [`Review::project`]) or be ungrouped
+/// (`None`). Linear is one optional [`ProjectSource`], not the entry point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct Project {
+    /// Locally-unique project identifier.
+    pub id: ProjectId,
+    /// Human-readable project name.
+    pub name: String,
+    /// Where this project came from (Linear or ad-hoc).
+    pub source: ProjectSource,
+    /// The optional project-level plan reviewed at the plan gate.
+    pub plan: Option<ProjectPlan>,
 }
 
 /// A single PR under review at the diff gate.
@@ -307,6 +354,9 @@ pub struct Review {
     /// operations like fetching diffs via `gh --repo`. `None` for reviews
     /// created from the local repo context (kickoff).
     pub repo_slug: Option<String>,
+    /// The first-class [`Project`] this review belongs to, if any. `None` for
+    /// ungrouped reviews (e.g. GitHub-imported PRs with no project attached).
+    pub project: Option<ProjectId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +387,7 @@ mod tests {
             stale: false,
             agent: None,
             repo_slug: None,
+            project: None,
         }
     }
 
@@ -419,6 +470,7 @@ mod tests {
             gate_state: GateState::Pending,
             comments: vec![],
             agent: None,
+            plan_path: None,
         };
 
         assert_eq!(plan.gate_state, GateState::Pending);

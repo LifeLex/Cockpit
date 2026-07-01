@@ -91,9 +91,23 @@ pub enum Error {
         reason: String,
     },
 
+    /// Failed to resolve a cockpit path (e.g. the worktrees directory).
+    #[error(transparent)]
+    Config(#[from] crate::config::Error),
+
     /// Underlying git2 error.
     #[error(transparent)]
     Git2(#[from] git2::Error),
+}
+
+/// Derive the git worktree registration name from a branch name.
+///
+/// Git stores worktree metadata under `.git/worktrees/<name>`, so the name
+/// cannot contain a `/`. Realistic branches (e.g. `alejandro/nex-123-fix`)
+/// have slashes, so we flatten them to dashes for the registration name only;
+/// the branch reference itself keeps its real (slashed) name.
+fn worktree_name(branch: &str) -> String {
+    branch.replace('/', "-")
 }
 
 /// Create a git worktree for a review branch, checked out from `base`.
@@ -101,7 +115,9 @@ pub enum Error {
 /// If `base` is a parent review's branch (stacked PR), the worktree starts
 /// from that branch's tip. Returns the OID of the initial HEAD commit.
 ///
-/// The worktree is registered under the name `branch` in the parent repo.
+/// The worktree is registered under [`worktree_name`]`(branch)` (slashes
+/// flattened to dashes) since git worktree metadata names cannot contain `/`;
+/// the branch reference keeps its real name.
 pub fn ensure_worktree(
     repo: &Repository,
     path: &Path,
@@ -123,7 +139,7 @@ pub fn ensure_worktree(
     let mut opts = WorktreeAddOptions::new();
     opts.reference(Some(&branch_ref));
 
-    repo.worktree(branch, path, Some(&opts))?;
+    repo.worktree(&worktree_name(branch), path, Some(&opts))?;
 
     Ok(base_commit.id())
 }
@@ -145,10 +161,11 @@ pub fn reconcile(worktree_path: &Path) -> Result<git2::Oid, Error> {
 
 /// Remove a worktree and clean up its directory.
 ///
-/// The worktree is identified by the name it was registered under (which
-/// matches the branch name passed to [`ensure_worktree`]).
-pub fn prune_worktree(repo: &Repository, worktree_name: &str) -> Result<(), Error> {
-    let wt = repo.find_worktree(worktree_name)?;
+/// Accepts the branch name and flattens it with [`worktree_name`] to match
+/// the registration name used by [`ensure_worktree`]. Passing an
+/// already-flat name is a no-op flatten, so both forms work.
+pub fn prune_worktree(repo: &Repository, branch: &str) -> Result<(), Error> {
+    let wt = repo.find_worktree(&worktree_name(branch))?;
     let mut prune_opts = WorktreePruneOptions::new();
     prune_opts.valid(true).working_tree(true);
     wt.prune(Some(&mut prune_opts))?;
@@ -157,9 +174,10 @@ pub fn prune_worktree(repo: &Repository, worktree_name: &str) -> Result<(), Erro
 
 /// Fetch a remote branch if not available locally, then create an isolated worktree.
 ///
-/// The worktree is placed at `repo_path/.cockpit/worktrees/<pr_id>` and checked
-/// out on `branch`. If the branch does not exist locally, `git fetch origin <branch>`
-/// is run first via `tokio::process::Command`.
+/// The worktree is placed under `<cockpit_home>/worktrees/<pr_id>` (outside the
+/// managed repo) and checked out on `branch`. If the branch does not exist
+/// locally, `git fetch origin <branch>` is run first via
+/// `tokio::process::Command`.
 ///
 /// Returns the path to the created worktree directory.
 pub async fn prepare_worktree(
@@ -167,7 +185,7 @@ pub async fn prepare_worktree(
     branch: &str,
     pr_id: &str,
 ) -> Result<PathBuf, Error> {
-    let worktree_path = repo_path.join(".cockpit").join("worktrees").join(pr_id);
+    let worktree_path = crate::config::worktrees_dir()?.join(pr_id);
 
     if worktree_path.exists() {
         return Err(Error::WorktreeExists(worktree_path));
@@ -203,6 +221,17 @@ pub async fn prepare_worktree(
         }
     }
 
+    // Ensure the worktrees base directory exists (it lives under the cockpit
+    // home, not inside the repo, so it may not exist yet).
+    if let Some(parent) = worktree_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| Error::WorktreeAddFailed {
+                branch: branch.to_string(),
+                reason: e.to_string(),
+            })?;
+    }
+
     // Create the worktree via `git worktree add <path> <branch>`.
     // Using the CLI here because git2's worktree API does not handle
     // remote tracking branches as cleanly as the CLI does.
@@ -232,7 +261,7 @@ pub async fn prepare_worktree(
 /// Runs `git worktree remove --force <path>` to clean up the worktree
 /// directory and its git metadata.
 pub async fn cleanup_worktree(repo_path: &Path, pr_id: &str) -> Result<(), Error> {
-    let worktree_path = repo_path.join(".cockpit").join("worktrees").join(pr_id);
+    let worktree_path = crate::config::worktrees_dir()?.join(pr_id);
 
     let output = Command::new("git")
         .current_dir(repo_path)
@@ -268,7 +297,7 @@ pub async fn cleanup_worktree(repo_path: &Path, pr_id: &str) -> Result<(), Error
 /// inside the clone so multiple branches can coexist.
 ///
 /// For **same-repo** PRs (`repo_slug` is `None`), a worktree is created
-/// under `repo_path/.cockpit/worktrees/<branch-id>/` if the branch isn't
+/// under `<cockpit_home>/worktrees/<branch-id>/` if the branch isn't
 /// already checked out there.
 ///
 /// Returns the directory root where `<file_path>` can be joined.
@@ -372,10 +401,7 @@ pub async fn ensure_branch_checkout(
             Ok(wt_dir)
         }
         None => {
-            let wt_path = repo_path
-                .join(".cockpit")
-                .join("worktrees")
-                .join(&sanitized);
+            let wt_path = crate::config::worktrees_dir()?.join(&sanitized);
 
             if wt_path.exists() {
                 return Ok(wt_path);
@@ -628,6 +654,49 @@ mod tests {
         let wt_repo = Repository::open(&wt_path).unwrap();
         let wt_head = wt_repo.head().unwrap().peel_to_commit().unwrap().id();
         assert_eq!(wt_head, oid);
+    }
+
+    #[test]
+    fn ensure_worktree_slashed_branch_name() {
+        // Realistic branch names contain slashes (e.g. `alejandro/nex-123`).
+        // Git worktree metadata names cannot, so the name must be flattened;
+        // creation and prune must both succeed and agree on the name.
+        let (repo, dir) = scratch_repo();
+        let wt_path = dir.path().join("wt-slashed");
+
+        let oid = ensure_worktree(&repo, &wt_path, "alejandro/nex-123-fix", "main").unwrap();
+        assert!(
+            wt_path.exists(),
+            "worktree with slashed branch should be created"
+        );
+
+        // The real (slashed) branch ref exists.
+        assert!(
+            repo.find_branch("alejandro/nex-123-fix", BranchType::Local)
+                .is_ok(),
+            "the branch ref should keep its slashed name"
+        );
+
+        // The worktree is registered under the flattened name.
+        assert!(
+            repo.find_worktree("alejandro-nex-123-fix").is_ok(),
+            "worktree should be registered under the flattened name"
+        );
+
+        // Prune accepts the branch name and flattens it internally.
+        prune_worktree(&repo, "alejandro/nex-123-fix").unwrap();
+
+        assert_eq!(oid, base_oid(&repo, "main"));
+    }
+
+    /// Peel a local branch to its HEAD commit OID (test helper).
+    fn base_oid(repo: &Repository, branch: &str) -> git2::Oid {
+        repo.find_branch(branch, BranchType::Local)
+            .unwrap()
+            .get()
+            .peel_to_commit()
+            .unwrap()
+            .id()
     }
 
     #[test]

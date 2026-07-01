@@ -4,24 +4,31 @@ import type { Review } from "./bindings/Review";
 import type { DiffData } from "./bindings/DiffData";
 import type { MirrorResult } from "./bindings/MirrorResult";
 import type { ProjectPlan } from "./bindings/ProjectPlan";
-import type { BatchVerdict } from "./bindings/BatchVerdict";
 import type { Config } from "./bindings/Config";
 import type { KickoffResult } from "./bindings/KickoffResult";
+import type { Project } from "./bindings/Project";
+import type { BatchStatus } from "./bindings/BatchStatus";
+import type { Skill } from "./bindings/Skill";
+import type { SyncReport } from "./bindings/SyncReport";
+import type { AgentMode } from "./bindings/AgentMode";
+import type { CiCheck } from "./bindings/CiCheck";
 
 /**
  * Navigation state discriminated union.
  *
- * The app is either showing the frontier list, reviewing a specific PR's diff,
- * viewing the project plan, adjusting settings, or running the kickoff flow.
- * Using a tagged union (not optional fields) makes exhaustive switching
- * possible.
+ * Top-level views mirror the sidebar: PRs (default), Projects, Skills, Agents,
+ * and Settings, plus the drill-in views (diff, plan, new-project). Using a
+ * tagged union (not optional fields) makes exhaustive switching possible.
  */
 type ViewState =
-  | { readonly kind: "frontier" }
+  | { readonly kind: "prs" }
   | { readonly kind: "diff"; readonly pr: string }
   | { readonly kind: "plan" }
-  | { readonly kind: "settings" }
-  | { readonly kind: "kickoff" };
+  | { readonly kind: "projects" }
+  | { readonly kind: "new-project" }
+  | { readonly kind: "skills" }
+  | { readonly kind: "agents" }
+  | { readonly kind: "settings" };
 
 interface AppStore {
   readonly reviews: readonly Review[];
@@ -29,6 +36,9 @@ interface AppStore {
   readonly plan: ProjectPlan | null;
   readonly loading: boolean;
   readonly error: string | null;
+
+  /** Dismiss the current error. */
+  clearError: () => void;
 
   /** Current navigation state. */
   readonly view: ViewState;
@@ -49,14 +59,23 @@ interface AppStore {
   /** Navigate to the plan view. */
   navigateToPlan: () => void;
 
-  /** Navigate back to the frontier list. */
-  navigateToFrontier: () => void;
+  /** Navigate to the PRs list (the default view). */
+  navigateToPrs: () => void;
+
+  /** Navigate to the Projects list. */
+  navigateToProjects: () => void;
+
+  /** Navigate to the New Project flow. */
+  navigateToNewProject: () => void;
+
+  /** Navigate to the Skills view. */
+  navigateToSkills: () => void;
+
+  /** Navigate to the Agents view. */
+  navigateToAgents: () => void;
 
   /** Navigate to the settings view. */
   navigateToSettings: () => void;
-
-  /** Navigate to the kickoff view. */
-  navigateToKickoff: () => void;
 
   /** Add an anchored comment to the active review. */
   addComment: (
@@ -78,27 +97,24 @@ interface AppStore {
   fetchPlan: () => Promise<void>;
   loadPlan: (file: string, project: string) => Promise<void>;
   addPlanComment: (anchor: string, body: string) => Promise<void>;
-  requestPlanChanges: () => Promise<void>;
-  approvePlan: () => Promise<void>;
+
+  /** Request changes on the project plan (spawns the plan agent). */
+  planRequestChanges: () => Promise<void>;
+
+  /** Approve the project plan (explicit user action; fans out the batch). */
+  planApprove: () => Promise<void>;
+
+  /** Open the plan for review (`Pending | Reworked` -> `InReview`). */
   openPlan: () => Promise<void>;
 
-  /** Batch-approve preview results. */
-  readonly batchVerdicts: readonly [Review, BatchVerdict][] | null;
-
-  /** Whether the batch-approve panel is visible. */
-  readonly showBatchPanel: boolean;
-
-  /** Fetch batch-approve preview from the backend. */
-  fetchBatchApprovePreview: () => Promise<void>;
+  /**
+   * Generate the plan document via the plan agent for the loaded plan (or an
+   * explicit project, if wired later by the caller).
+   */
+  generatePlan: (projectId?: string) => Promise<void>;
 
   /** Approve a single review by PR ref (explicit user action). */
   approveReview: (pr: string) => Promise<void>;
-
-  /** Approve all eligible reviews in the current batch preview. */
-  approveAllEligible: () => Promise<void>;
-
-  /** Toggle visibility of the batch-approve panel. */
-  toggleBatchPanel: () => void;
 
   // -------------------------------------------------------------------------
   // Config
@@ -123,7 +139,38 @@ interface AppStore {
   saveConfig: (config: Config) => Promise<void>;
 
   // -------------------------------------------------------------------------
-  // Kickoff
+  // Projects
+  // -------------------------------------------------------------------------
+
+  /** All first-class projects. */
+  readonly projects: readonly Project[];
+
+  /** Whether a project operation is in progress. */
+  readonly projectsLoading: boolean;
+
+  /** Fetch the list of projects from the backend. */
+  listProjects: () => Promise<void>;
+
+  /** Create a new ad-hoc project with the given name (explicit user action). */
+  createProject: (name: string) => Promise<Project | null>;
+
+  /**
+   * Create a project from a Linear project by running the kickoff import
+   * (Linear is one optional source, not the entry point).
+   */
+  createProjectFromLinear: (
+    projectId: string,
+    skipPlan: boolean,
+  ) => Promise<void>;
+
+  /** Attach an existing review (by PR ref) to a project. */
+  attachReview: (pr: string, projectId: string) => Promise<void>;
+
+  /** Fetch aggregate batch progress for a project (or all reviews). */
+  batchStatus: (projectId?: string) => Promise<BatchStatus | null>;
+
+  // -------------------------------------------------------------------------
+  // Kickoff (Linear import)
   // -------------------------------------------------------------------------
 
   /** Whether a kickoff operation is in progress. */
@@ -132,22 +179,59 @@ interface AppStore {
   /** Result of the last kickoff run, if any. */
   readonly kickoffResult: KickoffResult | null;
 
-  /** Run the kickoff flow for a Linear project. */
-  runKickoff: (projectId: string, skipPlan: boolean) => Promise<void>;
-
   // -------------------------------------------------------------------------
-  // Restack
+  // Skills
   // -------------------------------------------------------------------------
 
-  /** Restack a single PR onto its updated base. */
-  restackPr: (pr: string) => Promise<void>;
+  /** All locally-known skills. */
+  readonly skills: readonly Skill[];
+
+  /** Whether a skills operation is in progress. */
+  readonly skillsLoading: boolean;
+
+  /** Fetch the list of skills from the backend. */
+  listSkills: () => Promise<void>;
+
+  /** Create or overwrite a skill file with the given contents. */
+  saveSkill: (name: string, contents: string) => Promise<void>;
+
+  /** Delete a skill by name. */
+  deleteSkill: (name: string) => Promise<void>;
+
+  /** Sync skills from the configured GitHub source. */
+  syncSkills: () => Promise<SyncReport | null>;
 
   // -------------------------------------------------------------------------
-  // Plan from path
+  // Agent prompts
   // -------------------------------------------------------------------------
 
-  /** Load a plan document from a file path on disk. */
-  loadPlanFromPath: (path: string, project: string) => Promise<void>;
+  /** Fetch the custom prompt override for a mode (null if none set). */
+  getAgentPrompt: (mode: AgentMode) => Promise<string | null>;
+
+  /** Fetch the builtin prompt fragment for a mode. */
+  getBuiltinAgentPrompt: (mode: AgentMode) => Promise<string | null>;
+
+  /** Save (or clear, via empty text) the custom prompt override for a mode. */
+  saveAgentPrompt: (mode: AgentMode, text: string) => Promise<void>;
+
+  // -------------------------------------------------------------------------
+  // CI (best-effort UI queries; never block the loop)
+  // -------------------------------------------------------------------------
+
+  /** List the CI checks for a PR (empty on gh error). */
+  listCiChecks: (pr: string) => Promise<CiCheck[]>;
+
+  /**
+   * Fetch the failed-job logs for a single CI run of a PR, identified by a
+   * check `link` (empty string on gh error). Used for per-pipeline logs.
+   */
+  ciRunLogsByLink: (pr: string, link: string) => Promise<string>;
+
+  /**
+   * Dispatch the Fix loop to address a PR's CI failures (explicit user action,
+   * Invariant 5). Transitions the review to Dispatched and spawns the fixer.
+   */
+  fixCi: (pr: string) => Promise<void>;
 
   // -------------------------------------------------------------------------
   // GitHub PR import
@@ -175,17 +259,22 @@ export const useAppStore = create<AppStore>((set, get) => ({
   plan: null,
   loading: false,
   error: null,
-  view: { kind: "frontier" },
+  clearError: () => {
+    set({ error: null });
+  },
+  view: { kind: "prs" },
   activeReview: null,
   activeDiff: null,
-  batchVerdicts: null,
-  showBatchPanel: false,
   config: null,
   configLoading: false,
   configError: null,
   editorTheme: "vs-dark",
+  projects: [],
+  projectsLoading: false,
   kickoffLoading: false,
   kickoffResult: null,
+  skills: [],
+  skillsLoading: false,
   authoredPrs: [],
   reviewRequests: [],
   prFetchLoading: false,
@@ -237,11 +326,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
         invoke<Review>("get_review", { pr }),
         invoke<DiffData>("get_review_diff", { pr }),
       ]);
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
       set({
         view: { kind: "diff", pr },
         activeReview: review,
         activeDiff: diff,
         loading: false,
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        frontier: get().frontier.map(replace),
+        reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
       set({ error: String(e), loading: false });
@@ -253,23 +347,38 @@ export const useAppStore = create<AppStore>((set, get) => ({
     void get().fetchPlan();
   },
 
-  navigateToFrontier: () => {
+  navigateToPrs: () => {
     set({
-      view: { kind: "frontier" },
+      view: { kind: "prs" },
       activeReview: null,
       activeDiff: null,
     });
     void get().fetchReviews();
     void get().fetchFrontier();
+    void get().fetchAuthoredPrs();
+  },
+
+  navigateToProjects: () => {
+    set({ view: { kind: "projects" } });
+    void get().listProjects();
+  },
+
+  navigateToNewProject: () => {
+    set({ view: { kind: "new-project" }, kickoffResult: null });
+  },
+
+  navigateToSkills: () => {
+    set({ view: { kind: "skills" } });
+    void get().listSkills();
+  },
+
+  navigateToAgents: () => {
+    set({ view: { kind: "agents" } });
   },
 
   navigateToSettings: () => {
     set({ view: { kind: "settings" } });
     void get().fetchConfig();
-  },
-
-  navigateToKickoff: () => {
-    set({ view: { kind: "kickoff" }, kickoffResult: null });
   },
 
   addComment: async (
@@ -386,7 +495,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  requestPlanChanges: async () => {
+  planRequestChanges: async () => {
     try {
       const plan = await invoke<ProjectPlan>("plan_request_changes");
       set({ plan });
@@ -395,7 +504,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  approvePlan: async () => {
+  planApprove: async () => {
     try {
       const plan = await invoke<ProjectPlan>("plan_approve");
       set({ plan });
@@ -413,13 +522,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  fetchBatchApprovePreview: async () => {
+  generatePlan: async (_projectId?: string) => {
     set({ loading: true, error: null });
     try {
-      const results = await invoke<[Review, BatchVerdict][]>(
-        "batch_approve_preview",
-      );
-      set({ batchVerdicts: results, showBatchPanel: true, loading: false });
+      const plan = await invoke<ProjectPlan>("generate_plan");
+      set({ plan, loading: false });
     } catch (e: unknown) {
       set({ error: String(e), loading: false });
     }
@@ -428,39 +535,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
   approveReview: async (pr: string) => {
     try {
       await invoke<Review>("approve_review", { pr });
-      // Refresh after approval.
-      await get().fetchBatchApprovePreview();
       await get().fetchFrontier();
       await get().fetchReviews();
     } catch (e: unknown) {
       set({ error: String(e) });
     }
-  },
-
-  approveAllEligible: async () => {
-    const { batchVerdicts } = get();
-    if (batchVerdicts === null) return;
-
-    for (const [review, verdict] of batchVerdicts) {
-      if (verdict.kind === "Eligible") {
-        try {
-          await invoke<Review>("approve_review", { pr: review.pr });
-        } catch (e: unknown) {
-          set({ error: String(e) });
-          return;
-        }
-      }
-    }
-
-    // Refresh after all approvals.
-    await get().fetchBatchApprovePreview();
-    await get().fetchFrontier();
-    await get().fetchReviews();
-  },
-
-  toggleBatchPanel: () => {
-    const { showBatchPanel } = get();
-    set({ showBatchPanel: !showBatchPanel });
   },
 
   // -------------------------------------------------------------------------
@@ -502,10 +581,33 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   // -------------------------------------------------------------------------
-  // Kickoff
+  // Projects
   // -------------------------------------------------------------------------
 
-  runKickoff: async (projectId: string, skipPlan: boolean) => {
+  listProjects: async () => {
+    set({ projectsLoading: true, error: null });
+    try {
+      const projects = await invoke<Project[]>("list_projects");
+      set({ projects, projectsLoading: false });
+    } catch (e: unknown) {
+      set({ error: String(e), projectsLoading: false });
+    }
+  },
+
+  createProject: async (name: string): Promise<Project | null> => {
+    set({ projectsLoading: true, error: null });
+    try {
+      const project = await invoke<Project>("create_project", { name });
+      set({ projectsLoading: false });
+      await get().listProjects();
+      return project;
+    } catch (e: unknown) {
+      set({ error: String(e), projectsLoading: false });
+      return null;
+    }
+  },
+
+  createProjectFromLinear: async (projectId: string, skipPlan: boolean) => {
     set({ kickoffLoading: true, error: null, kickoffResult: null });
     try {
       const result = await invoke<KickoffResult>("kickoff", {
@@ -513,46 +615,161 @@ export const useAppStore = create<AppStore>((set, get) => ({
         skipPlan,
       });
       set({ kickoffLoading: false, kickoffResult: result });
-      // Refresh reviews and frontier after kickoff completes.
       void get().fetchReviews();
       void get().fetchFrontier();
       void get().fetchPlan();
+      void get().listProjects();
     } catch (e: unknown) {
       set({ error: String(e), kickoffLoading: false });
     }
   },
 
-  // -------------------------------------------------------------------------
-  // Restack
-  // -------------------------------------------------------------------------
-
-  restackPr: async (pr: string) => {
-    set({ loading: true, error: null });
+  attachReview: async (pr: string, projectId: string) => {
     try {
-      const review = await invoke<Review>("restack_pr", { pr });
-      // Update the review in-place in both lists.
-      const reviews = get().reviews.map((r) => (r.pr === review.pr ? review : r));
-      const frontier = get().frontier.map((r) => (r.pr === review.pr ? review : r));
-      set({ reviews, frontier, loading: false });
+      const review = await invoke<Review>("attach_review", {
+        pr,
+        projectId,
+      });
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      set({
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        frontier: get().frontier.map(replace),
+        reviews: get().reviews.map(replace),
+      });
     } catch (e: unknown) {
-      set({ error: String(e), loading: false });
+      set({ error: String(e) });
+    }
+  },
+
+  batchStatus: async (projectId?: string): Promise<BatchStatus | null> => {
+    try {
+      const status = await invoke<BatchStatus>("batch_status", {
+        projectId: projectId ?? null,
+      });
+      return status;
+    } catch (e: unknown) {
+      set({ error: String(e) });
+      return null;
     }
   },
 
   // -------------------------------------------------------------------------
-  // Plan from path
+  // Skills
   // -------------------------------------------------------------------------
 
-  loadPlanFromPath: async (path: string, project: string) => {
-    set({ loading: true, error: null });
+  listSkills: async () => {
+    set({ skillsLoading: true, error: null });
     try {
-      const plan = await invoke<ProjectPlan>("load_plan_from_path", {
-        path,
-        project,
-      });
-      set({ plan, loading: false });
+      const skills = await invoke<Skill[]>("list_skills");
+      set({ skills, skillsLoading: false });
     } catch (e: unknown) {
-      set({ error: String(e), loading: false });
+      set({ error: String(e), skillsLoading: false });
+    }
+  },
+
+  saveSkill: async (name: string, contents: string) => {
+    set({ skillsLoading: true, error: null });
+    try {
+      await invoke("save_skill", { name, contents });
+      set({ skillsLoading: false });
+      await get().listSkills();
+    } catch (e: unknown) {
+      set({ error: String(e), skillsLoading: false });
+    }
+  },
+
+  deleteSkill: async (name: string) => {
+    set({ skillsLoading: true, error: null });
+    try {
+      await invoke("delete_skill", { name });
+      set({ skillsLoading: false });
+      await get().listSkills();
+    } catch (e: unknown) {
+      set({ error: String(e), skillsLoading: false });
+    }
+  },
+
+  syncSkills: async (): Promise<SyncReport | null> => {
+    set({ skillsLoading: true, error: null });
+    try {
+      const report = await invoke<SyncReport>("sync_skills");
+      set({ skillsLoading: false });
+      await get().listSkills();
+      return report;
+    } catch (e: unknown) {
+      set({ error: String(e), skillsLoading: false });
+      return null;
+    }
+  },
+
+  // -------------------------------------------------------------------------
+  // Agent prompts
+  // -------------------------------------------------------------------------
+
+  getAgentPrompt: async (mode: AgentMode): Promise<string | null> => {
+    try {
+      return await invoke<string | null>("get_agent_prompt", { mode });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+      return null;
+    }
+  },
+
+  getBuiltinAgentPrompt: async (mode: AgentMode): Promise<string | null> => {
+    try {
+      return await invoke<string>("get_builtin_agent_prompt", { mode });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+      return null;
+    }
+  },
+
+  saveAgentPrompt: async (mode: AgentMode, text: string) => {
+    try {
+      await invoke("save_agent_prompt", { mode, text });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  // -------------------------------------------------------------------------
+  // CI (best-effort UI queries; never block the loop)
+  // -------------------------------------------------------------------------
+
+  listCiChecks: async (pr: string): Promise<CiCheck[]> => {
+    try {
+      return await invoke<CiCheck[]>("list_ci_checks", { pr });
+    } catch (e: unknown) {
+      // Non-fatal (Invariant 1): a CI query never blocks the loop.
+      console.error("list_ci_checks failed", e);
+      return [];
+    }
+  },
+
+  ciRunLogsByLink: async (pr: string, link: string): Promise<string> => {
+    try {
+      return await invoke<string>("ci_run_logs_by_link", { pr, link });
+    } catch (e: unknown) {
+      // Non-fatal (Invariant 1): a CI query never blocks the loop.
+      console.error("ci_run_logs_by_link failed", e);
+      return "";
+    }
+  },
+
+  fixCi: async (pr: string) => {
+    try {
+      const review = await invoke<Review>("fix_ci", { pr });
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      set({
+        activeReview: review,
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        frontier: get().frontier.map(replace),
+        reviews: get().reviews.map(replace),
+      });
+    } catch (e: unknown) {
+      set({ error: String(e) });
     }
   },
 

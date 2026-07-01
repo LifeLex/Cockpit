@@ -152,6 +152,15 @@ pub fn parse_stream_line(line: &str) -> Option<Event> {
         "assistant" => parse_assistant_event(&raw),
         "user" => parse_user_event(&raw),
         "result" => parse_result_event(&raw),
+        "rate_limit_event" => {
+            let status = raw
+                .get("rate_limit_info")
+                .and_then(|info| info.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            Some(Event::RateLimit { status })
+        }
         _ => None,
     }
 }
@@ -194,11 +203,11 @@ fn parse_system_event(raw: &serde_json::Value) -> Option<Event> {
         }
         "thinking_tokens" => {
             let estimated_tokens = raw
-                .get("cumulative_thinking_tokens")
+                .get("estimated_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             let delta = raw
-                .get("thinking_delta")
+                .get("estimated_tokens_delta")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             Some(Event::Thinking {
@@ -214,7 +223,12 @@ fn parse_system_event(raw: &serde_json::Value) -> Option<Event> {
 
 /// Parse a `"type": "assistant"` event, extracting tool_use and text blocks.
 fn parse_assistant_event(raw: &serde_json::Value) -> Option<Event> {
-    let content = raw.get("content")?.as_array()?;
+    // Claude Code nests content under `message.content`.
+    let content = raw
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .or_else(|| raw.get("content"))
+        .and_then(|v| v.as_array())?;
 
     // We return the first actionable block. In practice Claude Code sends
     // one meaningful block per line, but we handle arrays gracefully.
@@ -270,7 +284,12 @@ fn parse_assistant_event(raw: &serde_json::Value) -> Option<Event> {
 
 /// Parse a `"type": "user"` event (tool results).
 fn parse_user_event(raw: &serde_json::Value) -> Option<Event> {
-    let content = raw.get("content")?.as_array()?;
+    // Claude Code nests content under `message.content`.
+    let content = raw
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .or_else(|| raw.get("content"))
+        .and_then(|v| v.as_array())?;
 
     for block in content {
         let block_type = block.get("type").and_then(|v| v.as_str())?;
@@ -457,7 +476,7 @@ mod tests {
 
     #[test]
     fn parse_thinking_event() {
-        let line = r#"{"type":"system","subtype":"thinking_tokens","cumulative_thinking_tokens":42,"thinking_delta":10}"#;
+        let line = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":42,"estimated_tokens_delta":10}"#;
         let event = parse_stream_line(line).expect("should parse thinking");
         match event {
             Event::Thinking {
@@ -473,7 +492,7 @@ mod tests {
 
     #[test]
     fn parse_tool_use_read() {
-        let line = r#"{"type":"assistant","content":[{"type":"tool_use","id":"tu-1","name":"Read","input":{"file_path":"src/main.rs"}}]}"#;
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-1","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#;
         let event = parse_stream_line(line).expect("should parse tool_use");
         match event {
             Event::ToolUse {
@@ -491,7 +510,7 @@ mod tests {
 
     #[test]
     fn parse_tool_use_bash() {
-        let line = r#"{"type":"assistant","content":[{"type":"tool_use","id":"tu-2","name":"Bash","input":{"command":"cargo test"}}]}"#;
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-2","name":"Bash","input":{"command":"cargo test"}}]}}"#;
         let event = parse_stream_line(line).expect("should parse bash tool_use");
         match event {
             Event::ToolUse {
@@ -509,7 +528,7 @@ mod tests {
 
     #[test]
     fn parse_subagent_spawn() {
-        let line = r#"{"type":"assistant","content":[{"type":"tool_use","id":"tu-3","name":"Agent","input":{"prompt":"review the changes"}}]}"#;
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-3","name":"Agent","input":{"prompt":"review the changes"}}]}}"#;
         let event = parse_stream_line(line).expect("should parse subagent");
         match event {
             Event::SubagentSpawn { id, prompt } => {
@@ -522,7 +541,7 @@ mod tests {
 
     #[test]
     fn parse_tool_result_success() {
-        let line = r#"{"type":"user","content":[{"type":"tool_result","tool_use_id":"tu-1","content":"file contents here","is_error":false}]}"#;
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu-1","content":"file contents here","is_error":false}]}}"#;
         let event = parse_stream_line(line).expect("should parse tool_result");
         match event {
             Event::ToolResult {
@@ -540,7 +559,7 @@ mod tests {
 
     #[test]
     fn parse_tool_result_error() {
-        let line = r#"{"type":"user","content":[{"type":"tool_result","tool_use_id":"tu-2","content":"command failed","is_error":true}]}"#;
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu-2","content":"command failed","is_error":true}]}}"#;
         let event = parse_stream_line(line).expect("should parse error tool_result");
         match event {
             Event::ToolResult {
@@ -557,8 +576,7 @@ mod tests {
 
     #[test]
     fn parse_text_event() {
-        let line =
-            r#"{"type":"assistant","content":[{"type":"text","text":"I will fix the bug."}]}"#;
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I will fix the bug."}]}}"#;
         let event = parse_stream_line(line).expect("should parse text");
         match event {
             Event::Text { content } => {
@@ -665,10 +683,13 @@ mod tests {
 
     #[test]
     fn parse_rate_limit_event() {
-        // Rate limit events come as a distinct type.
-        let line = r#"{"type":"rate_limit_event","status":"rate limited"}"#;
-        // This is not a system/assistant/user/result type, so it returns None.
-        // We handle it if Claude Code adds it as a dedicated type.
-        assert!(parse_stream_line(line).is_none());
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#;
+        let event = parse_stream_line(line).expect("should parse rate_limit_event");
+        match event {
+            Event::RateLimit { status } => {
+                assert_eq!(status, "allowed");
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
     }
 }

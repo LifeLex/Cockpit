@@ -4,7 +4,7 @@
 //! `request-changes`/`start` (T1.4), `kickoff` (T2.3).
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -92,6 +92,11 @@ enum Command {
         #[arg(long, default_value = "19876")]
         port: u16,
     },
+    /// Manage installable skills (local + GitHub sync).
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
     /// Evaluate frontier reviews for batch approval.
     ///
     /// By default shows a dry-run table of reviews and their verdicts.
@@ -122,6 +127,28 @@ enum CommentAction {
         line: String,
         /// Comment body.
         body: String,
+    },
+}
+
+/// Subcommands for the `skills` verb.
+#[derive(clap::Subcommand)]
+enum SkillsAction {
+    /// List installed skills with their source.
+    List,
+    /// Install a skill from a local SKILL.md (or markdown) file.
+    Install {
+        /// Path to a markdown file with YAML frontmatter.
+        path: String,
+        /// Optional name override (defaults to the frontmatter `name`).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Sync skills from the configured GitHub source (via `gh`).
+    Sync,
+    /// Scaffold a new local skill with a stub SKILL.md.
+    New {
+        /// Skill name (also the directory under skills/).
+        name: String,
     },
 }
 
@@ -174,6 +201,7 @@ async fn main() -> Result<()> {
             skip_plan,
             port,
         } => run_kickoff(&project_id, skip_plan, port).await,
+        Command::Skills { action } => run_skills(action).await,
         Command::BatchApprove { dry_run, confirm } => run_batch_approve(dry_run, confirm).await,
     }
 }
@@ -305,7 +333,7 @@ async fn run_start(port: u16) -> Result<()> {
     for (pr_data, (pr_ref, issue_ref)) in prs.iter().zip(linked.iter()) {
         let Some(issue) = issue_ref else { continue };
 
-        let review = Review {
+        let mut review = Review {
             id: ReviewId::new(format!("r-{}", pr_data.number)),
             issue: issue.clone(),
             pr: pr_ref.clone(),
@@ -313,7 +341,8 @@ async fn run_start(port: u16) -> Result<()> {
             base: pr_data.base_ref_name.clone(),
             base_sha: String::new(),
             source: ReviewSource::Authored,
-            worktree: PathBuf::from(format!(".cockpit/worktrees/{}", pr_data.number)),
+            // Placeholder; set below via the unified worktree keying scheme.
+            worktree: PathBuf::new(),
             gate_state: GateState::Pending,
             diff: DiffData { raw: String::new() },
             head_sha: String::new(),
@@ -323,15 +352,19 @@ async fn run_start(port: u16) -> Result<()> {
             stale: false,
             agent: None,
             repo_slug: None,
+            project: None,
         };
+        // Unified worktree keying: <worktrees>/<project-or-ungrouped>/<branch>.
+        review.worktree = cockpit_core::kickoff::review_worktree_path(&review)
+            .context("failed to resolve worktree path")?;
 
         store.insert(review);
         review_count += 1;
     }
 
     // 3. Save state to file.
-    let state_path = Path::new(store::STATE_FILE);
-    store::save_to_file(&store, state_path).context("failed to save state file")?;
+    let state_path = store::state_file_path()?;
+    store::save_to_file(&store, &state_path).context("failed to save state file")?;
 
     println!("Reviews loaded: {review_count}");
     println!("State file: {}", state_path.display());
@@ -396,8 +429,8 @@ async fn run_comment(action: CommentAction) -> Result<()> {
             let pr_ref = PrRef::new(format!("owner/repo#{pr}"));
 
             // Load state from file.
-            let state_path = Path::new(store::STATE_FILE);
-            let store = store::load_from_file(state_path).context("failed to load state file")?;
+            let state_path = store::state_file_path()?;
+            let store = store::load_from_file(&state_path).context("failed to load state file")?;
 
             // Look up the review.
             let review = store
@@ -425,7 +458,7 @@ async fn run_comment(action: CommentAction) -> Result<()> {
             });
 
             // Persist.
-            store::save_to_file(&store, state_path).context("failed to save state file")?;
+            store::save_to_file(&store, &state_path).context("failed to save state file")?;
 
             let review = store
                 .get(&pr_ref)
@@ -452,8 +485,8 @@ async fn run_request_changes(pr_num: u64) -> Result<()> {
     let pr_ref = PrRef::new(format!("owner/repo#{pr_num}"));
 
     // Load state from file.
-    let state_path = Path::new(store::STATE_FILE);
-    let store = store::load_from_file(state_path).context("failed to load state file")?;
+    let state_path = store::state_file_path()?;
+    let store = store::load_from_file(&state_path).context("failed to load state file")?;
 
     // Look up the review.
     let mut review = store
@@ -465,14 +498,27 @@ async fn run_request_changes(pr_num: u64) -> Result<()> {
         .request_changes()
         .map_err(|e| anyhow::anyhow!("cannot request changes: {e}"))?;
 
+    // Load config so the Fix-mode custom preamble and agent command are honored.
+    let app_config = cockpit_core::config::Config::load().context("failed to load config")?;
+    let preamble = app_config
+        .agent_prompts
+        .for_mode(cockpit_core::model::AgentMode::Fix)
+        .map(str::to_owned);
+
+    // Skills relevant to the diff under review; discovery failures are
+    // non-fatal (fall back to no skills — never block the loop).
+    let skills = cockpit_core::skills::relevant_for_diff(&review.diff.raw);
+
     // Assemble the rework prompt.
     let artifact = Artifact::Diff(review.diff.clone());
     let input = ReworkInput {
         intent: review.issue.as_str(),
+        custom_preamble: preamble.as_deref(),
         approved_plan: None,
         artifact: &artifact,
         comments: &review.comments,
-        skills: &[],
+        ci_failures: None,
+        skills: &skills,
     };
     let prompt = prompt::assemble_rework(&input);
 
@@ -481,7 +527,7 @@ async fn run_request_changes(pr_num: u64) -> Result<()> {
     // Spawn the fixer agent.
     let session_map = SessionMap::new();
     let hook_url = "http://127.0.0.1:19876/hook/stop";
-    let config = SpawnConfig::default();
+    let config = SpawnConfig::from_config(&app_config);
 
     let spawn_result = cockpit_core::adapters::agent::spawn_agent(
         &review.worktree,
@@ -506,7 +552,7 @@ async fn run_request_changes(pr_num: u64) -> Result<()> {
         r.comments = review.comments.clone();
         r.agent = review.agent.clone();
     });
-    store::save_to_file(&store, state_path).context("failed to save state file")?;
+    store::save_to_file(&store, &state_path).context("failed to save state file")?;
 
     println!("Dispatched -- waiting for agent to complete");
 
@@ -541,13 +587,14 @@ async fn run_plan_load(file: &str, project_id: &str) -> Result<()> {
         gate_state: GateState::Pending,
         comments: vec![],
         agent: None,
+        plan_path: None,
     };
 
     let plan_store = PlanStore::new();
     plan_store.set(plan);
 
-    let state_path = Path::new(store::PLAN_STATE_FILE);
-    store::save_plan_to_file(&plan_store, state_path).context("failed to save plan state")?;
+    let state_path = store::plan_state_file_path()?;
+    store::save_plan_to_file(&plan_store, &state_path).context("failed to save plan state")?;
 
     println!("Plan loaded: {}", doc.summary);
     println!("Steps:  {}", doc.steps.len());
@@ -560,8 +607,9 @@ async fn run_plan_load(file: &str, project_id: &str) -> Result<()> {
 
 /// Show the current plan.
 async fn run_plan_show() -> Result<()> {
-    let state_path = Path::new(store::PLAN_STATE_FILE);
-    let plan_store = store::load_plan_from_file(state_path).context("failed to load plan state")?;
+    let state_path = store::plan_state_file_path()?;
+    let plan_store =
+        store::load_plan_from_file(&state_path).context("failed to load plan state")?;
 
     let plan = plan_store
         .get()
@@ -615,8 +663,9 @@ async fn run_plan_comment(anchor_str: &str, body: &str) -> Result<()> {
     let anchor =
         plan_parser::parse_plan_anchor(anchor_str).context("failed to parse anchor string")?;
 
-    let state_path = Path::new(store::PLAN_STATE_FILE);
-    let plan_store = store::load_plan_from_file(state_path).context("failed to load plan state")?;
+    let state_path = store::plan_state_file_path()?;
+    let plan_store =
+        store::load_plan_from_file(&state_path).context("failed to load plan state")?;
 
     if plan_store.get().is_none() {
         bail!("no plan loaded; use `cockpit plan load <file>` first");
@@ -639,7 +688,7 @@ async fn run_plan_comment(anchor_str: &str, body: &str) -> Result<()> {
         }
     });
 
-    store::save_plan_to_file(&plan_store, state_path).context("failed to save plan state")?;
+    store::save_plan_to_file(&plan_store, &state_path).context("failed to save plan state")?;
 
     let plan = plan_store.get().expect("plan was just updated; must exist");
     let anchor_text = prompt::render_anchor(
@@ -655,8 +704,9 @@ async fn run_plan_comment(anchor_str: &str, body: &str) -> Result<()> {
 
 /// Request changes on the plan: assemble prompt and spawn planner agent.
 async fn run_plan_request_changes() -> Result<()> {
-    let state_path = Path::new(store::PLAN_STATE_FILE);
-    let plan_store = store::load_plan_from_file(state_path).context("failed to load plan state")?;
+    let state_path = store::plan_state_file_path()?;
+    let plan_store =
+        store::load_plan_from_file(&state_path).context("failed to load plan state")?;
 
     let mut plan = plan_store
         .get()
@@ -666,14 +716,27 @@ async fn run_plan_request_changes() -> Result<()> {
     plan.request_changes()
         .map_err(|e| anyhow::anyhow!("cannot request changes: {e}"))?;
 
+    // Load config so the Plan-mode custom preamble and agent command are honored.
+    let app_config = cockpit_core::config::Config::load().context("failed to load config")?;
+    let preamble = app_config
+        .agent_prompts
+        .for_mode(cockpit_core::model::AgentMode::Plan)
+        .map(str::to_owned);
+
+    // Plan rework operates on the plan doc, not a file diff — surface universal
+    // (untagged) skills. Discovery failures are non-fatal.
+    let skills = cockpit_core::skills::relevant_for_diff("");
+
     // Assemble the rework prompt (plan gate: no approved_plan, artifact is Plan).
     let artifact = Artifact::Plan(plan.doc.clone());
     let input = ReworkInput {
         intent: plan.project.as_str(),
+        custom_preamble: preamble.as_deref(),
         approved_plan: None,
         artifact: &artifact,
         comments: &plan.comments,
-        skills: &[],
+        ci_failures: None,
+        skills: &skills,
     };
     let assembled_prompt = prompt::assemble_rework(&input);
 
@@ -682,7 +745,7 @@ async fn run_plan_request_changes() -> Result<()> {
     // Spawn the planner agent.
     let session_map = SessionMap::new();
     let hook_url = "http://127.0.0.1:19876/hook/stop";
-    let config = SpawnConfig::default();
+    let config = SpawnConfig::from_config(&app_config);
 
     // Use the current directory as the worktree for plan-gate agents.
     let worktree = env::current_dir().context("failed to get current directory")?;
@@ -707,7 +770,7 @@ async fn run_plan_request_changes() -> Result<()> {
     // Persist the updated plan.
     let updated_store = PlanStore::new();
     updated_store.set(plan);
-    store::save_plan_to_file(&updated_store, state_path).context("failed to save plan state")?;
+    store::save_plan_to_file(&updated_store, &state_path).context("failed to save plan state")?;
 
     println!("Dispatched -- waiting for planner agent to complete");
 
@@ -716,8 +779,9 @@ async fn run_plan_request_changes() -> Result<()> {
 
 /// Approve the current plan.
 async fn run_plan_approve() -> Result<()> {
-    let state_path = Path::new(store::PLAN_STATE_FILE);
-    let plan_store = store::load_plan_from_file(state_path).context("failed to load plan state")?;
+    let state_path = store::plan_state_file_path()?;
+    let plan_store =
+        store::load_plan_from_file(&state_path).context("failed to load plan state")?;
 
     let mut plan = plan_store
         .get()
@@ -728,7 +792,7 @@ async fn run_plan_approve() -> Result<()> {
 
     let updated_store = PlanStore::new();
     updated_store.set(plan);
-    store::save_plan_to_file(&updated_store, state_path).context("failed to save plan state")?;
+    store::save_plan_to_file(&updated_store, &state_path).context("failed to save plan state")?;
 
     println!("Plan approved -- ready for batch implementation");
 
@@ -747,8 +811,8 @@ async fn run_mirror(pr_num: u64, dry_run: bool) -> Result<()> {
     let pr_ref = PrRef::new(format!("owner/repo#{pr_num}"));
 
     // Load state from file.
-    let state_path = Path::new(store::STATE_FILE);
-    let store = store::load_from_file(state_path).context("failed to load state file")?;
+    let state_path = store::state_file_path()?;
+    let store = store::load_from_file(&state_path).context("failed to load state file")?;
 
     // Look up the review.
     let review = store
@@ -814,8 +878,8 @@ async fn run_restack(pr_num: u64) -> Result<()> {
     let pr_ref = PrRef::new(format!("owner/repo#{pr_num}"));
 
     // Load state from file.
-    let state_path = Path::new(store::STATE_FILE);
-    let store = store::load_from_file(state_path).context("failed to load state file")?;
+    let state_path = store::state_file_path()?;
+    let store = store::load_from_file(&state_path).context("failed to load state file")?;
 
     // Look up the review.
     let mut review = store
@@ -833,9 +897,16 @@ async fn run_restack(pr_num: u64) -> Result<()> {
     // Open the repo (current directory).
     let repo = git2::Repository::discover(".").context("not inside a git repository")?;
 
+    // Load config so the Restack-mode custom preamble and agent command apply.
+    let app_config = cockpit_core::config::Config::load().context("failed to load config")?;
+    let preamble = app_config
+        .agent_prompts
+        .for_mode(cockpit_core::model::AgentMode::Restack)
+        .map(str::to_owned);
+
     let session_map = SessionMap::new();
     let hook_url = "http://127.0.0.1:19876/hook/stop";
-    let config = SpawnConfig::default();
+    let config = SpawnConfig::from_config(&app_config);
 
     let outcome = restack::restack_or_resolve(
         &repo,
@@ -845,6 +916,7 @@ async fn run_restack(pr_num: u64) -> Result<()> {
         &session_map,
         hook_url,
         &config,
+        preamble.as_deref(),
     )
     .await
     .context("restack failed")?;
@@ -870,7 +942,7 @@ async fn run_restack(pr_num: u64) -> Result<()> {
         r.stale = review.stale;
         r.agent = review.agent.clone();
     });
-    store::save_to_file(&store, state_path).context("failed to save state file")?;
+    store::save_to_file(&store, &state_path).context("failed to save state file")?;
 
     Ok(())
 }
@@ -936,13 +1008,14 @@ async fn run_kickoff(project_id: &str, skip_plan: bool, port: u16) -> Result<()>
             gate_state: GateState::Pending,
             comments: vec![],
             agent: None,
+            plan_path: None,
         };
 
         let plan_store = cockpit_core::store::PlanStore::new();
         plan_store.set(plan);
 
-        let plan_path = Path::new(cockpit_core::store::PLAN_STATE_FILE);
-        cockpit_core::store::save_plan_to_file(&plan_store, plan_path)
+        let plan_path = cockpit_core::store::plan_state_file_path()?;
+        cockpit_core::store::save_plan_to_file(&plan_store, &plan_path)
             .context("failed to save plan state")?;
 
         println!("Plan created in Pending state.");
@@ -953,15 +1026,23 @@ async fn run_kickoff(project_id: &str, skip_plan: bool, port: u16) -> Result<()>
         return Ok(());
     }
 
-    // 4. Build reviews for frontier issues.
-    let worktree_base = PathBuf::from(".cockpit/worktrees");
-    let reviews = cockpit_core::kickoff::build_reviews_for_frontier(
+    // 4. Build reviews for frontier issues. Kickoff creates a first-class
+    //    Linear-backed project that groups the reviews; worktrees live under
+    //    the cockpit home (outside the managed repo), keyed via the unified
+    //    scheme in `review_worktree_path`.
+    let cockpit_project =
+        cockpit_core::kickoff::project_from_linear(&project, format!("Project {project}"));
+    let mut reviews = cockpit_core::kickoff::build_reviews_for_frontier(
         &frontier,
         &data,
         &issue_dag,
-        &worktree_base,
         "main",
+        Some(&cockpit_project.id),
     );
+    for review in &mut reviews {
+        review.worktree = cockpit_core::kickoff::review_worktree_path(review)
+            .context("failed to resolve worktree path")?;
+    }
 
     println!();
     println!("Reviews to create: {}", reviews.len());
@@ -975,15 +1056,15 @@ async fn run_kickoff(project_id: &str, skip_plan: bool, port: u16) -> Result<()>
     }
 
     // 5. Save reviews to the store.
-    let state_path = Path::new(cockpit_core::store::STATE_FILE);
+    let state_path = cockpit_core::store::state_file_path()?;
     let store =
-        cockpit_core::store::load_from_file(state_path).context("failed to load state file")?;
+        cockpit_core::store::load_from_file(&state_path).context("failed to load state file")?;
 
     for review in &reviews {
         store.insert(review.clone());
     }
 
-    cockpit_core::store::save_to_file(&store, state_path).context("failed to save state file")?;
+    cockpit_core::store::save_to_file(&store, &state_path).context("failed to save state file")?;
 
     println!();
     println!("State saved to: {}", state_path.display());
@@ -991,24 +1072,41 @@ async fn run_kickoff(project_id: &str, skip_plan: bool, port: u16) -> Result<()>
     // 6. Create worktrees and spawn agents.
     let repo = git2::Repository::discover(".").context("not inside a git repository")?;
     let session_map = cockpit_core::adapters::agent::SessionMap::new();
-    let spawn_config = cockpit_core::adapters::agent::SpawnConfig::default();
+
+    // Load config so the agent command, Implement-mode preamble, and the
+    // fan-out bound are all honored (defaults if config is unreadable).
+    let app_config = cockpit_core::config::Config::load().unwrap_or_default();
+    let spawn_config = cockpit_core::adapters::agent::SpawnConfig::from_config(&app_config);
+    let implement_preamble = app_config
+        .agent_prompts
+        .for_mode(cockpit_core::model::AgentMode::Implement)
+        .map(str::to_owned);
     let hook_url = format!("http://127.0.0.1:{port}/hook/stop");
 
+    // Bound the implementer fan-out by the configured limit (default 3).
+    let max_parallel_agents = app_config.max_parallel_agents;
+
     let kickoff_config = cockpit_core::kickoff::KickoffConfig {
-        http_client: &client,
-        api_key: &api_key,
-        worktree_base: &worktree_base,
-        repo: &repo,
         session_map: &session_map,
         hook_url: &hook_url,
         spawn_config: &spawn_config,
+        max_parallel_agents,
     };
 
     println!();
     println!("Creating worktrees and spawning implementer agents...");
 
     let mut mutable_reviews = reviews;
-    cockpit_core::kickoff::spawn_batch(&mut mutable_reviews, &kickoff_config, &project)
+    // Prepare worktrees synchronously (git2::Repository is not Send / must not
+    // live across an .await), then spawn the bounded agent fan-out.
+    let prepared = cockpit_core::kickoff::prepare_batch_worktrees(
+        &mut mutable_reviews,
+        &repo,
+        &project,
+        implement_preamble.as_deref(),
+    )
+    .context("failed to prepare worktrees")?;
+    cockpit_core::kickoff::spawn_batch(&mut mutable_reviews, &prepared, &kickoff_config)
         .await
         .context("failed to spawn batch")?;
 
@@ -1020,7 +1118,7 @@ async fn run_kickoff(project_id: &str, skip_plan: bool, port: u16) -> Result<()>
         });
     }
 
-    cockpit_core::store::save_to_file(&store, state_path)
+    cockpit_core::store::save_to_file(&store, &state_path)
         .context("failed to save state file after spawning agents")?;
 
     println!();
@@ -1043,6 +1141,138 @@ async fn run_kickoff(project_id: &str, skip_plan: bool, port: u16) -> Result<()>
 }
 
 // ---------------------------------------------------------------------------
+// `cockpit skills <action>`
+// ---------------------------------------------------------------------------
+
+/// Dispatch skills subcommands.
+async fn run_skills(action: SkillsAction) -> Result<()> {
+    match action {
+        SkillsAction::List => run_skills_list(),
+        SkillsAction::Install { path, name } => run_skills_install(&path, name.as_deref()),
+        SkillsAction::Sync => run_skills_sync().await,
+        SkillsAction::New { name } => run_skills_new(&name),
+    }
+}
+
+/// List installed skills and their provenance.
+fn run_skills_list() -> Result<()> {
+    let dir = cockpit_core::skills::skills_dir().context("failed to resolve skills directory")?;
+    let skills =
+        cockpit_core::skills::discover_skills(&dir).context("failed to discover skills")?;
+
+    if skills.is_empty() {
+        println!("No skills installed. Skills live under {}", dir.display());
+        return Ok(());
+    }
+
+    println!("Installed skills ({}):", skills.len());
+    for skill in &skills {
+        let source = match cockpit_core::skills::read_meta(&skill.name) {
+            Ok(Some(meta)) => match meta.source {
+                cockpit_core::skills::SkillSource::Local => "local".to_string(),
+                cockpit_core::skills::SkillSource::GitHub { owner, repo, .. } => {
+                    format!("github:{owner}/{repo}")
+                }
+            },
+            _ => "unknown".to_string(),
+        };
+        let tags = if skill.tags.is_empty() {
+            "universal".to_string()
+        } else {
+            skill.tags.join(", ")
+        };
+        println!(
+            "  {} [{}] ({}) — {}",
+            skill.name, source, tags, skill.description
+        );
+    }
+
+    Ok(())
+}
+
+/// Install a skill from a local markdown file.
+fn run_skills_install(path: &str, name_override: Option<&str>) -> Result<()> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read skill file: {path}"))?;
+
+    // Resolve the name: explicit override wins, else derive from the file stem.
+    let name = match name_override {
+        Some(n) => n.to_string(),
+        None => PathBuf::from(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_owned)
+            .filter(|s| s != "SKILL")
+            .or_else(|| {
+                // If the file is a bare SKILL.md, use its parent directory name.
+                PathBuf::from(path)
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("could not derive skill name from {path}; pass --name")
+            })?,
+    };
+
+    let installed = cockpit_core::skills::install_skill(
+        &name,
+        &contents,
+        cockpit_core::skills::SkillSource::Local,
+    )
+    .with_context(|| format!("failed to install skill {name}"))?;
+
+    println!("Installed skill '{name}' to {}", installed.display());
+    Ok(())
+}
+
+/// Sync skills from the configured GitHub source via `gh`.
+async fn run_skills_sync() -> Result<()> {
+    let config = cockpit_core::config::Config::load().context("failed to load config")?;
+    let source = config.skills_github.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no skills GitHub source configured; set [skills_github] in ~/.cockpit/config.toml"
+        )
+    })?;
+
+    println!(
+        "Syncing skills from {}/{}@{} ({}) via gh...",
+        source.owner, source.repo, source.branch, source.path
+    );
+
+    let report = cockpit_core::skills::sync_from_github(
+        &source.owner,
+        &source.repo,
+        &source.branch,
+        &source.path,
+    )
+    .await
+    .context("failed to sync skills from GitHub")?;
+
+    println!(
+        "Sync complete: {} installed, {} updated, {} skipped",
+        report.installed, report.updated, report.skipped
+    );
+    Ok(())
+}
+
+/// Scaffold a new local skill with a stub SKILL.md.
+fn run_skills_new(name: &str) -> Result<()> {
+    let stub = format!(
+        "---\nname: {name}\ndescription: TODO one-line description\ntags: []\n---\n\n\
+         Describe the convention here. Untagged skills apply universally.\n"
+    );
+    let path =
+        cockpit_core::skills::install_skill(name, &stub, cockpit_core::skills::SkillSource::Local)
+            .with_context(|| format!("failed to create skill {name}"))?;
+
+    println!("Created skill '{name}' at {}", path.display());
+    println!("Edit it, then confirm with: cockpit skills list");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // `cockpit batch-approve [--dry-run] [--confirm]`
 // ---------------------------------------------------------------------------
 
@@ -1058,8 +1288,8 @@ async fn run_batch_approve(dry_run: bool, confirm: bool) -> Result<()> {
     }
 
     // Load state from file.
-    let state_path = Path::new(store::STATE_FILE);
-    let store = store::load_from_file(state_path).context("failed to load state file")?;
+    let state_path = store::state_file_path()?;
+    let store = store::load_from_file(&state_path).context("failed to load state file")?;
 
     let config = batch::Config::default();
     let results = batch::evaluate_frontier(&store, &config);
@@ -1146,7 +1376,7 @@ async fn run_batch_approve(dry_run: bool, confirm: bool) -> Result<()> {
         }
 
         // Persist the updated state.
-        store::save_to_file(&store, state_path).context("failed to save state file")?;
+        store::save_to_file(&store, &state_path).context("failed to save state file")?;
 
         println!();
         println!("Approved {approved}/{eligible_count} reviews.");
@@ -1192,6 +1422,7 @@ mod tests {
             stale: false,
             agent: None,
             repo_slug: None,
+            project: None,
         }
     }
 
@@ -1332,6 +1563,7 @@ mod tests {
             gate_state: state,
             comments: vec![],
             agent: None,
+            plan_path: None,
         }
     }
 
@@ -1405,9 +1637,11 @@ mod tests {
         let artifact = Artifact::Plan(plan.doc.clone());
         let input = ReworkInput {
             intent: "Build a reusable widget framework",
+            custom_preamble: None,
             approved_plan: None, // plan gate: no approved plan
             artifact: &artifact,
             comments: &plan.comments,
+            ci_failures: None,
             skills: &[],
         };
 

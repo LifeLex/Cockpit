@@ -1,0 +1,22 @@
+## Intent
+
+Fix the parser
+
+## Current Artifact
+
+diff --git a/f b/f
+
+## Comments
+
+No comments.
+
+## CI Failures
+
+=== run 222 (failed jobs) ===
+test_parse ... FAILED
+assertion failed: left == right
+
+## Scope Guard
+
+Address only the comments above. Don't refactor unrelated code. Don't weaken or delete tests. If a comment is wrong or impossible, stop and say so.
+

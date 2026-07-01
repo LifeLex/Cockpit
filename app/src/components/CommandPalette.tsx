@@ -11,20 +11,36 @@ import {
 } from "@/components/ui/command";
 import { useAppStore } from "../store";
 import type { GateState } from "../bindings/GateState";
+import type { Review } from "../bindings/Review";
+import { invoke } from "@tauri-apps/api/core";
+import { comboFor, Kbd } from "@/lib/shortcuts";
+import type { ShortcutId } from "@/lib/shortcuts";
 import {
   ListChecks,
-  FileText,
+  FolderKanban,
+  Sparkles,
+  Bot,
   Settings,
   RefreshCw,
-  MessageSquare,
-  Terminal,
   PanelBottom,
+  Code2,
 } from "lucide-react";
 
 interface CommandPaletteProps {
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
   readonly onToggleSidebar: () => void;
+}
+
+/** Render the registry combo for a shortcut id as a command-row hint. */
+function ShortcutHint({ id }: { readonly id: ShortcutId }) {
+  const combo = comboFor(id);
+  if (combo === undefined) return null;
+  return (
+    <CommandShortcut>
+      <Kbd combo={combo} />
+    </CommandShortcut>
+  );
 }
 
 /** Human-readable label for a gate state, used in the "Jump to Review" group. */
@@ -75,6 +91,9 @@ function gateStateBadgeClass(state: GateState): string {
  * - Navigation: move between the main app views
  * - Jump to Review: lists all current reviews with branch + state badge
  * - Actions: context-aware actions based on the current view
+ *
+ * Shortcut hints are read from the single shortcut registry so they never
+ * drift from the actual key bindings.
  */
 export function CommandPalette({
   open,
@@ -86,14 +105,15 @@ export function CommandPalette({
   const reviewRequests = useAppStore((s) => s.reviewRequests);
   const view = useAppStore((s) => s.view);
   const activeReview = useAppStore((s) => s.activeReview);
-  const navigateToFrontier = useAppStore((s) => s.navigateToFrontier);
-  const navigateToPlan = useAppStore((s) => s.navigateToPlan);
+  const navigateToPrs = useAppStore((s) => s.navigateToPrs);
+  const navigateToProjects = useAppStore((s) => s.navigateToProjects);
+  const navigateToSkills = useAppStore((s) => s.navigateToSkills);
+  const navigateToAgents = useAppStore((s) => s.navigateToAgents);
   const navigateToSettings = useAppStore((s) => s.navigateToSettings);
   const navigateToDiff = useAppStore((s) => s.navigateToDiff);
   const fetchReviews = useAppStore((s) => s.fetchReviews);
   const fetchFrontier = useAppStore((s) => s.fetchFrontier);
   const fetchAuthoredPrs = useAppStore((s) => s.fetchAuthoredPrs);
-  const requestChanges = useAppStore((s) => s.requestChanges);
 
   const close = useCallback(() => {
     onOpenChange(false);
@@ -110,7 +130,7 @@ export function CommandPalette({
   // Merge all reviews from the three sources, deduplicating by PR ref.
   const allReviews = (() => {
     const seen = new Set<string>();
-    const merged: typeof reviews extends readonly (infer T)[] ? T[] : never[] = [];
+    const merged: Review[] = [];
     for (const list of [reviews, authoredPrs, reviewRequests]) {
       for (const r of list) {
         if (!seen.has(r.pr)) {
@@ -123,8 +143,6 @@ export function CommandPalette({
   })();
 
   const isInDiffView = view.kind === "diff";
-  const isInReviewState =
-    isInDiffView && activeReview !== null && activeReview.gate_state === "InReview";
 
   return (
     <CommandDialog open={open} onOpenChange={onOpenChange}>
@@ -136,21 +154,39 @@ export function CommandPalette({
           <CommandGroup heading="Navigation">
             <CommandItem
               onSelect={() => {
-                handleSelect(navigateToFrontier);
+                handleSelect(navigateToPrs);
               }}
             >
               <ListChecks className="h-4 w-4 shrink-0" />
-              <span>Reviews</span>
-              <CommandShortcut>&#8984;1</CommandShortcut>
+              <span>PRs</span>
+              <ShortcutHint id="nav-prs" />
             </CommandItem>
             <CommandItem
               onSelect={() => {
-                handleSelect(navigateToPlan);
+                handleSelect(navigateToProjects);
               }}
             >
-              <FileText className="h-4 w-4 shrink-0" />
-              <span>Plan</span>
-              <CommandShortcut>&#8984;2</CommandShortcut>
+              <FolderKanban className="h-4 w-4 shrink-0" />
+              <span>Projects</span>
+              <ShortcutHint id="nav-projects" />
+            </CommandItem>
+            <CommandItem
+              onSelect={() => {
+                handleSelect(navigateToSkills);
+              }}
+            >
+              <Sparkles className="h-4 w-4 shrink-0" />
+              <span>Skills</span>
+              <ShortcutHint id="nav-skills" />
+            </CommandItem>
+            <CommandItem
+              onSelect={() => {
+                handleSelect(navigateToAgents);
+              }}
+            >
+              <Bot className="h-4 w-4 shrink-0" />
+              <span>Agents</span>
+              <ShortcutHint id="nav-agents" />
             </CommandItem>
             <CommandItem
               onSelect={() => {
@@ -159,7 +195,7 @@ export function CommandPalette({
             >
               <Settings className="h-4 w-4 shrink-0" />
               <span>Settings</span>
-              <CommandShortcut>&#8984;,</CommandShortcut>
+              <ShortcutHint id="nav-settings" />
             </CommandItem>
           </CommandGroup>
 
@@ -197,22 +233,8 @@ export function CommandPalette({
             >
               <RefreshCw className="h-4 w-4 shrink-0" />
               <span>Refresh PRs</span>
-              <CommandShortcut>&#8984;R</CommandShortcut>
+              <ShortcutHint id="refresh" />
             </CommandItem>
-
-            {isInReviewState && (
-              <CommandItem
-                onSelect={() => {
-                  handleSelect(() => {
-                    void requestChanges();
-                  });
-                }}
-              >
-                <MessageSquare className="h-4 w-4 shrink-0" />
-                <span>Request Changes</span>
-                <CommandShortcut>&#8984;&#8679;R</CommandShortcut>
-              </CommandItem>
-            )}
 
             <CommandItem
               onSelect={() => {
@@ -221,21 +243,26 @@ export function CommandPalette({
             >
               <PanelBottom className="h-4 w-4 shrink-0" />
               <span>Toggle Sidebar</span>
-              <CommandShortcut>&#8984;B</CommandShortcut>
+              <ShortcutHint id="toggle-sidebar" />
             </CommandItem>
 
-            <CommandItem
-              onSelect={() => {
-                handleSelect(() => {
-                  // Open a terminal shell -- placeholder for future integration.
-                  // Currently no-op; the shortcut is registered for discoverability.
-                });
-              }}
-            >
-              <Terminal className="h-4 w-4 shrink-0" />
-              <span>Open Shell</span>
-              <CommandShortcut>&#8984;T</CommandShortcut>
-            </CommandItem>
+            {isInDiffView && activeReview !== null && (
+              <CommandItem
+                onSelect={() => {
+                  handleSelect(() => {
+                    void invoke("open_in_editor", {
+                      filePath: ".",
+                      repoSlug: activeReview.repo_slug,
+                      branch: activeReview.branch,
+                    });
+                  });
+                }}
+              >
+                <Code2 className="h-4 w-4 shrink-0" />
+                <span>Open in IDE</span>
+                <ShortcutHint id="open-in-ide" />
+              </CommandItem>
+            )}
           </CommandGroup>
         </CommandList>
       </Command>

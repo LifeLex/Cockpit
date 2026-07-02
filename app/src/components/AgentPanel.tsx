@@ -21,14 +21,16 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import type { Event } from "../bindings/Event";
+import type { TrajectorySummary } from "../bindings/TrajectorySummary";
 import { useAppStore } from "../store";
+import { elapsedSince } from "@/lib/relative-time";
 import {
   presentEvent,
   toneTileClass,
   AgentMark,
   type EventPresentation,
 } from "@/lib/agent-event";
-import { X, Trash2, Square, FileText } from "lucide-react";
+import { X, Trash2, Square, FileText, History } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /**
@@ -273,6 +275,99 @@ function EmptyState() {
   );
 }
 
+/**
+ * Compact "last run" card shown when no live timeline exists (no buffered
+ * events, no attached agent) but a persisted trajectory summary is available.
+ *
+ * Per the trust-miscalibration research (RESEARCH_INTERACTION_PATTERNS §3): the
+ * compact summary is the DEFAULT transparency surface and the raw step-by-step
+ * log stays one click away ("Open log" in the header), never the default. No
+ * confidence display — deterministic facts only (mode, duration, tools, the
+ * commands the agent ran, its final message).
+ */
+function TrajectoryCard({ summary }: { readonly summary: TrajectorySummary }) {
+  const [expanded, setExpanded] = useState(false);
+  const endedAgo = elapsedSince({
+    secs_since_epoch: Math.floor(summary.ended_at_epoch_ms / 1000),
+  });
+
+  return (
+    <div className="rounded-lg border border-border bg-card/60 p-4">
+      {/* Header: last-run label + mode + telemetry. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="inline-flex items-center gap-1.5 font-display text-sm font-semibold text-foreground">
+          <History className="h-4 w-4 text-muted-foreground" />
+          Last run
+        </span>
+        <span className="font-mono text-xs text-muted-foreground">
+          · {summary.mode.toLowerCase()}
+        </span>
+        <span className="ml-auto flex items-center gap-3 font-mono text-[11px] tabular-nums text-muted-foreground/80">
+          <span title="Wall-clock duration">
+            {formatElapsed(summary.duration_ms)}
+          </span>
+          <span>{String(summary.tools_used)} tools</span>
+          {summary.unresolved_commands > 0 && (
+            <span title="Commands that never reported a result before the run ended — outcome unknown, so shown as neither ✓ nor ✗">
+              · {String(summary.unresolved_commands)} unresolved
+            </span>
+          )}
+          <span title="When the run ended">{endedAgo} ago</span>
+        </span>
+      </div>
+
+      {/* Commands the agent ran, each ✓/✗ with the full command in the tooltip. */}
+      {summary.commands.length > 0 && (
+        <ul className="mt-3 space-y-1 border-t border-border pt-3">
+          {summary.commands.map((cmd, idx) => (
+            <li
+              key={`${String(idx)}-${cmd.command}`}
+              className="flex items-center gap-2 font-mono text-xs"
+              title={cmd.command}
+            >
+              <span
+                className={cn(
+                  "shrink-0",
+                  cmd.ok ? "text-success" : "text-danger",
+                )}
+                aria-hidden="true"
+              >
+                {cmd.ok ? "✓" : "✗"}
+              </span>
+              <span className="truncate text-muted-foreground">
+                {cmd.command}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {/* Final message, collapsed to three lines with an expand toggle. */}
+      {summary.final_text !== "" && (
+        <div className="mt-3 border-t border-border pt-3">
+          <p
+            className={cn(
+              "whitespace-pre-wrap text-xs leading-relaxed text-foreground",
+              !expanded && "line-clamp-3",
+            )}
+          >
+            {summary.final_text}
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              setExpanded((prev) => !prev);
+            }}
+            className="mt-1 cursor-pointer border-none bg-transparent p-0 text-[11px] text-muted-foreground hover:text-foreground"
+          >
+            {expanded ? "Show less" : "Show more"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Terminal banner shown after the run finishes. */
 function EndBanner({
   phase,
@@ -320,9 +415,28 @@ export function AgentPanel({ visible, objectId, onClose }: AgentPanelProps) {
   // AgentPanel is mounted per workspace, so `activeReview.pr === objectId`.
   const activeReview = useAppStore((s) => s.activeReview);
   const killAgent = useAppStore((s) => s.killAgent);
+  const fetchTrajectorySummary = useAppStore((s) => s.fetchTrajectorySummary);
   const reviewForObject = activeReview?.pr === objectId ? activeReview : null;
   const agentAttached = reviewForObject?.agent != null;
   const logPath = reviewForObject?.agent?.log_path ?? null;
+
+  // D2: the persisted "last run" summary, shown only when there is no live
+  // timeline (no buffered events and no attached agent) to fall back on.
+  const [trajectory, setTrajectory] = useState<TrajectorySummary | null>(null);
+  const noLiveTimeline = entries.length === 0 && !agentAttached;
+  useEffect(() => {
+    if (!noLiveTimeline) {
+      setTrajectory(null);
+      return;
+    }
+    let cancelled = false;
+    void fetchTrajectorySummary(objectId).then((summary) => {
+      if (!cancelled) setTrajectory(summary);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [noLiveTimeline, objectId, fetchTrajectorySummary]);
 
   const phase = runPhase(entries);
   const isRunning = phase === "running";
@@ -510,7 +624,11 @@ export function AgentPanel({ visible, objectId, onClose }: AgentPanelProps) {
       {/* Timeline */}
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         {entries.length === 0 || anchor === null ? (
-          <EmptyState />
+          trajectory !== null ? (
+            <TrajectoryCard summary={trajectory} />
+          ) : (
+            <EmptyState />
+          )
         ) : (
           <>
             <ol className="list-none">

@@ -1,8 +1,12 @@
+import { useCallback, type ReactNode } from "react";
+import { Layers, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ReviewCard } from "./ReviewCard";
 import type { CardDensity } from "./ReviewCard";
+import { useAppStore } from "../store";
 import {
   computeHealth,
+  flattenStack,
   frontierReviewId,
   stackStatus,
 } from "../lib/stack-tree";
@@ -73,6 +77,99 @@ export function StackContainer({
   const status = stackStatus(health);
   const frontierId = frontierReviewId(root);
 
+  // -- D3: whole-stack restack control --
+  const rootPr = root.review.pr;
+  const restackStack = useAppStore((s) => s.restackStack);
+  const clearRestackProgress = useAppStore((s) => s.clearRestackProgress);
+  const progress = useAppStore((s) => s.restackProgress[rootPr]);
+  const staleCount = health.stale;
+  // Refuse the offer while any member is mid-rework: restacking a branch out from
+  // under a running agent would clobber its work (the backend guards this too).
+  const anyAgent = flattenStack(root).some((m) => m.review.agent != null);
+
+  const handleRestackStack = useCallback(() => {
+    // Explicit, confirmed side effect (§9). Spawns a conflict-resolver agent on
+    // conflict, so the confirm text says so.
+    const confirmed = window.confirm(
+      `Restack ${String(staleCount)} stale PR${
+        staleCount === 1 ? "" : "s"
+      } onto their parents in dependency order?\n\nOn a conflict, an agent is dispatched to resolve it and the remaining PRs stay stale until it lands.`,
+    );
+    if (!confirmed) return;
+    // Fresh sequence: drop any lingering terminal (conflict/error) progress so
+    // the live spinner replaces the stale note instead of racing it.
+    clearRestackProgress(rootPr);
+    void restackStack(rootPr);
+  }, [clearRestackProgress, restackStack, rootPr, staleCount]);
+
+  // The offer button, reused both as the initial control and when re-offered
+  // beside a terminal conflict/error note (so a halted run is never stuck).
+  const restackButton: ReactNode = (
+    <button
+      type="button"
+      onClick={handleRestackStack}
+      className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-warning/40 bg-transparent px-2 py-1 text-xs font-medium text-warning transition-colors hover:bg-warning/10"
+      title="Rebase every stale member onto its parent, in dependency order"
+    >
+      <Layers className="h-3 w-3" />
+      Restack stack ({staleCount} stale, in order)
+    </button>
+  );
+
+  // After a terminal halt (conflict/error), re-offer the button once the stack
+  // is settled (no member mid-rework) and stale members remain — otherwise the
+  // sticky note would hide the control forever.
+  const canRetry = !anyAgent && staleCount > 0;
+
+  let restackControl: ReactNode = null;
+  if (
+    progress !== undefined &&
+    (progress.status === "restacking" || progress.status === "clean")
+  ) {
+    restackControl = (
+      <span className="inline-flex items-center gap-1.5 text-xs text-state-in-review">
+        <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+        Restacking {progress.current}/{progress.total}
+        {progress.current_pr !== "" ? ` — ${progress.current_pr}` : ""}
+      </span>
+    );
+  } else if (progress?.status === "conflict") {
+    restackControl = (
+      <div className="flex flex-col gap-1.5">
+        <span className="inline-flex items-center gap-1.5 text-xs text-warning">
+          <span
+            className="h-1.5 w-1.5 shrink-0 rounded-full bg-warning"
+            aria-hidden="true"
+          />
+          conflict on {progress.current_pr} — resolver dispatched, remaining PRs
+          still stale
+        </span>
+        {canRetry && restackButton}
+      </div>
+    );
+  } else if (progress?.status === "error") {
+    const detail =
+      progress.detail !== undefined && progress.detail !== ""
+        ? ` — ${progress.detail}`
+        : "";
+    restackControl = (
+      <div className="flex flex-col gap-1.5">
+        <span className="inline-flex items-center gap-1.5 text-xs text-danger">
+          <span
+            className="h-1.5 w-1.5 shrink-0 rounded-full bg-danger"
+            aria-hidden="true"
+          />
+          restack halted
+          {progress.current_pr !== "" ? ` on ${progress.current_pr}` : ""}
+          {detail}
+        </span>
+        {canRetry && restackButton}
+      </div>
+    );
+  } else if (staleCount > 0 && !anyAgent) {
+    restackControl = restackButton;
+  }
+
   return (
     <div className="rounded-xl border border-border bg-card/30">
       <div className="flex items-center gap-2 px-3 pb-1.5 pt-2.5">
@@ -89,6 +186,10 @@ export function StackContainer({
           </span>
         </span>
       </div>
+
+      {restackControl !== null && (
+        <div className="px-3 pb-1.5">{restackControl}</div>
+      )}
 
       <div className={cn("px-2 pb-2", density === "compact" ? "space-y-1" : "space-y-2")}>
         {nodes.map(({ review, depth }) => {

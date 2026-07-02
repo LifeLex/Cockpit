@@ -47,6 +47,7 @@ import {
   identityLineMap,
 } from "../diff-parser";
 import type { FileDiff } from "../diff-parser";
+import { pairRequests } from "@/lib/request-pairing";
 import { elapsedSince } from "@/lib/relative-time";
 import { useAppStore } from "../store";
 import { registerCustomThemes } from "@/lib/monaco-themes";
@@ -635,9 +636,13 @@ export function DiffView({
   const listCiChecks = useAppStore((s) => s.listCiChecks);
 
   // -- D10: interdiff (changes since the last review dispatch) --
-  // Only a reworked review with a dispatch snapshot has a meaningful interdiff.
+  // A dispatch snapshot survives the Reworked→InReview reopen (it is cleared
+  // only on the next dispatch), so the "changes since your review" view and the
+  // D1 request pairing apply in BOTH states: Reworked (before reopen) and
+  // InReview (after reopen, where the Approve button lives).
   const hasInterdiff =
-    review.gate_state === "Reworked" && review.dispatch_snapshot != null;
+    review.dispatch_snapshot != null &&
+    (review.gate_state === "Reworked" || review.gate_state === "InReview");
   const [interdiff, setInterdiff] = useState<DiffData | null>(null);
   const [diffSource, setDiffSource] = useState<"interdiff" | "full">("full");
 
@@ -849,9 +854,30 @@ export function DiffView({
     }));
   }, [review.pr]);
 
-  // -- D10: read-only history of what was asked for in the last cycle --
-  const addressedComments = review.dispatch_snapshot?.comments ?? [];
-  const showAddressed = hasInterdiff && addressedComments.length > 0;
+  // -- D1: pair each dispatched request to the interdiff region that answers it.
+  // Paired against the interdiff specifically (not the toggled diff source) so
+  // the checklist + the approve warning always reflect "changes since your
+  // review". Advisory only — the pairing never blocks the gate (§9). --
+  const interdiffFiles = useMemo(
+    () => (interdiff !== null ? parseDiff(interdiff.raw) : []),
+    [interdiff],
+  );
+  const pairings = useMemo(
+    () =>
+      review.dispatch_snapshot != null
+        ? pairRequests(review.dispatch_snapshot, interdiffFiles)
+        : [],
+    [review.dispatch_snapshot, interdiffFiles],
+  );
+  const unmatchedCount = useMemo(
+    () => pairings.filter((p) => p.match === null).length,
+    [pairings],
+  );
+  // Gate on the loaded interdiff (not merely `hasInterdiff`), same as the
+  // Approve warning below: while the interdiff is still fetching, `interdiff` is
+  // null and every request pairs as unmatched — showing the panel then would
+  // flash the requests as unaddressed before the real pairing resolves.
+  const showAddressed = interdiff !== null && pairings.length > 0;
 
   // -- Close inline form on file change --
   useEffect(() => {
@@ -2006,6 +2032,25 @@ export function DiffView({
             <>
               {review.gate_state === "InReview" && (
                 <>
+                  {/* D1: informational nudge only — some dispatched requests have
+                      no matching interdiff change. Never blocks Approve and never
+                      adds a confirm; approve authority is unchanged (§9). Shown
+                      only once the interdiff is resolved so it can't false-alarm
+                      before the pairing data exists. */}
+                  {interdiff !== null && unmatchedCount > 0 && (
+                    <span
+                      className="inline-flex shrink-0 items-center gap-1.5 text-xs text-warning"
+                      title="Some requests you dispatched have no detected change in the interdiff — check them before approving."
+                    >
+                      <span
+                        className="h-1.5 w-1.5 shrink-0 rounded-full bg-warning"
+                        aria-hidden="true"
+                      />
+                      {String(unmatchedCount)} request
+                      {unmatchedCount === 1 ? "" : "s"} without a matching change
+                      — check before approving
+                    </span>
+                  )}
                   {canRequestChanges && (
                     <Button
                       variant="destructive"
@@ -2081,11 +2126,12 @@ export function DiffView({
       {/* ----------------------------------------------------------------- */}
       {showAddressed && (
         <AddressedRequests
-          comments={addressedComments}
+          pairings={pairings}
           open={addressedOpen}
           onToggle={() => {
             setAddressedOpen((prev) => !prev);
           }}
+          onJumpTo={handleJumpTo}
         />
       )}
 

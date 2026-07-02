@@ -560,36 +560,43 @@ mod tests {
         review.base_sha = b_fork.to_string();
         review.mark_stale();
 
-        let session_map = agent::SessionMap::new();
-        let config = agent::SpawnConfig {
-            command: "echo".into(),
-            base_args: vec![],
-            tail_args: vec![],
-        };
+        // spawn_agent resolves logs_dir() from COCKPIT_HOME; pin it to an
+        // owned tempdir under temp_env's lock so parallel env-mutating tests
+        // can't yank the directory mid-spawn (CI flake).
+        let home = tempfile::tempdir().unwrap();
+        temp_env::async_with_vars([("COCKPIT_HOME", Some(home.path().as_os_str()))], async {
+            let session_map = agent::SessionMap::new();
+            let config = agent::SpawnConfig {
+                command: "echo".into(),
+                base_args: vec![],
+                tail_args: vec![],
+            };
 
-        let outcome = restack_or_resolve(
-            &repo,
-            &mut review,
-            "branch-a",
-            dir.path(),
-            &session_map,
-            "http://localhost:9999/hook/stop",
-            &config,
-            None,
-        )
-        .await
-        .unwrap();
+            let outcome = restack_or_resolve(
+                &repo,
+                &mut review,
+                "branch-a",
+                dir.path(),
+                &session_map,
+                "http://localhost:9999/hook/stop",
+                &config,
+                None,
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(outcome, Outcome::Clean);
-        assert!(!review.stale, "stale should be cleared after clean restack");
-        assert!(
-            review.agent.is_none(),
-            "no agent should be spawned on clean restack"
-        );
+            assert_eq!(outcome, Outcome::Clean);
+            assert!(!review.stale, "stale should be cleared after clean restack");
+            assert!(
+                review.agent.is_none(),
+                "no agent should be spawned on clean restack"
+            );
 
-        // base_sha should be updated to the new branch-a tip.
-        let a_tip = branch_tip(&repo, "branch-a");
-        assert_eq!(review.base_sha, a_tip.to_string());
+            // base_sha should be updated to the new branch-a tip.
+            let a_tip = branch_tip(&repo, "branch-a");
+            assert_eq!(review.base_sha, a_tip.to_string());
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -619,43 +626,50 @@ mod tests {
         review.worktree = dir.path().to_path_buf();
         review.mark_stale();
 
-        let session_map = agent::SessionMap::new();
-        let config = agent::SpawnConfig {
-            command: "echo".into(),
-            base_args: vec![],
-            tail_args: vec![],
-        };
+        // spawn_agent resolves logs_dir() from COCKPIT_HOME; pin it to an
+        // owned tempdir under temp_env's lock so parallel env-mutating tests
+        // can't yank the directory mid-spawn (CI flake).
+        let home = tempfile::tempdir().unwrap();
+        temp_env::async_with_vars([("COCKPIT_HOME", Some(home.path().as_os_str()))], async {
+            let session_map = agent::SessionMap::new();
+            let config = agent::SpawnConfig {
+                command: "echo".into(),
+                base_args: vec![],
+                tail_args: vec![],
+            };
 
-        let outcome = restack_or_resolve(
-            &repo,
-            &mut review,
-            "branch-a",
-            dir.path(),
-            &session_map,
-            "http://localhost:9999/hook/stop",
-            &config,
-            None,
-        )
-        .await
-        .unwrap();
+            let outcome = restack_or_resolve(
+                &repo,
+                &mut review,
+                "branch-a",
+                dir.path(),
+                &session_map,
+                "http://localhost:9999/hook/stop",
+                &config,
+                None,
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(outcome, Outcome::ConflictDispatched);
-        assert!(review.stale, "stale should remain on conflict");
-        assert!(
-            review.agent.is_some(),
-            "agent should be spawned on conflict"
-        );
+            assert_eq!(outcome, Outcome::ConflictDispatched);
+            assert!(review.stale, "stale should remain on conflict");
+            assert!(
+                review.agent.is_some(),
+                "agent should be spawned on conflict"
+            );
 
-        let agent_run = review.agent.as_ref().unwrap();
-        assert_eq!(agent_run.mode, AgentMode::Restack);
-        assert!(agent_run.pid > 0);
+            let agent_run = review.agent.as_ref().unwrap();
+            assert_eq!(agent_run.mode, AgentMode::Restack);
+            assert!(agent_run.pid > 0);
 
-        // Verify session registered.
-        let entry = session_map
-            .find_by_object(review.id.as_str())
-            .expect("session should be registered for the review");
-        let session_entry = session_map.get(&entry).unwrap();
-        assert_eq!(session_entry.mode, AgentMode::Restack);
+            // Verify session registered.
+            let entry = session_map
+                .find_by_object(review.id.as_str())
+                .expect("session should be registered for the review");
+            let session_entry = session_map.get(&entry).unwrap();
+            assert_eq!(session_entry.mode, AgentMode::Restack);
+        })
+        .await;
     }
 
     #[test]
@@ -714,29 +728,36 @@ mod tests {
         let mut review = make_review("b", "branch-b", "branch-a", &["a"], &[]);
         assert!(!review.stale);
 
-        let session_map = agent::SessionMap::new();
-        let config = agent::SpawnConfig {
-            command: "echo".into(),
-            base_args: vec![],
-            tail_args: vec![],
-        };
+        // spawn_agent resolves logs_dir() from COCKPIT_HOME; pin it to an
+        // owned tempdir under temp_env's lock so parallel env-mutating tests
+        // can't yank the directory mid-spawn (CI flake).
+        let home = tempfile::tempdir().unwrap();
+        temp_env::async_with_vars([("COCKPIT_HOME", Some(home.path().as_os_str()))], async {
+            let session_map = agent::SessionMap::new();
+            let config = agent::SpawnConfig {
+                command: "echo".into(),
+                base_args: vec![],
+                tail_args: vec![],
+            };
 
-        let err = restack_or_resolve(
-            &repo,
-            &mut review,
-            "branch-a",
-            dir.path(),
-            &session_map,
-            "http://localhost:9999/hook/stop",
-            &config,
-            None,
-        )
-        .await
-        .unwrap_err();
+            let err = restack_or_resolve(
+                &repo,
+                &mut review,
+                "branch-a",
+                dir.path(),
+                &session_map,
+                "http://localhost:9999/hook/stop",
+                &config,
+                None,
+            )
+            .await
+            .unwrap_err();
 
-        assert!(
-            matches!(err, Error::NotStale(ref id) if id == &ReviewId::new("b")),
-            "expected NotStale error, got {err:?}"
-        );
+            assert!(
+                matches!(err, Error::NotStale(ref id) if id == &ReviewId::new("b")),
+                "expected NotStale error, got {err:?}"
+            );
+        })
+        .await;
     }
 }

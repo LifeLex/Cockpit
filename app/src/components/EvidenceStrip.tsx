@@ -20,9 +20,10 @@ import type { RiskFlag } from "../bindings/RiskFlag";
 import type { SizeClass } from "../bindings/SizeClass";
 import type { WeakeningKind } from "../bindings/WeakeningKind";
 import type { DiffSide } from "../bindings/DiffSide";
+import type { FindingsBreakdown } from "./FindingsPanel";
 import { checkOutcome } from "@/lib/ci";
 import { cn } from "@/lib/utils";
-import { Gauge, ShieldAlert, TriangleAlert } from "lucide-react";
+import { Gauge, ScanSearch, ShieldAlert, TriangleAlert } from "lucide-react";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -41,6 +42,14 @@ interface EvidenceStripProps {
    * suspected weakening jumps straight to its hunk.
    */
   readonly onJumpTo?: (path: string, side: DiffSide, line: number) => void;
+  /**
+   * Per-severity counts of the non-dismissed advisory findings. When the total
+   * is positive the strip shows a "N findings" chip toned by the highest
+   * severity present; null or all-zero renders no chip.
+   */
+  readonly findingsCount?: FindingsBreakdown | null;
+  /** Expand + scroll to the findings panel; wired to the findings chip. */
+  readonly onShowFindings?: (() => void) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +211,13 @@ function failingCheckName(checks: readonly CiCheck[]): string | null {
   return failing.workflow !== "" ? failing.workflow : failing.name;
 }
 
+/** Chip tone for the findings chip: the highest severity present drives it. */
+function findingsTone(breakdown: FindingsBreakdown): ChipTone {
+  if (breakdown.critical > 0) return "fail";
+  if (breakdown.warning > 0) return "warning";
+  return "neutral";
+}
+
 // ---------------------------------------------------------------------------
 // EvidenceStrip
 // ---------------------------------------------------------------------------
@@ -210,6 +226,8 @@ export function EvidenceStrip({
   evidence,
   ciChecks,
   onJumpTo,
+  findingsCount,
+  onShowFindings,
 }: EvidenceStripProps) {
   if (evidence === null) return null;
 
@@ -221,12 +239,33 @@ export function EvidenceStrip({
     testDelta.assertions_removed > 0;
   const failingName = ci !== null && ciChecks ? failingCheckName(ciChecks) : null;
 
+  const findingsTotal =
+    findingsCount != null
+      ? findingsCount.info + findingsCount.warning + findingsCount.critical
+      : 0;
+
   return (
     <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-border bg-card/60 px-4 py-1.5">
       <span className="mr-0.5 inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
         <Gauge className="h-3 w-3" />
         Evidence
       </span>
+
+      {/* Advisory pre-review findings — a triage jump-off, never a verdict. */}
+      {findingsCount != null && findingsTotal > 0 && (
+        <Chip
+          tone={findingsTone(findingsCount)}
+          title={`${String(findingsTotal)} pre-review finding${
+            findingsTotal === 1 ? "" : "s"
+          } — advisory`}
+          onClick={onShowFindings}
+        >
+          <ScanSearch className="h-3 w-3" />
+          <span className="text-foreground">
+            {String(findingsTotal)} finding{findingsTotal === 1 ? "" : "s"}
+          </span>
+        </Chip>
+      )}
 
       {/* CI rollup (x/y + failing workflow name when available). */}
       {ci !== null && ci.total > 0 && (

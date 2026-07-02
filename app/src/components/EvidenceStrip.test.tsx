@@ -81,4 +81,34 @@ describe("EvidenceStrip", () => {
     );
     expect(onJumpTo).toHaveBeenCalledWith("tests/foo.rs", "Old", 3);
   });
+
+  it("shows no findings chip when the count is null or all-zero", () => {
+    const { rerender } = render(
+      <EvidenceStrip evidence={makeEvidence()} findingsCount={null} />,
+    );
+    expect(screen.queryByText(/finding/)).not.toBeInTheDocument();
+
+    rerender(
+      <EvidenceStrip
+        evidence={makeEvidence()}
+        findingsCount={{ info: 0, warning: 0, critical: 0 }}
+      />,
+    );
+    expect(screen.queryByText(/finding/)).not.toBeInTheDocument();
+  });
+
+  it("shows a findings chip and expands the panel when clicked", () => {
+    const onShowFindings = vi.fn();
+    render(
+      <EvidenceStrip
+        evidence={makeEvidence()}
+        findingsCount={{ info: 1, warning: 2, critical: 0 }}
+        onShowFindings={onShowFindings}
+      />,
+    );
+    const chip = screen.getByRole("button", { name: /3 findings/ });
+    expect(chip).toBeInTheDocument();
+    fireEvent.click(chip);
+    expect(onShowFindings).toHaveBeenCalledOnce();
+  });
 });

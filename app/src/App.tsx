@@ -87,11 +87,16 @@ type CompletionOutcome = CompletionEventPayload["outcome"];
  * landed a commit (`"reworked"` — ready to re-review) from a no-op/failed run
  * (`"failed"` — comments are preserved for another cycle), since those demand
  * very different follow-up from the reviewer.
+ *
+ * For a Review (pre-review) run, `findingsCount` carries how many advisory
+ * findings landed (null when the completed review is not the active one, so we
+ * fall back to the generic copy).
  */
 function completionNotification(
   mode: AgentMode,
   outcome: CompletionOutcome,
   branch: string,
+  findingsCount: number | null,
 ): { readonly title: string; readonly body: string } {
   switch (mode) {
     case "Fix":
@@ -115,11 +120,22 @@ function completionNotification(
         title: "Plan Rework Complete",
         body: "Plan agent finished reworking",
       };
-    case "Review":
+    case "Review": {
+      if (findingsCount === null) {
+        return {
+          title: "Pre-review Complete",
+          body: `Pre-review finished on ${branch}`,
+        };
+      }
+      const label =
+        findingsCount === 0
+          ? "no findings"
+          : `${String(findingsCount)} finding${findingsCount === 1 ? "" : "s"}`;
       return {
         title: "Pre-review Complete",
-        body: `Pre-review finished on ${branch}`,
+        body: `Pre-review complete — ${label}`,
       };
+    }
     default:
       return assertNever(mode);
   }
@@ -350,18 +366,36 @@ function App() {
       if (currentView.kind === "plan") {
         void fetchPlan(currentView.project);
       }
-      void refreshActiveReview();
 
-      // Suppress the notification for a run the user already stopped — otherwise
-      // the killed process's straggler completion would double-toast.
-      if (settledLocally) return;
+      // Await the active-review refresh so a Review-mode toast can report the
+      // freshly parsed findings count. Kept in an IIFE so the listener callback
+      // stays synchronous.
+      void (async () => {
+        await refreshActiveReview();
 
-      // Best-effort desktop notification, outcome-aware so a failed rework reads
-      // differently from one that landed a commit.
-      const current = useAppStore.getState().activeReview;
-      const branch = current !== null ? current.branch : "a review";
-      const { title, body } = completionNotification(mode, outcome, branch);
-      void sendNotification({ title, body });
+        // Suppress the notification for a run the user already stopped —
+        // otherwise the killed process's straggler completion would double-toast.
+        if (settledLocally) return;
+
+        // Best-effort desktop notification, outcome-aware so a failed rework
+        // reads differently from one that landed a commit.
+        const current = useAppStore.getState().activeReview;
+        const branch = current !== null ? current.branch : "a review";
+        // For a pre-review, surface how many advisory findings landed — but only
+        // when the refreshed active review is the one that completed; otherwise
+        // fall back to the generic copy (null).
+        const findingsCount =
+          mode === "Review" && current !== null && current.pr === object_id
+            ? current.review_findings.length
+            : null;
+        const { title, body } = completionNotification(
+          mode,
+          outcome,
+          branch,
+          findingsCount,
+        );
+        void sendNotification({ title, body });
+      })();
     });
 
     // D4: the notify poller emits `board-updated` (empty payload) when it detects

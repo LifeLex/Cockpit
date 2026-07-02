@@ -282,6 +282,8 @@ pub fn run() {
             commands::open_review,
             commands::get_review_diff,
             commands::get_interdiff,
+            commands::get_teammate_interdiff,
+            commands::fetch_conversation,
             commands::get_evidence,
             commands::get_trajectory_summary,
             commands::get_file_pair,

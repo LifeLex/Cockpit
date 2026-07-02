@@ -19,9 +19,9 @@ use cockpit_core::diff_signals::{EvidenceSummary, compute_diff_signals};
 use cockpit_core::gate::Gated;
 use cockpit_core::kickoff::{self, KickoffResult};
 use cockpit_core::model::{
-    AgentMode, Anchor, Artifact, CiSummary, Comment, CommentId, CommentOrigin, DiffData, DiffSide,
-    FilePair, GateState, PlanDoc, PrRef, Project, ProjectId, ProjectPlan, ProjectRef, Review,
-    ReviewSource,
+    AgentMode, Anchor, Artifact, CiSummary, Comment, CommentId, CommentOrigin, ConversationItem,
+    DiffData, DiffSide, FilePair, GateState, PlanDoc, PrRef, Project, ProjectId, ProjectPlan,
+    ProjectRef, ProjectSource, Review, ReviewSource,
 };
 use cockpit_core::plan_parser;
 use cockpit_core::restack;
@@ -147,6 +147,41 @@ pub async fn get_interdiff(
     })?;
     let raw = github::compare(&repo_slug, &snapshot.reviewed_sha, &review.head_sha).await?;
     Ok(DiffData { raw })
+}
+
+/// Fetch a PR's GitHub conversation (reviews, inline + issue comments) as
+/// read-only context and store it on the review (E1).
+///
+/// Requires a `repo_slug` (typed error otherwise). Reads via
+/// [`github::fetch_conversation`], overwrites the review's `conversation` with
+/// the merged chronological list, and returns it. The frontend calls this on
+/// opening a review-requested PR and from a refresh button.
+///
+/// This is a STATUS-tier read: it never advances the gate and never blocks the
+/// loop. The stored conversation is external context, distinct from cockpit's
+/// own ephemeral [`Comment`]s (Invariant 4).
+#[tauri::command]
+pub async fn fetch_conversation(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+) -> Result<Vec<ConversationItem>, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    let repo_slug = review.repo_slug.clone().ok_or_else(|| CommandError {
+        message: format!("Review {pr} has no repo slug; cannot fetch its GitHub conversation"),
+    })?;
+    let pr_number = pr_number_from_ref(&pr).ok_or_else(|| CommandError {
+        message: format!("Could not parse a PR number from: {pr}"),
+    })?;
+
+    let items = github::fetch_conversation(&repo_slug, pr_number).await?;
+    state.reviews.update(&pr_ref, |r| {
+        r.conversation = items.clone();
+    });
+    Ok(items)
 }
 
 /// Return the review-time evidence bundle for a PR (B1 + D2).
@@ -941,7 +976,59 @@ pub async fn submit_github_review(
         }
     }
 
+    // Mark the revision this GitHub review covered so a later "changes since your
+    // review" interdiff (E2) can diff against it. Any verdict counts. Only when
+    // the head SHA is known (imported PRs pin it at fetch).
+    if !review.head_sha.is_empty() {
+        state.reviews.update(&pr_ref, |r| {
+            r.last_reviewed_sha = Some(r.head_sha.clone());
+        });
+    }
+
     Ok(result)
+}
+
+/// Return the interdiff for a teammate's PR since the user's last GitHub review
+/// (E2): the changes a review-requested PR received after the user reviewed it.
+///
+/// Requires a recorded `last_reviewed_sha` (set by [`submit_github_review`]), a
+/// `repo_slug`, and a current `head_sha` that is non-empty and differs from the
+/// last-reviewed revision (typed errors otherwise). Diffs
+/// `last_reviewed_sha..head_sha` via the GitHub compare API so the re-reviewer
+/// sees only what changed, not the whole PR again. Returned in the same
+/// [`DiffData`] shape as [`get_review_diff`].
+#[tauri::command]
+pub async fn get_teammate_interdiff(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+) -> Result<DiffData, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    let last = review
+        .last_reviewed_sha
+        .clone()
+        .ok_or_else(|| CommandError {
+            message: format!(
+                "Review {pr} has no prior review recorded; submit a GitHub review first"
+            ),
+        })?;
+    let repo_slug = review.repo_slug.clone().ok_or_else(|| CommandError {
+        message: format!("Review {pr} has no repo slug; cannot compute a teammate interdiff"),
+    })?;
+
+    // A non-empty head that differs from the last-reviewed revision is the whole
+    // point: without new commits there is nothing to re-review.
+    if review.head_sha.is_empty() || review.head_sha == last {
+        return Err(CommandError {
+            message: format!("Review {pr} has no new commits since your last review"),
+        });
+    }
+
+    let raw = github::compare(&repo_slug, &last, &review.head_sha).await?;
+    Ok(DiffData { raw })
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,6 +1348,39 @@ fn plan_for(state: &AppState, id: &ProjectId) -> Result<ProjectPlan, CommandErro
     })
 }
 
+/// Best-effort plan-prompt issue lines for a project's Linear issues (E3).
+///
+/// For a Linear-backed project, fetches its issues and formats each into a
+/// bullet line via [`kickoff::plan_issue_line`] — the identifier, title, and a
+/// capped description gist (the full description reaches the reviewer via each
+/// review's intent; the planner only needs enough to scope the work).
+///
+/// Returns an empty list for an ad-hoc project, a missing project, no API key,
+/// or any Linear failure, so plan generation never blocks on an external
+/// round-trip (Invariant 1) — an empty list renders identically to the pre-E3
+/// "No issues listed." plan prompt.
+async fn plan_issue_lines(state: &Arc<AppState>, id: &ProjectId) -> Vec<String> {
+    let Some(project) = state.projects.get(id) else {
+        return Vec::new();
+    };
+    let ProjectSource::Linear(linear_id) = &project.source else {
+        return Vec::new();
+    };
+    let Some(api_key) = Config::load().ok().and_then(|c| c.linear_api_key) else {
+        return Vec::new();
+    };
+
+    let client = reqwest::Client::new();
+    let project_ref = ProjectRef::new(linear_id);
+    match linear::fetch_project_issues(&client, &api_key, &project_ref).await {
+        Ok(data) => data.issues.iter().map(kickoff::plan_issue_line).collect(),
+        Err(e) => {
+            eprintln!("generate_plan: Linear issue fetch failed for {linear_id}: {e}");
+            Vec::new()
+        }
+    }
+}
+
 /// Generate the plan for a project by spawning a planner agent.
 ///
 /// This is an artifact-filling spawn: it does **not** move the gate. A `Pending`
@@ -1332,10 +1452,14 @@ pub async fn generate_plan(
     // Plan generation has no diff yet — surface universal (untagged) skills.
     // Discovery failures are non-fatal.
     let skills = cockpit_core::skills::relevant_for_diff("");
+    // Give the planner the project's issues (with a description gist each) when
+    // they can be fetched; best-effort, so an ad-hoc project or a Linear failure
+    // falls back to an empty list without blocking plan generation (E3).
+    let issue_lines = plan_issue_lines(state.inner(), &id).await;
     let plan_input = cockpit_core::prompt::PlanInput {
         intent: &intent,
         custom_preamble: preamble.as_deref(),
-        issues: &[],
+        issues: &issue_lines,
         current_plan: Some(&plan.doc),
         output_path: Some(&plan_path),
         skills: &skills,

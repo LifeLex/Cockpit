@@ -11,7 +11,8 @@ use tokio::process::Command;
 use ts_rs::TS;
 
 use crate::model::{
-    Anchor, CiSummary, Comment, CommentId, CommentOrigin, DiffSide, IssueRef, PrRef,
+    Anchor, CiSummary, Comment, CommentId, CommentOrigin, ConversationItem, ConversationKind,
+    DiffSide, IssueRef, PrRef,
 };
 
 // ---------------------------------------------------------------------------
@@ -1583,6 +1584,254 @@ pub async fn submit_review(
 }
 
 // ---------------------------------------------------------------------------
+// Conversation ingestion (read-only GitHub context)
+// ---------------------------------------------------------------------------
+
+/// A GitHub `user` object, from which only the login is needed.
+#[derive(Debug, Deserialize)]
+struct UserRow {
+    /// The account's login handle. Defaulted so a null/absent user (a deleted
+    /// account renders as a "ghost") coalesces to an empty author.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    login: String,
+}
+
+/// The author login of an optional GitHub `user`, empty when absent.
+fn login_of(user: Option<UserRow>) -> String {
+    user.map(|u| u.login).unwrap_or_default()
+}
+
+/// A row from `GET /repos/{slug}/pulls/{n}/reviews`.
+#[derive(Debug, Deserialize)]
+struct ReviewRow {
+    /// GitHub's numeric review id.
+    id: u64,
+    /// The reviewer.
+    #[serde(default)]
+    user: Option<UserRow>,
+    /// The review's summary body (may be empty for a state-only review).
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    body: String,
+    /// Verdict: `APPROVED` / `CHANGES_REQUESTED` / `COMMENTED` (kept raw).
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    state: String,
+    /// ISO-8601 submission timestamp (absent for an unsubmitted review).
+    #[serde(default)]
+    submitted_at: Option<String>,
+    /// Permalink to the review.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    html_url: String,
+}
+
+/// A row from `GET /repos/{slug}/pulls/{n}/comments` (inline review comments).
+#[derive(Debug, Deserialize)]
+struct ReviewCommentRow {
+    /// GitHub's numeric comment id.
+    id: u64,
+    /// The comment author.
+    #[serde(default)]
+    user: Option<UserRow>,
+    /// The comment body.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    body: String,
+    /// Repo-relative path the comment is anchored to.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    path: String,
+    /// Line in the current diff the comment is anchored to.
+    #[serde(default)]
+    line: Option<u32>,
+    /// Line in the original diff, used as a fallback when `line` is null (an
+    /// outdated comment whose anchor no longer maps to the current diff).
+    #[serde(default)]
+    original_line: Option<u32>,
+    /// GitHub side label: `"LEFT"` (old) or `"RIGHT"` (new).
+    #[serde(default)]
+    side: Option<String>,
+    /// ISO-8601 creation timestamp.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    created_at: String,
+    /// Permalink to the comment.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    html_url: String,
+}
+
+/// A row from `GET /repos/{slug}/issues/{n}/comments` (top-level PR comments).
+#[derive(Debug, Deserialize)]
+struct IssueCommentRow {
+    /// GitHub's numeric comment id.
+    id: u64,
+    /// The comment author.
+    #[serde(default)]
+    user: Option<UserRow>,
+    /// The comment body.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    body: String,
+    /// ISO-8601 creation timestamp.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    created_at: String,
+    /// Permalink to the comment.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    html_url: String,
+}
+
+/// Map GitHub's review-comment `side` label to a [`DiffSide`].
+///
+/// `"RIGHT"` is the new (post-change) side, `"LEFT"` the old; anything else
+/// (including a null/absent side) yields `None`.
+fn parse_diff_side(side: Option<&str>) -> Option<DiffSide> {
+    match side {
+        Some("RIGHT") => Some(DiffSide::New),
+        Some("LEFT") => Some(DiffSide::Old),
+        _ => None,
+    }
+}
+
+/// A non-empty permalink wrapped in `Some`, or `None` when GitHub omitted it.
+fn optional_url(url: String) -> Option<String> {
+    (!url.is_empty()).then_some(url)
+}
+
+/// Parse `pulls/{n}/reviews` JSON into [`ConversationItem`]s (kind `Review`).
+///
+/// A fully-empty row (no body **and** no state) is skipped, but a state-only
+/// review (e.g. an `APPROVED` with no body) is kept — the verdict alone is
+/// signal. Ids are `"review-{github id}"`.
+fn parse_reviews_json(json: &str) -> Result<Vec<ConversationItem>, Error> {
+    let rows: Vec<ReviewRow> =
+        serde_json::from_str(json).map_err(|e| Error::ParseOutput(e.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            // Skip only fully-empty rows; a state-only review is retained.
+            if row.body.trim().is_empty() && row.state.trim().is_empty() {
+                return None;
+            }
+            Some(ConversationItem {
+                id: format!("review-{}", row.id),
+                kind: ConversationKind::Review,
+                author: login_of(row.user),
+                body: row.body,
+                path: None,
+                line: None,
+                side: None,
+                state: (!row.state.is_empty()).then_some(row.state),
+                created_at: row.submitted_at.unwrap_or_default(),
+                url: optional_url(row.html_url),
+            })
+        })
+        .collect())
+}
+
+/// Parse `pulls/{n}/comments` JSON into [`ConversationItem`]s (kind
+/// `ReviewComment`).
+///
+/// The anchor line uses `line`, falling back to `original_line` for an outdated
+/// comment. Empty-body rows are skipped. Ids are `"review-comment-{github id}"`.
+fn parse_review_comments_json(json: &str) -> Result<Vec<ConversationItem>, Error> {
+    let rows: Vec<ReviewCommentRow> =
+        serde_json::from_str(json).map_err(|e| Error::ParseOutput(e.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            if row.body.trim().is_empty() {
+                return None;
+            }
+            Some(ConversationItem {
+                id: format!("review-comment-{}", row.id),
+                kind: ConversationKind::ReviewComment,
+                author: login_of(row.user),
+                body: row.body,
+                path: (!row.path.is_empty()).then(|| std::path::PathBuf::from(&row.path)),
+                line: row.line.or(row.original_line),
+                side: parse_diff_side(row.side.as_deref()),
+                state: None,
+                created_at: row.created_at,
+                url: optional_url(row.html_url),
+            })
+        })
+        .collect())
+}
+
+/// Parse `issues/{n}/comments` JSON into [`ConversationItem`]s (kind
+/// `IssueComment`).
+///
+/// Empty-body rows are skipped. Ids are `"issue-comment-{github id}"`.
+fn parse_issue_comments_json(json: &str) -> Result<Vec<ConversationItem>, Error> {
+    let rows: Vec<IssueCommentRow> =
+        serde_json::from_str(json).map_err(|e| Error::ParseOutput(e.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            if row.body.trim().is_empty() {
+                return None;
+            }
+            Some(ConversationItem {
+                id: format!("issue-comment-{}", row.id),
+                kind: ConversationKind::IssueComment,
+                author: login_of(row.user),
+                body: row.body,
+                path: None,
+                line: None,
+                side: None,
+                state: None,
+                created_at: row.created_at,
+                url: optional_url(row.html_url),
+            })
+        })
+        .collect())
+}
+
+/// Run `gh api <endpoint>` and return its stdout as text.
+///
+/// A non-zero exit captures stderr into [`Error::GhCommand`]. List endpoints
+/// return `[]` (with a success exit) for an empty result, so a PR with no
+/// reviews/comments parses to an empty vec rather than erroring.
+async fn gh_api_read(endpoint: &str) -> Result<String, Error> {
+    let output = Command::new("gh").args(["api", endpoint]).output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Fetch a PR's GitHub conversation for read-only context (E1).
+///
+/// Reads submitted reviews (`pulls/{n}/reviews`), inline review comments
+/// (`pulls/{n}/comments`), and top-level issue comments (`issues/{n}/comments`)
+/// via three concurrent `gh api` calls ([`tokio::join!`]), maps each into a
+/// [`ConversationItem`], and merges them into one chronological list.
+///
+/// The merged list is sorted by `created_at`: GitHub emits ISO-8601 timestamps,
+/// which sort chronologically as plain strings, so a lexicographic compare is
+/// correct. This is a STATUS-tier read — it never mutates review state and never
+/// blocks the loop.
+pub async fn fetch_conversation(
+    repo_slug: &str,
+    pr_number: u64,
+) -> Result<Vec<ConversationItem>, Error> {
+    // `per_page=100` returns the full conversation in one call for all but the
+    // busiest PRs, without the pagination-merge complexity of `--paginate`.
+    let reviews_ep = format!("repos/{repo_slug}/pulls/{pr_number}/reviews?per_page=100");
+    let review_comments_ep = format!("repos/{repo_slug}/pulls/{pr_number}/comments?per_page=100");
+    let issue_comments_ep = format!("repos/{repo_slug}/issues/{pr_number}/comments?per_page=100");
+
+    let (reviews, review_comments, issue_comments) = tokio::join!(
+        gh_api_read(&reviews_ep),
+        gh_api_read(&review_comments_ep),
+        gh_api_read(&issue_comments_ep),
+    );
+
+    let mut items = parse_reviews_json(&reviews?)?;
+    items.extend(parse_review_comments_json(&review_comments?)?);
+    items.extend(parse_issue_comments_json(&issue_comments?)?);
+
+    // ISO-8601 timestamps sort chronologically as plain strings.
+    items.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    Ok(items)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2655,5 +2904,192 @@ index 1111111..2222222 100644
             matches!(result, Err(Error::ParseOutput(_))),
             "malformed JSON must be a ParseOutput error, got {result:?}"
         );
+    }
+
+    // -- conversation ingestion (E1) --
+
+    /// `pulls/{n}/reviews` fixture in the GitHub REST shape: an approval with a
+    /// body, a state-only approval (empty body — kept), a changes-request, and a
+    /// fully-empty row (no body and no state — skipped).
+    const REVIEWS_FIXTURE: &str = r#"[
+        {
+            "id": 80,
+            "user": { "login": "octocat" },
+            "body": "Looks good to me.",
+            "state": "APPROVED",
+            "submitted_at": "2019-11-17T17:43:43Z",
+            "html_url": "https://github.com/o/r/pull/12#pullrequestreview-80"
+        },
+        {
+            "id": 81,
+            "user": { "login": "hubot" },
+            "body": "",
+            "state": "APPROVED",
+            "submitted_at": "2019-11-18T09:00:00Z",
+            "html_url": "https://github.com/o/r/pull/12#pullrequestreview-81"
+        },
+        {
+            "id": 82,
+            "user": { "login": "monalisa" },
+            "body": "Please fix the error handling.",
+            "state": "CHANGES_REQUESTED",
+            "submitted_at": "2019-11-19T12:30:00Z",
+            "html_url": "https://github.com/o/r/pull/12#pullrequestreview-82"
+        },
+        {
+            "id": 83,
+            "user": null,
+            "body": "",
+            "state": "",
+            "submitted_at": null,
+            "html_url": ""
+        }
+    ]"#;
+
+    #[test]
+    fn parse_reviews_keeps_state_only_skips_fully_empty() {
+        let items = parse_reviews_json(REVIEWS_FIXTURE).expect("reviews fixture parses");
+        // The fully-empty row (id 83) is dropped; the state-only one (id 81) is kept.
+        assert_eq!(items.len(), 3);
+
+        assert_eq!(items[0].id, "review-80");
+        assert_eq!(items[0].kind, ConversationKind::Review);
+        assert_eq!(items[0].author, "octocat");
+        assert_eq!(items[0].state.as_deref(), Some("APPROVED"));
+        assert_eq!(items[0].created_at, "2019-11-17T17:43:43Z");
+        assert_eq!(
+            items[0].url.as_deref(),
+            Some("https://github.com/o/r/pull/12#pullrequestreview-80")
+        );
+
+        // The state-only approval is retained (an APPROVED with no body is signal).
+        assert_eq!(items[1].id, "review-81");
+        assert!(items[1].body.is_empty());
+        assert_eq!(items[1].state.as_deref(), Some("APPROVED"));
+
+        assert_eq!(items[2].id, "review-82");
+        assert_eq!(items[2].state.as_deref(), Some("CHANGES_REQUESTED"));
+    }
+
+    #[test]
+    fn parse_reviews_ghost_author_is_empty() {
+        // A row authored by a deleted account (`user: null`) keeps the row (it has
+        // state) but yields an empty author rather than failing the parse.
+        let json = r#"[
+            {"id": 5, "user": null, "body": "still relevant", "state": "COMMENTED",
+             "submitted_at": "2020-01-01T00:00:00Z", "html_url": "https://x/1"}
+        ]"#;
+        let items = parse_reviews_json(json).expect("parses");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].author, "");
+    }
+
+    /// `pulls/{n}/comments` fixture: a current inline comment on the new side, and
+    /// an outdated one whose `line` is null (fall back to `original_line`).
+    const REVIEW_COMMENTS_FIXTURE: &str = r#"[
+        {
+            "id": 10,
+            "user": { "login": "octocat" },
+            "body": "This should be a match, not an if.",
+            "path": "src/main.rs",
+            "line": 42,
+            "original_line": 40,
+            "side": "RIGHT",
+            "created_at": "2011-04-14T16:00:49Z",
+            "html_url": "https://github.com/o/r/pull/1#discussion_r10"
+        },
+        {
+            "id": 11,
+            "user": { "login": "hubot" },
+            "body": "Was this removed intentionally?",
+            "path": "src/old.rs",
+            "line": null,
+            "original_line": 7,
+            "side": "LEFT",
+            "created_at": "2011-04-15T09:00:00Z",
+            "html_url": "https://github.com/o/r/pull/1#discussion_r11"
+        },
+        {
+            "id": 12,
+            "user": { "login": "ghost" },
+            "body": "   ",
+            "path": "src/blank.rs",
+            "line": 1,
+            "original_line": 1,
+            "side": "RIGHT",
+            "created_at": "2011-04-16T09:00:00Z",
+            "html_url": "https://github.com/o/r/pull/1#discussion_r12"
+        }
+    ]"#;
+
+    #[test]
+    fn parse_review_comments_maps_line_and_side() {
+        let items =
+            parse_review_comments_json(REVIEW_COMMENTS_FIXTURE).expect("comments fixture parses");
+        // The whitespace-only body (id 12) is skipped.
+        assert_eq!(items.len(), 2);
+
+        assert_eq!(items[0].id, "review-comment-10");
+        assert_eq!(items[0].kind, ConversationKind::ReviewComment);
+        assert_eq!(
+            items[0].path.as_deref(),
+            Some(std::path::Path::new("src/main.rs"))
+        );
+        assert_eq!(items[0].line, Some(42));
+        assert_eq!(items[0].side, Some(DiffSide::New));
+        assert!(items[0].state.is_none());
+
+        // `line` is null, so `original_line` (7) is used; LEFT maps to the old side.
+        assert_eq!(items[1].id, "review-comment-11");
+        assert_eq!(items[1].line, Some(7));
+        assert_eq!(items[1].side, Some(DiffSide::Old));
+    }
+
+    /// `issues/{n}/comments` fixture: a top-level PR comment plus an empty one.
+    const ISSUE_COMMENTS_FIXTURE: &str = r#"[
+        {
+            "id": 1,
+            "user": { "login": "octocat" },
+            "body": "Rebased on main, ready for another look.",
+            "created_at": "2011-04-14T16:00:49Z",
+            "html_url": "https://github.com/o/r/pull/1#issuecomment-1"
+        },
+        {
+            "id": 2,
+            "user": { "login": "hubot" },
+            "body": "",
+            "created_at": "2011-04-14T17:00:00Z",
+            "html_url": "https://github.com/o/r/pull/1#issuecomment-2"
+        }
+    ]"#;
+
+    #[test]
+    fn parse_issue_comments_skips_empty_body() {
+        let items = parse_issue_comments_json(ISSUE_COMMENTS_FIXTURE)
+            .expect("issue comments fixture parses");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "issue-comment-1");
+        assert_eq!(items[0].kind, ConversationKind::IssueComment);
+        assert_eq!(items[0].author, "octocat");
+        assert!(items[0].path.is_none());
+        assert!(items[0].line.is_none());
+        assert!(items[0].side.is_none());
+        assert!(items[0].state.is_none());
+    }
+
+    #[test]
+    fn parse_empty_arrays_yield_no_items() {
+        // A PR with no reviews/comments returns `[]` from `gh api`, not an error.
+        assert!(parse_reviews_json("[]").expect("parses").is_empty());
+        assert!(parse_review_comments_json("[]").expect("parses").is_empty());
+        assert!(parse_issue_comments_json("[]").expect("parses").is_empty());
+    }
+
+    #[test]
+    fn parse_diff_side_labels() {
+        assert_eq!(parse_diff_side(Some("RIGHT")), Some(DiffSide::New));
+        assert_eq!(parse_diff_side(Some("LEFT")), Some(DiffSide::Old));
+        assert_eq!(parse_diff_side(None), None);
+        assert_eq!(parse_diff_side(Some("weird")), None);
     }
 }

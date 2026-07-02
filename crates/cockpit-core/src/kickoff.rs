@@ -181,7 +181,10 @@ fn build_review(
         issue: issue.clone(),
         pr: PrRef::new(format!("pending-{}", issue.as_str())),
         title: String::new(),
-        body: String::new(),
+        // Seed the intent from the Linear issue description (E3): the intent
+        // panel and rework prompts read `body`, so a kickoff review starts with
+        // the "what was asked" text rather than an empty string.
+        body: issue_data.description.clone(),
         branch,
         base,
         base_sha: String::new(),
@@ -443,6 +446,50 @@ pub fn assemble_implement_prompt(
 }
 
 // ---------------------------------------------------------------------------
+// Plan-prompt issue lines
+// ---------------------------------------------------------------------------
+
+/// Maximum characters of an issue's description included in a plan-prompt line.
+///
+/// The full description reaches the reviewer via each review's intent
+/// ([`crate::model::Review::body`]); the planner only needs a gist to scope the
+/// work, so a long description is capped here to keep the plan prompt bounded.
+const PLAN_ISSUE_DESC_MAX_CHARS: usize = 300;
+
+/// Format a Linear issue as a single plan-prompt bullet line (E3).
+///
+/// The line is `"<identifier> <title>"`, with a capped one-line gist of the
+/// description appended after `": "` when the issue has one. An issue with **no**
+/// description (the common case, and the serde default) yields exactly
+/// `"<identifier> <title>"` with no trailing separator, so a description-less
+/// issue list is byte-identical to the pre-E3 line format.
+pub fn plan_issue_line(issue: &linear::IssueNode) -> String {
+    let base = format!("{} {}", issue.identifier, issue.title);
+    match description_gist(&issue.description, PLAN_ISSUE_DESC_MAX_CHARS) {
+        Some(gist) => format!("{base}: {gist}"),
+        None => base,
+    }
+}
+
+/// Collapse a description to a single line and cap it to `max_chars` characters.
+///
+/// Returns `None` when the description is empty (so the caller omits the
+/// separator entirely). Whitespace runs — including newlines — collapse to a
+/// single space so the gist stays on one line; an over-long gist is truncated on
+/// a `char` boundary (never mid-UTF-8) with a trailing ellipsis.
+fn description_gist(description: &str, max_chars: usize) -> Option<String> {
+    let collapsed = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() <= max_chars {
+        return Some(collapsed);
+    }
+    let truncated: String = collapsed.chars().take(max_chars).collect();
+    Some(format!("{truncated}..."))
+}
+
+// ---------------------------------------------------------------------------
 // Project construction
 // ---------------------------------------------------------------------------
 
@@ -535,12 +582,13 @@ mod tests {
     use super::*;
     use crate::model::{GateState, IssueRef, ReviewId};
 
-    /// Build a minimal `IssueNode` for testing.
+    /// Build a minimal `IssueNode` for testing (no description).
     fn make_issue_node(identifier: &str, branch: &str) -> linear::IssueNode {
         linear::IssueNode {
             id: format!("id-{identifier}"),
             identifier: identifier.to_string(),
             title: format!("Title for {identifier}"),
+            description: String::new(),
             branch_name: branch.to_string(),
         }
     }
@@ -902,5 +950,105 @@ mod tests {
                 .join("alejandro-nex-9-thing");
             assert_eq!(path, expected);
         });
+    }
+
+    // -- E3: description into intent + plan-prompt issue lines --
+
+    #[test]
+    fn build_review_seeds_body_from_description() {
+        let mut node = make_issue_node("NEX-1", "alejandro/nex-1-first");
+        node.description = "Implement the widget trait.".to_string();
+        let review = build_review(
+            &IssueRef::new("NEX-1"),
+            &node,
+            &linear_dag(),
+            &HashMap::new(),
+            "main",
+            None,
+        );
+        assert_eq!(
+            review.body, "Implement the widget trait.",
+            "the review intent should be seeded from the Linear description"
+        );
+    }
+
+    #[test]
+    fn build_review_empty_description_yields_empty_body() {
+        let review = build_review(
+            &IssueRef::new("NEX-1"),
+            &make_issue_node("NEX-1", "alejandro/nex-1-first"),
+            &linear_dag(),
+            &HashMap::new(),
+            "main",
+            None,
+        );
+        assert!(review.body.is_empty());
+    }
+
+    #[test]
+    fn plan_issue_line_without_description_is_id_and_title() {
+        // No description => exactly "<identifier> <title>", no trailing separator.
+        // This is the pre-E3 format the plan-prompt goldens rely on.
+        let node = linear::IssueNode {
+            id: "id-1".into(),
+            identifier: "NEX-1".into(),
+            title: "Define the widget trait".into(),
+            description: String::new(),
+            branch_name: "b".into(),
+        };
+        assert_eq!(plan_issue_line(&node), "NEX-1 Define the widget trait");
+    }
+
+    #[test]
+    fn plan_issue_line_appends_description_gist() {
+        let node = linear::IssueNode {
+            id: "id-2".into(),
+            identifier: "NEX-2".into(),
+            title: "Add button widget".into(),
+            description: "Render a clickable button.".into(),
+            branch_name: "b".into(),
+        };
+        assert_eq!(
+            plan_issue_line(&node),
+            "NEX-2 Add button widget: Render a clickable button."
+        );
+    }
+
+    #[test]
+    fn plan_issue_line_collapses_whitespace() {
+        let node = linear::IssueNode {
+            id: "id-3".into(),
+            identifier: "NEX-3".into(),
+            title: "Wire events".into(),
+            description: "First line.\n\n  Second line.\t".into(),
+            branch_name: "b".into(),
+        };
+        assert_eq!(
+            plan_issue_line(&node),
+            "NEX-3 Wire events: First line. Second line."
+        );
+    }
+
+    #[test]
+    fn description_gist_caps_at_max_chars() {
+        // A description longer than the cap is truncated (char-boundary) with an
+        // ellipsis; the gist portion is exactly PLAN_ISSUE_DESC_MAX_CHARS chars.
+        let long = "x".repeat(PLAN_ISSUE_DESC_MAX_CHARS + 50);
+        let gist = description_gist(&long, PLAN_ISSUE_DESC_MAX_CHARS).expect("non-empty");
+        assert!(gist.ends_with("..."));
+        assert_eq!(
+            gist.chars().count(),
+            PLAN_ISSUE_DESC_MAX_CHARS + 3,
+            "capped body plus the three-dot ellipsis"
+        );
+    }
+
+    #[test]
+    fn description_gist_empty_is_none() {
+        assert_eq!(description_gist("", PLAN_ISSUE_DESC_MAX_CHARS), None);
+        assert_eq!(
+            description_gist("   \n\t ", PLAN_ISSUE_DESC_MAX_CHARS),
+            None
+        );
     }
 }

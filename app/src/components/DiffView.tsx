@@ -59,6 +59,11 @@ import { IntentPanel } from "./IntentPanel";
 import { ConversationBand } from "./ConversationBand";
 import { AddressedRequests } from "./AddressedRequests";
 import { EvidenceStrip } from "./EvidenceStrip";
+import {
+  FindingsPanel,
+  findingsAutoExpand,
+  findingsBreakdown,
+} from "./FindingsPanel";
 import { SubmitReviewControl } from "./SubmitReviewControl";
 import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
@@ -692,6 +697,10 @@ export function DiffView({
   const [findingPortals, setFindingPortals] = useState<
     readonly FindingPortalEntry[]
   >([]);
+  // Findings-panel disclosure. Owned here so the evidence-strip findings chip
+  // can force it open; auto-expands on entry only when a Critical finding
+  // exists (see findingsAutoExpand). Set once per review below.
+  const [findingsOpen, setFindingsOpen] = useState(false);
 
   // -- B4: Hunks vs Full-file view + the resolved full-file pair --
   const [viewMode, setViewMode] = useState<"hunks" | "full">("hunks");
@@ -782,6 +791,8 @@ export function DiffView({
   const originalFindingDecorRef =
     useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
   const lspAttachmentRef = useRef<LspAttachment | null>(null);
+  // The findings-panel band, so the evidence-strip chip can scroll it into view.
+  const findingsPanelRef = useRef<HTMLDivElement | null>(null);
   // Pending jump-to-line request (from evidence-strip weakening chips), applied
   // once the target file's editor + line map are ready.
   const pendingJumpRef = useRef<{
@@ -840,6 +851,41 @@ export function DiffView({
       ),
     [review.review_findings, selectedFile, dismissedFindings],
   );
+
+  // Per-severity counts of every non-dismissed finding across all files, for the
+  // evidence-strip findings chip and the findings-panel header.
+  const findingsCounts = useMemo(
+    () => findingsBreakdown(review.review_findings, dismissedFindings),
+    [review.review_findings, dismissedFindings],
+  );
+
+  // Per-file finding summary (excluding dismissed): highest severity + count,
+  // for the file-tree severity dot and its tooltip.
+  const findingsByFile = useMemo(() => {
+    const map = new Map<
+      string,
+      { severity: FindingSeverity; count: number }
+    >();
+    const rank: Record<FindingSeverity, number> = {
+      Info: 1,
+      Warning: 2,
+      Critical: 3,
+    };
+    for (const f of review.review_findings) {
+      if (dismissedFindings.has(f.id)) continue;
+      const prev = map.get(f.path);
+      if (prev === undefined) {
+        map.set(f.path, { severity: f.severity, count: 1 });
+      } else {
+        map.set(f.path, {
+          severity:
+            rank[f.severity] > rank[prev.severity] ? f.severity : prev.severity,
+          count: prev.count + 1,
+        });
+      }
+    }
+    return map;
+  }, [review.review_findings, dismissedFindings]);
 
   const hasLocalComments = useMemo(
     () => review.comments.some((c) => isLocalOrigin(c.origin)),
@@ -1595,6 +1641,25 @@ export function DiffView({
     [],
   );
 
+  // -- Findings panel: auto-expand on entry only when a Critical finding
+  // exists; otherwise leave the header collapsed-but-visible. Keyed on the PR
+  // so switching reviews recomputes the default without clobbering a manual
+  // toggle mid-review. --
+  useEffect(() => {
+    setFindingsOpen(
+      findingsAutoExpand(review.review_findings, dismissedFindings),
+    );
+    // dismissedFindings intentionally omitted: dismissing a finding must not
+    // re-open the panel; the default is a per-review entry decision.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviewPr]);
+
+  // -- Expand + scroll to the findings panel (from the evidence-strip chip). --
+  const handleShowFindings = useCallback(() => {
+    setFindingsOpen(true);
+    findingsPanelRef.current?.scrollIntoView({ block: "nearest" });
+  }, []);
+
   const ciBadgeState = useMemo(
     () => (ciSummary !== null ? ciState(ciSummary) : "none"),
     [ciSummary],
@@ -2208,7 +2273,31 @@ export function DiffView({
         evidence={evidence}
         ciChecks={ciChecks}
         onJumpTo={handleJumpTo}
+        findingsCount={findingsCounts}
+        onShowFindings={handleShowFindings}
       />
+
+      {/* ----------------------------------------------------------------- */}
+      {/* Pre-review findings — advisory triage layer (findings surfacing)  */}
+      {/* ----------------------------------------------------------------- */}
+      <div ref={findingsPanelRef}>
+        <FindingsPanel
+          findings={review.review_findings}
+          dismissed={dismissedFindings}
+          open={findingsOpen}
+          onToggle={() => {
+            setFindingsOpen((prev) => !prev);
+          }}
+          onDismiss={(id) => {
+            setDismissedFindings((prev) => {
+              const next = new Set(prev);
+              next.add(id);
+              return next;
+            });
+          }}
+          onJumpTo={handleJumpTo}
+        />
+      </div>
 
       {/* ----------------------------------------------------------------- */}
       {/* Addressed requests — read-only interdiff history (D10)            */}
@@ -2376,6 +2465,7 @@ export function DiffView({
                   review.comments,
                   path,
                 ).length;
+                const fileFindings = findingsByFile.get(path);
                 return (
                   <button
                     key={path}
@@ -2407,6 +2497,20 @@ export function DiffView({
                     >
                       {path}
                     </span>
+                    {fileFindings !== undefined && (
+                      <span
+                        className={cn(
+                          "h-1.5 w-1.5 shrink-0 rounded-full",
+                          severityMeta(fileFindings.severity).dot,
+                        )}
+                        title={`${String(fileFindings.count)} pre-review finding${
+                          fileFindings.count === 1 ? "" : "s"
+                        }`}
+                        aria-label={`${String(fileFindings.count)} pre-review finding${
+                          fileFindings.count === 1 ? "" : "s"
+                        }`}
+                      />
+                    )}
                     <span
                       role="button"
                       tabIndex={0}

@@ -9,6 +9,7 @@ import type { GateState } from "../bindings/GateState";
 import type { CiCheck } from "../bindings/CiCheck";
 import type { AgentRun } from "../bindings/AgentRun";
 import type { ConversationItem } from "../bindings/ConversationItem";
+import type { ReviewFinding } from "../bindings/ReviewFinding";
 
 /** A minimal running agent, for the stale/agent-active edges. */
 export function makeAgentRun(overrides: Partial<AgentRun> = {}): AgentRun {
@@ -76,6 +77,25 @@ export function makeConversationItem(
     state: null,
     created_at: "2026-07-01T12:00:00Z",
     url: "https://github.com/o/r/pull/1#issuecomment-1",
+    ...overrides,
+  };
+}
+
+/**
+ * A valid advisory `ReviewFinding` — a New-side Warning on lines 20–21 by
+ * default. Pass `range: [0, 0]` for a file-level finding.
+ */
+export function makeFinding(
+  overrides: Partial<ReviewFinding> = {},
+): ReviewFinding {
+  return {
+    id: "finding-1",
+    severity: "Warning",
+    path: "src/lib.rs",
+    range: [20, 21],
+    side: "New",
+    title: "Possible off-by-one",
+    rationale: "The loop bound looks inclusive where an exclusive one is meant.",
     ...overrides,
   };
 }

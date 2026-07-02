@@ -291,17 +291,18 @@ pub fn router(state: HookState) -> Router {
 /// subscribes to a [`PermissionBroker`]. Composed by merging two sub-routers
 /// so each carries its own state ([`HookState`] and [`McpState`]).
 pub fn router_with_broker(state: HookState, broker: PermissionBroker) -> Router {
-    router(state).merge(mcp_router(broker))
+    let sessions = state.session_map.clone();
+    router(state).merge(mcp_router(broker, sessions))
 }
 
 /// Build the MCP permission sub-router (`/mcp/{object_id}`).
-fn mcp_router(broker: PermissionBroker) -> Router {
+fn mcp_router(broker: PermissionBroker, sessions: SessionMap) -> Router {
     Router::new()
         .route(
             "/mcp/{object_id}",
             routing::post(handle_mcp).get(handle_mcp_get),
         )
-        .with_state(McpState { broker })
+        .with_state(McpState { broker, sessions })
 }
 
 /// Handle a Stop-hook callback from Claude Code.
@@ -354,6 +355,10 @@ async fn handle_stop(
 struct McpState {
     /// Broker that routes each permission request to a human decision.
     broker: PermissionBroker,
+    /// Live agent sessions, used to reject forged requests: only an
+    /// `object_id` with a registered running session may enqueue a
+    /// permission request (defense in depth for the localhost endpoint).
+    sessions: SessionMap,
 }
 
 /// A minimal JSON-RPC 2.0 request, permissive about extra fields.
@@ -443,6 +448,22 @@ async fn handle_tools_call(
         .get("input")
         .cloned()
         .unwrap_or_else(|| arguments.clone());
+
+    // Defense in depth: the endpoint is localhost-only, but any local process
+    // could POST here. Only object ids with a live registered agent session
+    // may enqueue a request the user could mistakenly approve; everything
+    // else is denied immediately without ever reaching the UI.
+    if state.sessions.find_by_object(object_id).is_none() {
+        let behavior = serde_json::json!({
+            "behavior": "deny",
+            "message": "no live agent session for this object",
+        });
+        let result = serde_json::json!({
+            "content": [{ "type": "text", "text": behavior.to_string() }],
+            "isError": false,
+        });
+        return json_rpc_result(id, result).into_response();
+    }
 
     let request = PermissionRequest {
         id: Uuid::new_v4().to_string(),
@@ -606,8 +627,20 @@ mod tests {
     }
 
     /// Build the full router (Stop-hook + MCP) backed by `broker`.
+    ///
+    /// Registers live sessions for the object ids the MCP tests use, since
+    /// `tools/call` denies object ids without a registered agent session
+    /// (forged-request hardening).
     fn mcp_app(broker: PermissionBroker) -> Router {
         let (state, _rx) = make_state();
+        for object_id in ["obj", "review-1", "review-42"] {
+            register_session(
+                &state,
+                &format!("session-{object_id}"),
+                object_id,
+                AgentMode::Review,
+            );
+        }
         router_with_broker(state, broker)
     }
 
@@ -961,6 +994,32 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_denies_object_without_live_session() {
+        // Forged-request hardening: a POST for an object id with no
+        // registered agent session is denied immediately and never becomes
+        // a pending request the user could mistakenly approve.
+        let broker = PermissionBroker::new();
+        let app = mcp_app(broker.clone());
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": { "name": "approve", "arguments": { "tool_name": "Bash", "input": {"command": "curl evil"} } }
+        });
+        let response = app
+            .oneshot(mcp_request("forged-object", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"behavior\":\"deny\""), "got: {text}");
+        assert!(text.contains("no live agent session"), "got: {text}");
+        assert!(broker.pending().is_empty(), "must not enqueue a request");
     }
 
     #[tokio::test]

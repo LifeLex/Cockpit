@@ -32,7 +32,14 @@ import type { Anchor } from "../bindings/Anchor";
 import type { DiffSide } from "../bindings/DiffSide";
 import type { CiSummary } from "../bindings/CiSummary";
 import { summarizeChecks, ciState, parseCiUpdate } from "@/lib/ci";
-import { parseDiff, extractFilePaths } from "../diff-parser";
+import type { ReviewEvent } from "../bindings/ReviewEvent";
+import type { SubmitReviewResult } from "../bindings/SubmitReviewResult";
+import {
+  parseDiff,
+  extractFilePaths,
+  fragmentToReal,
+  realToFragment,
+} from "../diff-parser";
 import type { FileDiff } from "../diff-parser";
 import { elapsedSince } from "@/lib/relative-time";
 import { useAppStore } from "../store";
@@ -41,6 +48,9 @@ import { attachLspClient, type LspAttachment } from "@/lib/lsp-client";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { GatePill } from "./GatePill";
+import { IntentPanel } from "./IntentPanel";
+import { AddressedRequests } from "./AddressedRequests";
+import { SubmitReviewControl } from "./SubmitReviewControl";
 import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -60,6 +70,8 @@ import {
   Loader2,
   Wrench,
   Layers,
+  Check,
+  GitMerge,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -89,6 +101,10 @@ interface DiffViewProps {
 interface PortalEntry {
   readonly key: string;
   readonly domNode: HTMLDivElement;
+  /**
+   * The REAL file line, used for display and as the comment anchor when
+   * submitting (D1). Zone placement uses the fragment line instead.
+   */
   readonly lineNumber: number;
   readonly comments: readonly Comment[];
   readonly hasInput: boolean;
@@ -211,6 +227,17 @@ function anchorRange(
     return anchor.DiffLine.range;
   }
   return null;
+}
+
+/**
+ * Which diff side a comment anchors to. Defaults to `New` for non-diff anchors
+ * and legacy data (matching the server-side `serde` default).
+ */
+function anchorSide(anchor: Anchor): DiffSide {
+  if (isDiffLineAnchor(anchor)) {
+    return anchor.DiffLine.side;
+  }
+  return "New";
 }
 
 function getFileDiff(
@@ -458,9 +485,30 @@ export function DiffView({
   const lspRootPath = useAppStore((s) => s.config?.repo_path ?? null);
   const lspEnabled = useAppStore((s) => s.config?.lsp_servers.enabled ?? true);
 
+  // -- Close-the-loop store actions (D2 / D9 / D10) --
+  const approveReview = useAppStore((s) => s.approveReview);
+  const mergeReview = useAppStore((s) => s.mergeReview);
+  const submitGithubReview = useAppStore((s) => s.submitGithubReview);
+  const fetchInterdiff = useAppStore((s) => s.fetchInterdiff);
+
+  // -- D10: interdiff (changes since the last review dispatch) --
+  // Only a reworked review with a dispatch snapshot has a meaningful interdiff.
+  const hasInterdiff =
+    review.gate_state === "Reworked" && review.dispatch_snapshot != null;
+  const [interdiff, setInterdiff] = useState<DiffData | null>(null);
+  const [diffSource, setDiffSource] = useState<"interdiff" | "full">("full");
+
+  // The raw diff currently shown: the interdiff when selected and available,
+  // otherwise the full review diff.
+  const activeDiffRaw =
+    diffSource === "interdiff" && interdiff !== null ? interdiff.raw : diff.raw;
+
   // -- Diff parsing --
-  const fileDiffs = useMemo(() => parseDiff(diff.raw), [diff.raw]);
-  const filePaths = useMemo(() => extractFilePaths(diff.raw), [diff.raw]);
+  const fileDiffs = useMemo(() => parseDiff(activeDiffRaw), [activeDiffRaw]);
+  const filePaths = useMemo(
+    () => extractFilePaths(activeDiffRaw),
+    [activeDiffRaw],
+  );
 
   // -- Navigation / display state --
   const [selectedFile, setSelectedFile] = useState<string>(
@@ -493,6 +541,23 @@ export function DiffView({
   const restackPr = useAppStore((s) => s.restackPr);
   const [restacking, setRestacking] = useState(false);
 
+  // -- D2: approve / merge state --
+  const [approving, setApproving] = useState(false);
+  const [merging, setMerging] = useState(false);
+
+  // -- D9: GitHub review submission state --
+  const [githubSubmitting, setGithubSubmitting] = useState(false);
+  const [githubSubmitResult, setGithubSubmitResult] =
+    useState<SubmitReviewResult | null>(null);
+
+  // -- D4: per-review Intent disclosure open state (component-only memory) --
+  const [intentOpenByPr, setIntentOpenByPr] = useState<
+    Readonly<Record<string, boolean>>
+  >({});
+
+  // -- D10: Addressed-requests panel open state (open by default on entry) --
+  const [addressedOpen, setAddressedOpen] = useState(true);
+
   // -- Refs --
   const activeFileRef = useRef<HTMLButtonElement | null>(null);
   const diffEditorRef = useRef<MonacoDiffEditor | null>(null);
@@ -510,6 +575,14 @@ export function DiffView({
     () => getFileDiff(fileDiffs, selectedFile),
     [fileDiffs, selectedFile],
   );
+
+  // Keep the current file diff reachable from the (mount-time) Monaco mouse
+  // handlers, which capture nothing else from render scope. Used to map a
+  // clicked fragment line to its real file line for the comment anchor (D1).
+  const currentFileDiffRef = useRef(currentFileDiff);
+  useEffect(() => {
+    currentFileDiffRef.current = currentFileDiff;
+  }, [currentFileDiff]);
 
   const commentsForFile = useMemo(
     () => fileComments(review.comments, selectedFile),
@@ -543,10 +616,59 @@ export function DiffView({
   // -- Agent reason line (replaces the raw PID readout) --
   const agentReason = useMemo(() => agentReasonLine(review), [review]);
 
+  // -- D4: PR intent header + collapsible disclosure --
+  const headerTitle = review.title.trim() !== "" ? review.title : review.branch;
+  const showIntent = review.title.trim() !== "" || review.body.trim() !== "";
+  const intentOpen = intentOpenByPr[review.pr] ?? false;
+  const toggleIntent = useCallback(() => {
+    setIntentOpenByPr((prev) => ({
+      ...prev,
+      [review.pr]: !(prev[review.pr] ?? false),
+    }));
+  }, [review.pr]);
+
+  // -- D10: read-only history of what was asked for in the last cycle --
+  const addressedComments = review.dispatch_snapshot?.comments ?? [];
+  const showAddressed = hasInterdiff && addressedComments.length > 0;
+
   // -- Close inline form on file change --
   useEffect(() => {
     setActiveCommentLine(null);
   }, [selectedFile]);
+
+  // -- D10: default a reworked review to its interdiff and fetch it. A fetch
+  // failure falls back to the full diff (the store surfaces the error). --
+  const reviewPr = review.pr;
+  useEffect(() => {
+    if (!hasInterdiff) {
+      setInterdiff(null);
+      setDiffSource("full");
+      return;
+    }
+    setDiffSource("interdiff");
+    let cancelled = false;
+    void fetchInterdiff(reviewPr).then((data) => {
+      if (cancelled) return;
+      if (data === null) {
+        // Fetch failed; keep the full diff visible.
+        setDiffSource("full");
+        return;
+      }
+      setInterdiff(data);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reviewPr, hasInterdiff, fetchInterdiff]);
+
+  // -- Keep the selected file valid when the file set changes (e.g. toggling
+  // between the interdiff and the full diff). --
+  useEffect(() => {
+    if (filePaths.length === 0) return;
+    if (!filePaths.includes(selectedFile)) {
+      setSelectedFile(filePaths[0] ?? "");
+    }
+  }, [filePaths, selectedFile]);
 
   // -- Keyboard shortcut: `m` toggles the file tree sidebar --
   useEffect(() => {
@@ -620,7 +742,9 @@ export function DiffView({
         }
       });
 
-      // Click on gutter: toggle inline comment form
+      // Click on gutter: toggle inline comment form. `activeCommentLine` holds
+      // the FRAGMENT (Monaco) line for zone placement; the real file line is
+      // resolved when the comment is submitted (D1).
       modified.onMouseDown((e) => {
         const target = e.target;
         const isGutterClick =
@@ -629,6 +753,13 @@ export function DiffView({
 
         if (isGutterClick && target.position != null) {
           const line = target.position.lineNumber;
+          // D1: only lines that map to a real file line are commentable. This
+          // should always hold for a clickable gutter line; guard anyway.
+          if (
+            fragmentToReal(currentFileDiffRef.current, "New", line) === undefined
+          ) {
+            return;
+          }
           setActiveCommentLine((prev) => (prev === line ? null : line));
         }
       });
@@ -656,19 +787,25 @@ export function DiffView({
     // Re-apply glyph margin after mode changes
     modified.updateOptions({ glyphMargin: true });
 
-    // Group comments by their end line
+    // Group comments by the FRAGMENT (editor) line their real anchor maps to.
+    // Anchors store REAL file lines (D1), so translate each back to the current
+    // fragment. New-side only for now — original-side rendering is a follow-up
+    // (D12). Comments whose real line is not present in the current fragment
+    // (e.g. after a diff refresh, or an interdiff that no longer touches that
+    // line) are skipped gracefully.
     const commentsByLine = new Map<number, Comment[]>();
     for (const c of commentsForFile) {
+      if (anchorSide(c.anchor) !== "New") continue;
       const range = anchorRange(c.anchor);
-      if (range != null) {
-        const line = range[1];
-        const arr = commentsByLine.get(line) ?? [];
-        arr.push(c);
-        commentsByLine.set(line, arr);
-      }
+      if (range === null) continue;
+      const fragLine = realToFragment(currentFileDiff, "New", range[1]);
+      if (fragLine === undefined) continue;
+      const arr = commentsByLine.get(fragLine) ?? [];
+      arr.push(c);
+      commentsByLine.set(fragLine, arr);
     }
 
-    // All lines that need a view zone
+    // All fragment lines that need a view zone
     const zoneLines = new Set<number>(commentsByLine.keys());
     if (effectiveInputLine != null) {
       zoneLines.add(effectiveInputLine);
@@ -715,8 +852,16 @@ export function DiffView({
           suppressMouseDown: false,
         });
 
+        // Display + anchor use the real file line; placement used the fragment.
+        const realLine = fragmentToReal(currentFileDiff, "New", line) ?? line;
         zoneIdsRef.current.push(zoneId);
-        newPortals.push({ key, domNode, lineNumber: line, comments, hasInput });
+        newPortals.push({
+          key,
+          domNode,
+          lineNumber: realLine,
+          comments,
+          hasInput,
+        });
       }
     });
 
@@ -742,7 +887,14 @@ export function DiffView({
     }
 
     setPortals(newPortals);
-  }, [editorReady, commentsForFile, effectiveInputLine, selectedFile, diffMode]);
+  }, [
+    editorReady,
+    commentsForFile,
+    currentFileDiff,
+    effectiveInputLine,
+    selectedFile,
+    diffMode,
+  ]);
 
   // -- LSP: attach a language client to the modified (right-hand) model --
   // Runs once the editor is ready and whenever the selected file (and thus its
@@ -890,24 +1042,76 @@ export function DiffView({
     }
   }, [restackPr, prRef]);
 
-  const handleSubmitReview = useCallback(async () => {
-    const commentCount = review.comments.filter((c) => isLocalOrigin(c.origin)).length;
-    if (commentCount === 0) return;
+  // -- D2: approve is a local gate transition (InReview -> Approved); no
+  // confirm, since it publishes nothing. --
+  const handleApprove = useCallback(async () => {
+    setApproving(true);
+    try {
+      await approveReview(review.pr);
+    } finally {
+      setApproving(false);
+    }
+  }, [approveReview, review.pr]);
 
+  // -- D2: merge is a guarded, confirmed side effect (Invariant 5 / §9). --
+  const handleMerge = useCallback(async () => {
     const confirmed = window.confirm(
-      `Post ${String(commentCount)} comment${commentCount !== 1 ? "s" : ""} to GitHub?`,
+      `Squash-merge ${review.pr} on GitHub and delete the branch?`,
     );
     if (!confirmed) return;
-
-    setSubmitting(true);
-    setMirrorResult(null);
+    setMerging(true);
     try {
-      const result = await onMirrorComments();
-      setMirrorResult(result);
+      await mergeReview(review.pr);
     } finally {
-      setSubmitting(false);
+      setMerging(false);
     }
-  }, [review.comments, onMirrorComments]);
+  }, [mergeReview, review.pr]);
+
+  // -- D9: the inline Local comments carried by a submitted GitHub review. --
+  const localCommentCount = useMemo(
+    () => review.comments.filter((c) => isLocalOrigin(c.origin)).length,
+    [review.comments],
+  );
+
+  const verdictLabel = useCallback((event: ReviewEvent): string => {
+    switch (event) {
+      case "Approve":
+        return "Approve";
+      case "RequestChanges":
+        return "Request changes";
+      case "Comment":
+        return "Comment";
+      default:
+        return assertNever(event);
+    }
+  }, []);
+
+  // -- D9: submit a real GitHub PR review (guarded, confirmed side effect;
+  // Invariant 5 / §9). Returns whether the review was posted so the control can
+  // close its popover. --
+  const handleGithubSubmit = useCallback(
+    async (event: ReviewEvent, body: string): Promise<boolean> => {
+      const confirmed = window.confirm(
+        `Post review (${verdictLabel(event)}, ${String(localCommentCount)} line comment${
+          localCommentCount === 1 ? "" : "s"
+        }) to GitHub?`,
+      );
+      if (!confirmed) return false;
+      setGithubSubmitting(true);
+      setGithubSubmitResult(null);
+      try {
+        const result = await submitGithubReview(review.pr, event, body);
+        if (result !== null) {
+          setGithubSubmitResult(result);
+          return true;
+        }
+        return false;
+      } finally {
+        setGithubSubmitting(false);
+      }
+    },
+    [submitGithubReview, review.pr, localCommentCount, verdictLabel],
+  );
 
   // =========================================================================
   // Render
@@ -938,8 +1142,11 @@ export function DiffView({
           <div className="flex min-w-0 flex-col">
             {/* Title row: PR subject + gate-state pill + inline flags. */}
             <div className="flex min-w-0 items-center gap-2">
-              <span className="truncate font-display text-sm font-semibold text-foreground">
-                {review.branch}
+              <span
+                className="truncate font-display text-sm font-semibold text-foreground"
+                title={headerTitle}
+              >
+                {headerTitle}
               </span>
               <GatePill state={review.gate_state} />
               {review.stale && (
@@ -949,8 +1156,16 @@ export function DiffView({
               )}
             </div>
 
-            {/* Refs line: mono, faint; PR / issue / repo links via opener. */}
+            {/* Refs line: mono, faint; branch + PR / issue / repo links. */}
             <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-0.5 font-mono text-xs text-muted-foreground">
+              <span
+                className="inline-flex min-w-0 shrink items-center gap-1"
+                title={review.branch}
+              >
+                <GitBranch className="h-3 w-3 shrink-0" />
+                <span className="truncate">{review.branch}</span>
+              </span>
+
               {prHref !== null ? (
                 <a
                   href={prHref}
@@ -1054,6 +1269,45 @@ export function DiffView({
               Unified
             </button>
           </div>
+
+          {/* Diff-source toggle: interdiff vs full diff (D10). */}
+          {hasInterdiff && (
+            <div className="flex overflow-hidden rounded-md border border-border">
+              <button
+                type="button"
+                onClick={() => {
+                  setDiffSource("interdiff");
+                }}
+                aria-pressed={diffSource === "interdiff"}
+                disabled={interdiff === null}
+                className={cn(
+                  "cursor-pointer border-none px-3 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                  diffSource === "interdiff"
+                    ? "bg-accent text-accent-foreground"
+                    : "bg-transparent text-muted-foreground hover:bg-accent/50",
+                )}
+                title="Show only what changed since your last review"
+              >
+                Since your review
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setDiffSource("full");
+                }}
+                aria-pressed={diffSource === "full"}
+                className={cn(
+                  "cursor-pointer border-none px-3 py-1 text-xs font-medium transition-colors",
+                  diffSource === "full"
+                    ? "bg-accent text-accent-foreground"
+                    : "bg-transparent text-muted-foreground hover:bg-accent/50",
+                )}
+                title="Show the full PR diff"
+              >
+                Full diff
+              </button>
+            </div>
+          )}
 
           {/* CI checks badge. */}
           {ciSummary !== null && ciSummary.total > 0 && (
@@ -1165,32 +1419,94 @@ export function DiffView({
           </div>
 
           {/* Primary action — one clear call to action by state. */}
-          {review.source === "ReviewRequested"
-            ? review.gate_state === "InReview" &&
-              review.comments.length > 0 && (
+          {review.source === "ReviewRequested" ? (
+            // D9: review-requested PRs publish a real GitHub review.
+            review.gate_state !== "Merged" && (
+              <SubmitReviewControl
+                commentCount={localCommentCount}
+                pending={githubSubmitting}
+                onSubmit={handleGithubSubmit}
+              />
+            )
+          ) : (
+            // D2: authored reviews close the loop locally — request changes /
+            // approve while InReview, merge once Approved, read-only when Merged.
+            <>
+              {review.gate_state === "InReview" && (
+                <>
+                  {canRequestChanges && (
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => void handleRequestChanges()}
+                      disabled={submitting}
+                    >
+                      <Send className="h-3.5 w-3.5" />
+                      Request Changes ({String(review.comments.length)})
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    onClick={() => void handleApprove()}
+                    disabled={approving}
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                    {approving ? "Approving…" : "Approve"}
+                  </Button>
+                </>
+              )}
+
+              {review.gate_state === "Approved" && (
                 <Button
                   size="sm"
                   className="bg-success text-white hover:bg-success/90"
-                  onClick={() => void handleSubmitReview()}
-                  disabled={submitting}
+                  onClick={() => void handleMerge()}
+                  disabled={merging}
                 >
-                  <Upload className="h-3.5 w-3.5" />
-                  Submit Review ({String(review.comments.length)})
-                </Button>
-              )
-            : canRequestChanges && (
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  onClick={() => void handleRequestChanges()}
-                  disabled={submitting}
-                >
-                  <Send className="h-3.5 w-3.5" />
-                  Request Changes ({String(review.comments.length)})
+                  <GitMerge className="h-3.5 w-3.5" />
+                  {merging ? "Merging…" : "Merge PR"}
                 </Button>
               )}
+
+              {review.gate_state === "Merged" && (
+                <span className="inline-flex items-center gap-1.5 rounded-md border border-success/30 bg-success/15 px-2.5 py-1 text-xs font-medium text-success">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  Merged
+                </span>
+              )}
+            </>
+          )}
         </div>
       </header>
+
+      {/* ----------------------------------------------------------------- */}
+      {/* Intent disclosure (D4)                                            */}
+      {/* ----------------------------------------------------------------- */}
+      {showIntent && (
+        <IntentPanel
+          body={review.body}
+          issue={review.issue}
+          issueHref={issueHref}
+          open={intentOpen}
+          onToggle={toggleIntent}
+          onOpenIssue={(href) => {
+            void openExternal(href);
+          }}
+        />
+      )}
+
+      {/* ----------------------------------------------------------------- */}
+      {/* Addressed requests — read-only interdiff history (D10)            */}
+      {/* ----------------------------------------------------------------- */}
+      {showAddressed && (
+        <AddressedRequests
+          comments={addressedComments}
+          open={addressedOpen}
+          onToggle={() => {
+            setAddressedOpen((prev) => !prev);
+          }}
+        />
+      )}
 
       {/* ----------------------------------------------------------------- */}
       {/* Stack strip (collapsible) — relocated from PR Info tab            */}
@@ -1280,6 +1596,29 @@ export function DiffView({
               setMirrorResult(null);
             }}
             className="ml-3 cursor-pointer rounded border border-white/30 bg-transparent px-2 py-0.5 text-[11px] text-foreground"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* ----------------------------------------------------------------- */}
+      {/* GitHub review submission result (D9)                              */}
+      {/* ----------------------------------------------------------------- */}
+      {githubSubmitResult !== null && (
+        <div className="flex items-center justify-between border-b border-success/40 bg-success/15 px-4 py-2 text-xs text-success">
+          <span>
+            Submitted review with {String(githubSubmitResult.submitted)} line
+            comment{githubSubmitResult.submitted === 1 ? "" : "s"} to GitHub
+            {githubSubmitResult.skipped.length > 0 &&
+              ` · ${String(githubSubmitResult.skipped.length)} skipped`}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              setGithubSubmitResult(null);
+            }}
+            className="cursor-pointer border-none bg-transparent text-success underline hover:no-underline"
           >
             Dismiss
           </button>

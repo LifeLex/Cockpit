@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import type { Review } from "./bindings/Review";
 import type { CiCheck } from "./bindings/CiCheck";
+import type { SubmitReviewResult } from "./bindings/SubmitReviewResult";
 import {
   mockInvoke,
   mockInvokeReject,
@@ -203,5 +204,183 @@ describe("requestChanges", () => {
     await useAppStore.getState().requestChanges();
 
     expect(useAppStore.getState().activeReview?.gate_state).toBe("Dispatched");
+  });
+});
+
+describe("approveReview", () => {
+  it("advances the review across lists + activeReview on success (D2)", async () => {
+    const before = makeReview({ pr: "pr-1", gate_state: "InReview" });
+    const approved = makeReview({ pr: "pr-1", gate_state: "Approved" });
+    useAppStore.setState({
+      activeReview: before,
+      reviews: [before],
+      frontier: [before],
+    });
+    mockInvoke("approve_review", (args) => {
+      expect(args.pr).toBe("pr-1");
+      return approved;
+    });
+
+    await useAppStore.getState().approveReview("pr-1");
+
+    const state = useAppStore.getState();
+    expect(state.activeReview?.gate_state).toBe("Approved");
+    expect(state.reviews[0]?.gate_state).toBe("Approved");
+    expect(state.frontier[0]?.gate_state).toBe("Approved");
+    expect(state.error).toBeNull();
+  });
+
+  it("sets error (non-fatal) on rejection", async () => {
+    const before = makeReview({ pr: "pr-1", gate_state: "InReview" });
+    useAppStore.setState({ activeReview: before, reviews: [before] });
+    mockInvokeReject("approve_review", "cannot approve");
+
+    await useAppStore.getState().approveReview("pr-1");
+
+    expect(useAppStore.getState().error).toContain("cannot approve");
+    expect(useAppStore.getState().activeReview?.gate_state).toBe("InReview");
+  });
+});
+
+describe("mergeReview", () => {
+  it("advances the active review to Merged on success (D2)", async () => {
+    const before = makeReview({ pr: "pr-1", gate_state: "Approved" });
+    const merged = makeReview({ pr: "pr-1", gate_state: "Merged" });
+    useAppStore.setState({
+      activeReview: before,
+      reviews: [before],
+      frontier: [before],
+    });
+    mockInvoke("merge_review", (args) => {
+      expect(args.pr).toBe("pr-1");
+      return merged;
+    });
+
+    await useAppStore.getState().mergeReview("pr-1");
+
+    const state = useAppStore.getState();
+    expect(state.activeReview?.gate_state).toBe("Merged");
+    expect(state.reviews[0]?.gate_state).toBe("Merged");
+    expect(state.error).toBeNull();
+  });
+
+  it("sets error (non-fatal) on rejection", async () => {
+    const before = makeReview({ pr: "pr-1", gate_state: "Approved" });
+    useAppStore.setState({ activeReview: before, reviews: [before] });
+    mockInvokeReject("merge_review", "merge conflict");
+
+    await useAppStore.getState().mergeReview("pr-1");
+
+    expect(useAppStore.getState().error).toContain("merge conflict");
+    expect(useAppStore.getState().activeReview?.gate_state).toBe("Approved");
+  });
+});
+
+describe("submitGithubReview", () => {
+  it("returns the result and refreshes the active review on success (D9)", async () => {
+    const before = makeReview({ pr: "pr-1", gate_state: "InReview" });
+    const refreshed = makeReview({ pr: "pr-1", gate_state: "Approved" });
+    useAppStore.setState({
+      view: { kind: "diff", pr: "pr-1" },
+      activeReview: before,
+      reviews: [before],
+    });
+    const result: SubmitReviewResult = { submitted: 2, skipped: [] };
+    mockInvoke("submit_github_review", (args) => {
+      expect(args.pr).toBe("pr-1");
+      expect(args.event).toBe("Approve");
+      return result;
+    });
+    mockInvoke("get_review", () => refreshed);
+    mockInvoke("get_review_diff", () => ({ raw: "" }));
+
+    const returned = await useAppStore
+      .getState()
+      .submitGithubReview("pr-1", "Approve", "");
+
+    expect(returned).toEqual(result);
+    expect(useAppStore.getState().activeReview?.gate_state).toBe("Approved");
+    expect(useAppStore.getState().error).toBeNull();
+  });
+
+  it("maps an empty body to null and passes a non-empty body through", async () => {
+    useAppStore.setState({
+      view: { kind: "diff", pr: "pr-1" },
+      activeReview: makeReview({ pr: "pr-1" }),
+      reviews: [],
+    });
+    const result: SubmitReviewResult = { submitted: 0, skipped: [] };
+    let seenBody: unknown = "unset";
+    mockInvoke("submit_github_review", (args) => {
+      seenBody = args.body;
+      return result;
+    });
+    mockInvoke("get_review", () => makeReview({ pr: "pr-1" }));
+    mockInvoke("get_review_diff", () => ({ raw: "" }));
+
+    await useAppStore.getState().submitGithubReview("pr-1", "Comment", "   ");
+    expect(seenBody).toBeNull();
+
+    await useAppStore.getState().submitGithubReview("pr-1", "Comment", "looks good");
+    expect(seenBody).toBe("looks good");
+  });
+
+  it("sets a store error listing reasons when comments are skipped", async () => {
+    const before = makeReview({ pr: "pr-1", gate_state: "InReview" });
+    useAppStore.setState({
+      view: { kind: "diff", pr: "pr-1" },
+      activeReview: before,
+      reviews: [before],
+    });
+    const result: SubmitReviewResult = {
+      submitted: 1,
+      skipped: [["c-1", "line not in diff"]],
+    };
+    mockInvoke("submit_github_review", () => result);
+    mockInvoke("get_review", () => before);
+    mockInvoke("get_review_diff", () => ({ raw: "" }));
+
+    const returned = await useAppStore
+      .getState()
+      .submitGithubReview("pr-1", "Comment", "hi");
+
+    expect(returned).toEqual(result);
+    expect(useAppStore.getState().error).toContain("line not in diff");
+  });
+
+  it("returns null and sets error on rejection", async () => {
+    useAppStore.setState({ view: { kind: "diff", pr: "pr-1" } });
+    mockInvokeReject("submit_github_review", "gh failed");
+
+    const returned = await useAppStore
+      .getState()
+      .submitGithubReview("pr-1", "Comment", "");
+
+    expect(returned).toBeNull();
+    expect(useAppStore.getState().error).toContain("gh failed");
+  });
+});
+
+describe("fetchInterdiff", () => {
+  it("returns the interdiff on success (D10)", async () => {
+    const diff = { raw: "diff --git a/x b/x" };
+    mockInvoke("get_interdiff", (args) => {
+      expect(args.pr).toBe("pr-1");
+      return diff;
+    });
+
+    const result = await useAppStore.getState().fetchInterdiff("pr-1");
+
+    expect(result).toEqual(diff);
+    expect(useAppStore.getState().error).toBeNull();
+  });
+
+  it("returns null and sets error on failure", async () => {
+    mockInvokeReject("get_interdiff", "no snapshot");
+
+    const result = await useAppStore.getState().fetchInterdiff("pr-1");
+
+    expect(result).toBeNull();
+    expect(useAppStore.getState().error).toContain("no snapshot");
   });
 });

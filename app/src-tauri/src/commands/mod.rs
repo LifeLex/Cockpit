@@ -1370,7 +1370,15 @@ async fn plan_issue_lines(state: &Arc<AppState>, id: &ProjectId) -> Vec<String> 
         return Vec::new();
     };
 
-    let client = reqwest::Client::new();
+    // A stalled Linear API must not hang the caller indefinitely; errors
+    // (including timeout) degrade to the empty/default path.
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => reqwest::Client::new(),
+    };
     let project_ref = ProjectRef::new(linear_id);
     match linear::fetch_project_issues(&client, &api_key, &project_ref).await {
         Ok(data) => data.issues.iter().map(kickoff::plan_issue_line).collect(),
@@ -2291,7 +2299,15 @@ pub async fn kickoff(
     })?;
 
     let project = ProjectRef::new(&project_id);
-    let client = reqwest::Client::new();
+    // A stalled Linear API must not hang the caller indefinitely; errors
+    // (including timeout) degrade to the empty/default path.
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => reqwest::Client::new(),
+    };
 
     // 1. Fetch issues and compute the frontier.
     let (data, frontier) = kickoff::fetch_and_compute_frontier(&client, &api_key, &project).await?;

@@ -18,7 +18,7 @@ becoming the rubber stamp.** Every roadmap item below is judged against that sen
 
 ---
 
-## Phase A — Close the loop (IN FLIGHT on `alejandro/close-the-loop`)
+## Phase A — Close the loop (implemented — PR #12)
 
 The audits found cockpit couldn't yet *finish* a review. This program fixes the defects;
 it is the precondition for everything else.

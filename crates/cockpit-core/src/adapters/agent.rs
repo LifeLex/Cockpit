@@ -177,6 +177,20 @@ impl SpawnConfig {
             ..Self::default()
         }
     }
+
+    /// Grant the spawned agent write access to a directory outside its
+    /// worktree by appending `--add-dir <path>`.
+    ///
+    /// Headless (`--print`) sessions cannot interactively grant permissions,
+    /// so any output contract that lives outside the worktree — the findings
+    /// file, the plan document — must be pre-authorized at spawn time or the
+    /// agent's writes are silently blocked and its output is lost.
+    #[must_use]
+    pub fn with_extra_dir(mut self, dir: &Path) -> Self {
+        self.tail_args.push("--add-dir".into());
+        self.tail_args.push(dir.to_string_lossy().into_owned());
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +452,29 @@ mod tests {
         // Argument shape is unchanged from the default.
         assert_eq!(spawn.base_args, SpawnConfig::default().base_args);
         assert_eq!(spawn.tail_args, SpawnConfig::default().tail_args);
+    }
+
+    #[test]
+    fn spawn_config_with_extra_dir_appends_add_dir_args() {
+        let spawn = SpawnConfig::default()
+            .with_extra_dir(Path::new("/home/u/.cockpit/findings"))
+            .with_extra_dir(Path::new("/home/u/.cockpit/plans"));
+        let tail: Vec<&str> = spawn.tail_args.iter().map(String::as_str).collect();
+        // Base tail args are preserved, followed by one --add-dir pair per dir.
+        let default_len = SpawnConfig::default().tail_args.len();
+        assert_eq!(
+            &tail[..default_len],
+            ["--output-format", "stream-json", "--verbose"]
+        );
+        assert_eq!(
+            &tail[default_len..],
+            [
+                "--add-dir",
+                "/home/u/.cockpit/findings",
+                "--add-dir",
+                "/home/u/.cockpit/plans"
+            ]
+        );
     }
 
     #[test]

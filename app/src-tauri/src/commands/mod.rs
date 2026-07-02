@@ -759,7 +759,11 @@ async fn try_spawn_review_agent(
     prompt: &cockpit_core::prompt::AssembledPrompt,
 ) -> Result<cockpit_core::model::AgentRun, String> {
     let config = Config::load().map_err(|e| format!("config: {e}"))?;
-    let spawn_config = SpawnConfig::from_config(&config);
+    // The findings file lives outside the worktree; a headless session can't
+    // be granted that write interactively, so pre-authorize it at spawn.
+    let findings_dir =
+        cockpit_core::config::findings_dir().map_err(|e| format!("findings dir: {e}"))?;
+    let spawn_config = SpawnConfig::from_config(&config).with_extra_dir(&findings_dir);
     let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
 
     let spawn_result = cockpit_core::adapters::agent::spawn_agent(
@@ -1592,7 +1596,10 @@ async fn spawn_plan_agent(
         .repo_path
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
-    let spawn_config = SpawnConfig::from_config(&config);
+    // The plan document lives outside the worktree; pre-authorize the plans
+    // dir so the headless planner's Write isn't silently blocked.
+    let plans_dir = cockpit_core::config::plans_dir()?;
+    let spawn_config = SpawnConfig::from_config(&config).with_extra_dir(&plans_dir);
     let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
 
     let spawn_result = cockpit_core::adapters::agent::spawn_agent(

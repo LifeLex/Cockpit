@@ -910,8 +910,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
     try {
       const review = await invoke<Review>("fix_ci", { pr });
       const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      const active = get().activeReview;
       set({
-        activeReview: review,
+        activeReview: active?.pr === review.pr ? review : active,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
         reviews: get().reviews.map(replace),

@@ -1514,7 +1514,18 @@ export function DiffView({
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => void handleMirrorComments()}
+                onClick={() => {
+                  // Outward publish — explicit confirmation per SPEC §12.
+                  if (
+                    window.confirm(
+                      `Post ${String(localCommentCount)} comment${
+                        localCommentCount === 1 ? "" : "s"
+                      } to the GitHub PR thread?`,
+                    )
+                  ) {
+                    void handleMirrorComments();
+                  }
+                }}
                 disabled={mirroring}
                 title="Mirror local comments to the GitHub PR thread"
               >

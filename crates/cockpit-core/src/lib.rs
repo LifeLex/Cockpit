@@ -25,6 +25,7 @@ pub mod prompt;
 pub mod restack;
 pub mod skills;
 pub mod store;
+pub mod trajectory;
 
 pub mod hook_server;
 

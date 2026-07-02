@@ -647,13 +647,16 @@ async fn refresh_review_diff(state: &AppState, pr_ref: &PrRef) {
         None => github::pr_diff(pr_number).await,
     };
 
+    // The advisory findings were anchored to the previous diff/head; the head
+    // has already moved by the time a refresh is requested, so drop them even
+    // when the re-fetch fails (stale pins on changed content mislead).
+    state.reviews.update(pr_ref, |review| {
+        review.review_findings.clear();
+    });
+
     if let Ok(raw_diff) = diff_result {
         state.reviews.update(pr_ref, |review| {
             review.diff = DiffData { raw: raw_diff };
-            // The advisory findings were anchored to the previous diff/head; once
-            // the diff is replaced (e.g. after a Fix landed a commit) they no
-            // longer line up, so drop them.
-            review.review_findings.clear();
         });
     }
 }

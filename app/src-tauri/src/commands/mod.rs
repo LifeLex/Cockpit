@@ -25,6 +25,7 @@ use cockpit_core::model::{
 };
 use cockpit_core::plan_parser;
 use cockpit_core::restack;
+use cockpit_core::trajectory::{self, TrajectorySummary};
 
 use crate::error::CommandError;
 use crate::state::AppState;
@@ -148,17 +149,20 @@ pub async fn get_interdiff(
     Ok(DiffData { raw })
 }
 
-/// Return the review-time evidence bundle for a PR (B1).
+/// Return the review-time evidence bundle for a PR (B1 + D2).
 ///
 /// Bundles the deterministic diff signals, the review's CI rollup, and the
 /// commands the agent ran into one [`EvidenceSummary`] so the diff gate can show
 /// what changed, whether CI is green, and what the agent executed without three
 /// separate round-trips.
 ///
-/// The diff can be large, so [`compute_diff_signals`] runs on the blocking pool
-/// via [`tokio::task::spawn_blocking`] (only the owned diff string — `Send` —
-/// crosses the boundary). `agent_ran` is empty for now; Phase D fills it from the
-/// agent trajectory.
+/// Both the diff walk ([`compute_diff_signals`]) and the trajectory read
+/// ([`trajectory::load`]) are potentially expensive (a large diff string; file
+/// IO), so they run together on the blocking pool via
+/// [`tokio::task::spawn_blocking`] (only the owned diff string and PR key —
+/// both `Send` — cross the boundary). `agent_ran` is filled from the persisted
+/// trajectory summary; a missing/corrupt summary degrades to an empty list
+/// (Invariant §0.1).
 #[tauri::command]
 pub async fn get_evidence(
     state: State<'_, Arc<AppState>>,
@@ -171,18 +175,44 @@ pub async fn get_evidence(
 
     let ci = review.ci_summary;
     let raw = review.diff.raw;
-    let signals = tokio::task::spawn_blocking(move || compute_diff_signals(&raw))
-        .await
-        .map_err(|e| CommandError {
-            message: format!("diff signal task panicked: {e}"),
-        })?;
+    let (signals, agent_ran) = tokio::task::spawn_blocking(move || {
+        let signals = compute_diff_signals(&raw);
+        // Fold the agent's recorded commands in from its trajectory summary; a
+        // missing or corrupt file yields no commands rather than an error.
+        let agent_ran = trajectory::load(&pr)
+            .map(|t| t.commands)
+            .unwrap_or_default();
+        (signals, agent_ran)
+    })
+    .await
+    .map_err(|e| CommandError {
+        message: format!("evidence task panicked: {e}"),
+    })?;
 
     Ok(EvidenceSummary {
         signals,
         ci,
-        // Phase D fills this from the agent trajectory; empty for now.
-        agent_ran: vec![],
+        agent_ran,
     })
+}
+
+/// Return the persisted agent trajectory summary for a PR, if one exists (D2).
+///
+/// Loads `<logs_dir>/<slug>.trajectory.json` — the compact rollup of the last
+/// agent run keyed by the PR ref — so the UI can render "what did the agent
+/// try?" without re-running or reparsing the raw log. The read is file IO, so
+/// it runs on the blocking pool via [`tokio::task::spawn_blocking`].
+///
+/// Returns `Ok(None)` when no summary is present or it cannot be parsed
+/// ([`trajectory::load`] never fails loudly — Invariant §0.1).
+#[tauri::command]
+pub async fn get_trajectory_summary(pr: String) -> Result<Option<TrajectorySummary>, CommandError> {
+    let summary = tokio::task::spawn_blocking(move || trajectory::load(&pr))
+        .await
+        .map_err(|e| CommandError {
+            message: format!("trajectory load task panicked: {e}"),
+        })?;
+    Ok(summary)
 }
 
 /// Return the full text of a single file on both sides of a review's diff (B4).
@@ -2266,6 +2296,119 @@ pub fn attach_review(
 // Restack command
 // ---------------------------------------------------------------------------
 
+/// Outcome of restacking a single review via [`restack_one`].
+///
+/// Drives the per-child progress event and the halt decision in
+/// [`restack_stack`]: a [`RestackStep::Conflict`] hands the branch to a
+/// conflict-resolver agent and stops the sequence, while [`RestackStep::Clean`]
+/// lets it continue to the next descendant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestackStep {
+    /// Rebase completed cleanly; the review's stale flag was cleared.
+    Clean,
+    /// Rebase hit conflicts; the conflict-resolver agent was dispatched.
+    Conflict,
+}
+
+/// Restack one review onto `parent_branch`, dispatching the conflict-resolver on
+/// failure, and persist the result to the store.
+///
+/// The shared core of both [`restack_pr`] (single review) and [`restack_stack`]
+/// (whole dependency-ordered stack). The git work runs synchronously (via
+/// [`restack::restack_review`]) and the `git2::Repository` — which is not `Send`
+/// — is dropped before any `.await`, so this future stays `Send` and can be
+/// awaited from a spawned background task.
+///
+/// On a clean rebase the stale flag is cleared and `base_sha` advances; on
+/// conflict the conflict-resolver agent (`AgentMode::Restack`) is spawned in the
+/// review's worktree with stdout streamed to the frontend, keyed by the PR ref
+/// so the Restack completion handler matches it. Either way `base_sha`, `stale`,
+/// and the agent handle are written back to the store.
+async fn restack_one(
+    state: &AppState,
+    app_handle: &tauri::AppHandle,
+    config: &Config,
+    repo_path: &Path,
+    pr_ref: &PrRef,
+    parent_branch: &str,
+) -> Result<RestackStep, CommandError> {
+    let mut review = state.reviews.get(pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr_ref}"),
+    })?;
+
+    // Phase 1: synchronous git restack. git2::Repository is not Send, so we
+    // must not hold it across an .await point.
+    let repo = git2::Repository::discover(repo_path).map_err(|e| CommandError {
+        message: format!(
+            "not inside a git repository at {}: {e}",
+            repo_path.display()
+        ),
+    })?;
+
+    let clean =
+        restack::restack_review(&repo, &mut review, parent_branch).map_err(|e| CommandError {
+            message: format!("restack failed: {e}"),
+        })?;
+
+    // Drop the repo before any .await to satisfy Send requirements.
+    drop(repo);
+
+    // Phase 2: if conflicts, spawn the conflict-resolver agent (async).
+    if !clean {
+        let spawn_config = SpawnConfig::from_config(config);
+        let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
+        let worktree_path = review.worktree.clone();
+
+        // Restack-mode custom preamble, injected verbatim (builtin fallback).
+        let preamble = config
+            .agent_prompts
+            .for_mode(AgentMode::Restack)
+            .map(str::to_owned);
+        let prompt = restack::assemble_conflict_prompt(&review, parent_branch, preamble.as_deref());
+        // Key the session + stream by the PR ref (not the ReviewId): the
+        // Restack completion handler resolves reviews by PrRef, so keying by
+        // ReviewId here would leave restack completions unmatched. Mirrors the
+        // Fix path (see `try_spawn_agent`).
+        let spawn_result = cockpit_core::adapters::agent::spawn_agent(
+            &worktree_path,
+            &prompt,
+            AgentMode::Restack,
+            review.pr.as_str(),
+            &state.sessions,
+            &hook_url,
+            &spawn_config,
+        )
+        .await
+        .map_err(|e| CommandError {
+            message: format!("failed to spawn conflict-resolver agent: {e}"),
+        })?;
+
+        // Start streaming agent stdout to the frontend.
+        let stream_ctx = crate::streaming::StreamContext {
+            object_id: review.pr.as_str().to_string(),
+            mode: AgentMode::Restack,
+            completion_tx: state.completion_tx.clone(),
+        };
+        let agent_run =
+            crate::streaming::start_stream_forwarding(spawn_result, app_handle.clone(), stream_ctx);
+        review.agent = Some(agent_run);
+    }
+
+    // Persist the updated review back to the in-memory store.
+    let review_clone = review.clone();
+    state.reviews.update(pr_ref, |r| {
+        r.base_sha = review_clone.base_sha.clone();
+        r.stale = review_clone.stale;
+        r.agent = review_clone.agent.clone();
+    });
+
+    Ok(if clean {
+        RestackStep::Clean
+    } else {
+        RestackStep::Conflict
+    })
+}
+
 /// Restack a stale PR onto its parent's new head.
 ///
 /// If the rebase is clean, clears the stale flag and returns the updated
@@ -2274,9 +2417,9 @@ pub fn attach_review(
 ///
 /// This is an explicit user action (Invariant 5).
 ///
-/// The git operations run synchronously (via `restack_review`) before any
-/// async agent spawn so that `git2::Repository` (not `Send`) never lives
-/// across an `.await` boundary.
+/// Delegates the git + spawn work to the shared [`restack_one`] helper, which
+/// runs the git operations synchronously before any async agent spawn so that
+/// `git2::Repository` (not `Send`) never lives across an `.await` boundary.
 #[tauri::command]
 pub async fn restack_pr(
     state: State<'_, Arc<AppState>>,
@@ -2285,7 +2428,7 @@ pub async fn restack_pr(
 ) -> Result<Review, CommandError> {
     let pr_ref = PrRef::new(&pr);
 
-    let mut review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
         message: format!("Review not found: {pr}"),
     })?;
 
@@ -2302,76 +2445,225 @@ pub async fn restack_pr(
         .unwrap_or_else(|| PathBuf::from("."));
     let parent_branch = review.base.clone();
 
-    // Phase 1: synchronous git restack. git2::Repository is not Send, so
-    // we must not hold it across an .await point.
-    let repo = git2::Repository::discover(&repo_path).map_err(|e| CommandError {
-        message: format!(
-            "not inside a git repository at {}: {e}",
-            repo_path.display()
-        ),
-    })?;
-
-    let clean =
-        restack::restack_review(&repo, &mut review, &parent_branch).map_err(|e| CommandError {
-            message: format!("restack failed: {e}"),
-        })?;
-
-    // Drop the repo before any .await to satisfy Send requirements.
-    drop(repo);
-
-    // Phase 2: if conflicts, spawn the conflict-resolver agent (async).
-    if !clean {
-        let spawn_config = SpawnConfig::from_config(&config);
-        let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
-        let worktree_path = review.worktree.clone();
-
-        // Restack-mode custom preamble, injected verbatim (builtin fallback).
-        let preamble = config
-            .agent_prompts
-            .for_mode(AgentMode::Restack)
-            .map(str::to_owned);
-        let prompt =
-            restack::assemble_conflict_prompt(&review, &parent_branch, preamble.as_deref());
-        // Key the session + stream by the PR ref (not the ReviewId): the
-        // Restack completion handler resolves reviews by PrRef, so keying by
-        // ReviewId here would leave restack completions unmatched. Mirrors the
-        // Fix path (see `try_spawn_agent`).
-        let spawn_result = cockpit_core::adapters::agent::spawn_agent(
-            &worktree_path,
-            &prompt,
-            cockpit_core::model::AgentMode::Restack,
-            review.pr.as_str(),
-            &state.sessions,
-            &hook_url,
-            &spawn_config,
-        )
-        .await
-        .map_err(|e| CommandError {
-            message: format!("failed to spawn conflict-resolver agent: {e}"),
-        })?;
-
-        // Start streaming agent stdout to the frontend.
-        let stream_ctx = crate::streaming::StreamContext {
-            object_id: review.pr.as_str().to_string(),
-            mode: cockpit_core::model::AgentMode::Restack,
-            completion_tx: state.completion_tx.clone(),
-        };
-        let agent_run =
-            crate::streaming::start_stream_forwarding(spawn_result, app_handle, stream_ctx);
-        review.agent = Some(agent_run);
-    }
-
-    // Persist the updated review back to the in-memory store.
-    let review_clone = review.clone();
-    state.reviews.update(&pr_ref, |r| {
-        r.base_sha = review_clone.base_sha.clone();
-        r.stale = review_clone.stale;
-        r.agent = review_clone.agent.clone();
-    });
+    restack_one(
+        &state,
+        &app_handle,
+        &config,
+        &repo_path,
+        &pr_ref,
+        &parent_branch,
+    )
+    .await?;
 
     state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
         message: format!("Review not found after restack: {pr}"),
     })
+}
+
+/// Progress event payload for a [`restack_stack`] run.
+///
+/// Emitted on the hand-typed `"restack-progress"` Tauri event so the frontend
+/// can track a whole-stack restack live. `current`/`total` are 1-based over the
+/// dependency-ordered descendants; `status` is `"restacking"` before a child,
+/// its outcome afterwards (`"clean"`/`"conflict"`/`"error"`), and `"done"` once
+/// the entire sequence completes cleanly. Hand-typed on the frontend (no
+/// `ts-rs`).
+#[derive(Debug, Clone, serde::Serialize)]
+struct RestackProgressPayload {
+    /// PR ref of the stack root the run was requested for.
+    root_pr: String,
+    /// 1-based index of the child currently being restacked (0 on a load error).
+    current: u32,
+    /// Total number of descendants in the restack order.
+    total: u32,
+    /// PR ref of the child this event is about (empty on the final `"done"`).
+    current_pr: String,
+    /// Phase of the run: `restacking` | `clean` | `conflict` | `done` | `error`.
+    status: &'static str,
+}
+
+/// Emit a `"restack-progress"` event, swallowing any emit failure.
+fn emit_restack_progress(
+    app_handle: &tauri::AppHandle,
+    root_pr: &str,
+    current: u32,
+    total: u32,
+    current_pr: &str,
+    status: &'static str,
+) {
+    use tauri::Emitter;
+    let payload = RestackProgressPayload {
+        root_pr: root_pr.to_string(),
+        current,
+        total,
+        current_pr: current_pr.to_string(),
+        status,
+    };
+    let _ = app_handle.emit("restack-progress", &payload);
+}
+
+/// Restack a whole stack: rebase every descendant of `root_pr` onto its parent
+/// in dependency order, one at a time (D3).
+///
+/// This is an explicit user action (Invariant 5). It computes the
+/// dependency-ordered descendants of the root (via [`restack::dependency_order`],
+/// scoped to the root's project like the fan-out) and drives them SEQUENTIALLY
+/// on a background task, emitting `"restack-progress"` events as it goes. The
+/// command itself returns immediately once the sequence is launched.
+///
+/// Guards (typed errors, checked before launching):
+/// - an empty order (the root has no descendants) — nothing to restack;
+/// - any review in the order already has an agent attached — someone is
+///   mid-rework and restacking underneath them would clobber their branch.
+///
+/// Per-child semantics mirror [`restack_pr`]: a clean rebase clears stale and
+/// the sequence continues; a conflict dispatches the conflict-resolver agent and
+/// HALTS the sequence (the remaining descendants stay stale until the resolver
+/// lands and the user restacks again); a hard error also halts.
+#[tauri::command]
+pub async fn restack_stack(
+    state: State<'_, Arc<AppState>>,
+    app_handle: tauri::AppHandle,
+    root_pr: String,
+) -> Result<(), CommandError> {
+    let root_ref = PrRef::new(&root_pr);
+    let root = state.reviews.get(&root_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {root_pr}"),
+    })?;
+
+    // Scope the review set to the root's project (as the fan-out does) and
+    // compute the dependency-ordered descendants.
+    let reviews = cockpit_core::store::reviews_by_project(&state.reviews, root.project.as_ref());
+    let order = restack::dependency_order(&reviews, &root.id);
+
+    if order.is_empty() {
+        return Err(CommandError {
+            message: format!("Stack rooted at {root_pr} has nothing to restack"),
+        });
+    }
+
+    // Guard: refuse if any review in the order is mid-rework. Restacking a branch
+    // out from under a running agent would clobber its work.
+    for (id, _) in &order {
+        if let Some(r) = reviews.iter().find(|r| &r.id == id)
+            && r.agent.is_some()
+        {
+            return Err(CommandError {
+                message: format!(
+                    "Review {} is mid-rework (agent attached); wait for it to finish before restacking the stack",
+                    r.pr
+                ),
+            });
+        }
+    }
+
+    // Resolve the ordered ids to (PrRef, parent_branch) pairs up front from the
+    // snapshot, so the background task does not need the id -> PrRef mapping.
+    // dependency_order skips dangling ids, so every id resolves here.
+    let steps: Vec<(PrRef, String)> = order
+        .into_iter()
+        .filter_map(|(id, parent_branch)| {
+            reviews
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| (r.pr.clone(), parent_branch))
+        })
+        .collect();
+
+    // Launch the sequence on a background task so the command returns promptly.
+    let state_arc: Arc<AppState> = state.inner().clone();
+    let app_handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        run_restack_sequence(state_arc, app_handle, root_pr, steps).await;
+    });
+
+    Ok(())
+}
+
+/// Drive a dependency-ordered restack sequence to completion (or first halt).
+///
+/// Runs on a background task spawned by [`restack_stack`]. Loads config once,
+/// then restacks each `(PrRef, parent_branch)` pair in order via [`restack_one`],
+/// emitting `"restack-progress"` before and after each child. A conflict or a
+/// hard error halts the sequence (leaving later descendants stale); a fully
+/// clean run emits a final `"done"`. Every failure mode is non-fatal to the task
+/// (Invariant §0.1): errors are logged and surfaced as progress events, never a
+/// panic.
+async fn run_restack_sequence(
+    state: Arc<AppState>,
+    app_handle: tauri::AppHandle,
+    root_pr: String,
+    steps: Vec<(PrRef, String)>,
+) {
+    let total = steps.len() as u32;
+
+    // Load config + repo path once for the whole sequence. A load failure aborts
+    // before touching any branch.
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("restack_stack: config load failed: {e}");
+            emit_restack_progress(&app_handle, &root_pr, 0, total, "", "error");
+            return;
+        }
+    };
+    let repo_path = config
+        .repo_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    for (idx, (pr_ref, parent_branch)) in steps.iter().enumerate() {
+        let current = idx as u32 + 1;
+        let current_pr = pr_ref.as_str().to_string();
+
+        emit_restack_progress(
+            &app_handle,
+            &root_pr,
+            current,
+            total,
+            &current_pr,
+            "restacking",
+        );
+
+        match restack_one(
+            &state,
+            &app_handle,
+            &config,
+            &repo_path,
+            pr_ref,
+            parent_branch,
+        )
+        .await
+        {
+            Ok(RestackStep::Clean) => {
+                emit_restack_progress(&app_handle, &root_pr, current, total, &current_pr, "clean");
+            }
+            Ok(RestackStep::Conflict) => {
+                // The conflict-resolver agent now owns this branch; stop here so
+                // later descendants are not restacked onto an unresolved base.
+                emit_restack_progress(
+                    &app_handle,
+                    &root_pr,
+                    current,
+                    total,
+                    &current_pr,
+                    "conflict",
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "restack_stack: restack failed for {current_pr}: {}",
+                    e.message
+                );
+                emit_restack_progress(&app_handle, &root_pr, current, total, &current_pr, "error");
+                return;
+            }
+        }
+    }
+
+    // The whole sequence completed cleanly.
+    emit_restack_progress(&app_handle, &root_pr, total, total, "", "done");
 }
 
 // ---------------------------------------------------------------------------
@@ -2387,7 +2679,7 @@ pub async fn restack_pr(
 pub async fn fetch_authored_prs(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<Review>, CommandError> {
-    fetch_prs_by_filter(state, github::PrFilter::Authored).await
+    fetch_prs_by_filter(&state, github::PrFilter::Authored).await
 }
 
 /// Fetch open PRs where the current user is requested for review.
@@ -2399,7 +2691,7 @@ pub async fn fetch_authored_prs(
 pub async fn fetch_review_requests(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<Review>, CommandError> {
-    fetch_prs_by_filter(state, github::PrFilter::ReviewRequested).await
+    fetch_prs_by_filter(&state, github::PrFilter::ReviewRequested).await
 }
 
 /// Shared implementation for fetching PRs by filter.
@@ -2411,8 +2703,11 @@ pub async fn fetch_review_requests(
 /// while a rework is in flight (an attached agent or `Dispatched` state): the
 /// local worktree HEAD leads GitHub's last-reported OID then, so adopting the
 /// fetched head would point the diff/full-file view at a stale revision.
-async fn fetch_prs_by_filter(
-    state: State<'_, Arc<AppState>>,
+///
+/// Takes `&AppState` (not `State`) so both the thin commands and the background
+/// notify poller (D4) share this exact fetch + no-clobber refresh path.
+pub(crate) async fn fetch_prs_by_filter(
+    state: &AppState,
     filter: github::PrFilter,
 ) -> Result<Vec<Review>, CommandError> {
     let config = Config::load()?;

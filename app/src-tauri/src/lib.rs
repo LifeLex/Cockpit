@@ -8,12 +8,15 @@ mod error;
 mod state;
 mod streaming;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager};
+use tauri_plugin_notification::NotificationExt;
 
+use cockpit_core::config::Config;
 use cockpit_core::gate::{AgentOutcome, Gated};
-use cockpit_core::model::{AgentMode, GateState, PrRef, Project, ProjectId, Review};
+use cockpit_core::model::{AgentMode, GateState, PrRef, Project, ProjectId, Review, ReviewSource};
 
 use state::AppState;
 
@@ -101,6 +104,10 @@ pub fn run() {
     // app_state is moved into `.manage()`.
     let flush_reviews = app_state.reviews.clone();
     let flush_projects = app_state.projects.clone();
+
+    // Clone the full AppState handle for the notify poller (D4) before app_state
+    // is moved into `.manage()`.
+    let notify_state = app_state.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -251,6 +258,21 @@ pub fn run() {
                 }
             });
 
+            // Notify-on-reviewable poller (D4). When `notify_poll_secs` is set,
+            // a background task refreshes the board on an interval and raises an
+            // OS notification on an external transition worth attention (a new
+            // review request, CI going green, or new commits on a review-request
+            // PR). Disabled by default (`None`/`0`); config load failure falls
+            // back to the default (disabled) so a bad config never blocks launch.
+            let notify_secs = notify_interval_secs(&Config::load().unwrap_or_default());
+            if let Some(interval_secs) = notify_secs {
+                let poller_state = notify_state;
+                let poller_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    run_notify_poller(poller_state, poller_handle, interval_secs).await;
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -261,6 +283,7 @@ pub fn run() {
             commands::get_review_diff,
             commands::get_interdiff,
             commands::get_evidence,
+            commands::get_trajectory_summary,
             commands::get_file_pair,
             commands::pre_review,
             commands::add_comment,
@@ -296,6 +319,7 @@ pub fn run() {
             commands::create_project,
             commands::attach_review,
             commands::restack_pr,
+            commands::restack_stack,
             commands::fetch_authored_prs,
             commands::fetch_review_requests,
             commands::shell::spawn_shell,
@@ -681,4 +705,462 @@ fn extract_pr_number(pr_str: &str) -> Option<u64> {
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------
+// Notify-on-reviewable poller (D4)
+// ---------------------------------------------------------------------------
+
+/// Minimum poll interval in seconds.
+///
+/// Each poll cycle shells out to `gh` twice (authored + review-requested), so a
+/// tighter loop would hammer GitHub for no practical gain — review-request
+/// changes are not second-sensitive. Any configured value is floored here.
+const NOTIFY_POLL_FLOOR_SECS: u64 = 30;
+
+/// Resolve the effective notify poll interval in seconds, or `None` when the
+/// poller is disabled.
+///
+/// `notify_poll_secs` of `None` or `0` disables background polling; any positive
+/// value is floored at [`NOTIFY_POLL_FLOOR_SECS`].
+fn notify_interval_secs(config: &Config) -> Option<u64> {
+    match config.notify_poll_secs {
+        None | Some(0) => None,
+        Some(secs) => Some((secs as u64).max(NOTIFY_POLL_FLOOR_SECS)),
+    }
+}
+
+/// A per-PR snapshot the notify poller diffs across cycles to detect the
+/// external transitions worth an OS notification.
+///
+/// Deliberately small and `PartialEq` so [`diff_snapshots`] is a pure function
+/// of two snapshot maps (and unit-testable without any Tauri or GitHub state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrSnapshot {
+    /// Whether this PR is a review request (vs the user's own authored PR).
+    review_requested: bool,
+    /// Whether the review is currently open for review (`InReview`).
+    in_review: bool,
+    /// Whether CI currently reports at least one failing check.
+    ci_failed: bool,
+    /// Whether CI is fully green (has checks, none failing, none pending).
+    ci_passing: bool,
+    /// The PR head commit SHA at snapshot time.
+    head_sha: String,
+    /// PR title, used for the "review requested" notification body.
+    title: String,
+}
+
+/// Build the per-PR snapshot for a review.
+fn snapshot_of(review: &Review) -> PrSnapshot {
+    let (ci_failed, ci_passing) = match review.ci_summary {
+        Some(ci) => (
+            ci.failed > 0,
+            ci.total > 0 && ci.failed == 0 && ci.pending == 0,
+        ),
+        None => (false, false),
+    };
+    PrSnapshot {
+        review_requested: review.source == ReviewSource::ReviewRequested,
+        in_review: review.gate_state == GateState::InReview,
+        ci_failed,
+        ci_passing,
+        head_sha: review.head_sha.clone(),
+        title: review.title.clone(),
+    }
+}
+
+/// Build a `pr -> snapshot` map from a set of reviews (keyed by PR ref).
+fn build_pr_snapshots<'a>(
+    reviews: impl Iterator<Item = &'a Review>,
+) -> HashMap<String, PrSnapshot> {
+    reviews
+        .map(|r| (r.pr.as_str().to_string(), snapshot_of(r)))
+        .collect()
+}
+
+/// Choose the display label for a PR: its title when present, else its ref.
+fn display_pr(pr: &str, title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        pr.to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+/// Compute the notification messages for the transitions between two snapshots.
+///
+/// Pure and deterministic (output sorted): the only external transitions the
+/// poller raises are (1) a new review-request PR appearing, (2) CI going
+/// failing → fully-green on an `InReview` review, and (3) new commits landing on
+/// a review-request PR. Rework/agent-completion notifications are intentionally
+/// NOT computed here — they stay owned by the existing `agent-completed` path so
+/// the two sources never double-notify.
+fn diff_snapshots(
+    prev: &HashMap<String, PrSnapshot>,
+    next: &HashMap<String, PrSnapshot>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+
+    for (pr, cur) in next {
+        match prev.get(pr) {
+            // Newly seen PR: only review requests warrant an appear notification
+            // (an authored PR appearing is the user's own push, not news).
+            None => {
+                if cur.review_requested {
+                    out.push(format!("Review requested: {}", display_pr(pr, &cur.title)));
+                }
+            }
+            Some(old) => {
+                // CI transitioned failing -> fully green on a review being read.
+                if cur.in_review && old.ci_failed && !cur.ci_failed && cur.ci_passing {
+                    out.push(format!("CI green on {pr}"));
+                }
+                // New commits on a review-request PR (re-review needed).
+                if cur.review_requested && !cur.head_sha.is_empty() && old.head_sha != cur.head_sha
+                {
+                    out.push(format!("New commits on {pr}"));
+                }
+            }
+        }
+    }
+
+    // Sort for a deterministic single-message case (and stable tests).
+    out.sort();
+    out
+}
+
+/// Collapse per-PR messages into at most one OS notification for the cycle.
+///
+/// `None` when nothing changed; the single message when exactly one transition
+/// fired; a summarized count otherwise — so a poll cycle raises at most one
+/// notification. Returns `(title, body)`.
+fn coalesce_notifications(messages: &[String]) -> Option<(String, String)> {
+    match messages {
+        [] => None,
+        [one] => Some(("Cockpit".to_string(), one.clone())),
+        many => Some((
+            "Cockpit".to_string(),
+            format!("{} reviews need attention", many.len()),
+        )),
+    }
+}
+
+/// Run the notify-on-reviewable poll loop until the app shuts down (D4).
+///
+/// Each cycle re-fetches both PR filters through the same
+/// [`commands::fetch_prs_by_filter`] path the interactive fetch commands use
+/// (so the no-clobber refresh guards are preserved), emits `board-updated` so
+/// the frontend refreshes from the store without polling, then diffs the fetched
+/// state against the previous cycle to raise at most one OS notification via the
+/// notification plugin's Rust builder.
+///
+/// The first cycle only seeds the baseline (no notifications) so pre-existing
+/// review requests do not all fire at startup. Every failure mode is non-fatal
+/// (Invariant §0.1): a failed `gh` fetch or a failed notification is logged and
+/// the loop continues rather than crashing the task.
+async fn run_notify_poller(state: Arc<AppState>, app_handle: tauri::AppHandle, interval_secs: u64) {
+    use cockpit_core::adapters::github::PrFilter;
+
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    // The first tick fires immediately; consume it so the first real poll waits
+    // one full interval (the frontend already fetches on mount, so the poller
+    // need not add a startup `gh` burst).
+    ticker.tick().await;
+
+    let mut prev: HashMap<String, PrSnapshot> = HashMap::new();
+    let mut seeded = false;
+
+    loop {
+        ticker.tick().await;
+
+        // Re-fetch both filters via the shared no-clobber path. A failed fetch
+        // skips the cycle without disturbing the baseline.
+        let authored = match commands::fetch_prs_by_filter(&state, PrFilter::Authored).await {
+            Ok(reviews) => reviews,
+            Err(e) => {
+                eprintln!("notify poller: authored fetch failed: {}", e.message);
+                continue;
+            }
+        };
+        let requested = match commands::fetch_prs_by_filter(&state, PrFilter::ReviewRequested).await
+        {
+            Ok(reviews) => reviews,
+            Err(e) => {
+                eprintln!("notify poller: review-request fetch failed: {}", e.message);
+                continue;
+            }
+        };
+
+        // Nudge the frontend to refresh from the store (event-driven, not
+        // polling). Best-effort: dropped if no window is listening.
+        let _ = app_handle.emit("board-updated", ());
+
+        let next = build_pr_snapshots(authored.iter().chain(requested.iter()));
+
+        // Skip notifications on the seeding cycle; only diff once we have a real
+        // prior baseline.
+        if seeded {
+            let messages = diff_snapshots(&prev, &next);
+            if let Some((title, body)) = coalesce_notifications(&messages)
+                && let Err(e) = app_handle
+                    .notification()
+                    .builder()
+                    .title(title)
+                    .body(body)
+                    .show()
+            {
+                eprintln!("notify poller: show notification failed: {e}");
+            }
+        }
+
+        prev = next;
+        seeded = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot with all-quiet defaults, overridden per test.
+    fn snap() -> PrSnapshot {
+        PrSnapshot {
+            review_requested: false,
+            in_review: false,
+            ci_failed: false,
+            ci_passing: false,
+            head_sha: "sha0".to_string(),
+            title: String::new(),
+        }
+    }
+
+    fn map(entries: &[(&str, PrSnapshot)]) -> HashMap<String, PrSnapshot> {
+        entries
+            .iter()
+            .map(|(pr, s)| ((*pr).to_string(), s.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn new_review_request_notifies_with_title() {
+        let prev = HashMap::new();
+        let next = map(&[(
+            "owner/repo#1",
+            PrSnapshot {
+                review_requested: true,
+                title: "Fix the widget".to_string(),
+                ..snap()
+            },
+        )]);
+        assert_eq!(
+            diff_snapshots(&prev, &next),
+            vec!["Review requested: Fix the widget".to_string()]
+        );
+    }
+
+    #[test]
+    fn new_review_request_falls_back_to_ref_without_title() {
+        let prev = HashMap::new();
+        let next = map(&[(
+            "owner/repo#2",
+            PrSnapshot {
+                review_requested: true,
+                ..snap()
+            },
+        )]);
+        assert_eq!(
+            diff_snapshots(&prev, &next),
+            vec!["Review requested: owner/repo#2".to_string()]
+        );
+    }
+
+    #[test]
+    fn new_authored_pr_does_not_notify() {
+        let prev = HashMap::new();
+        let next = map(&[(
+            "owner/repo#3",
+            PrSnapshot {
+                review_requested: false,
+                ..snap()
+            },
+        )]);
+        assert!(diff_snapshots(&prev, &next).is_empty());
+    }
+
+    #[test]
+    fn ci_failing_to_green_on_in_review_notifies() {
+        let prev = map(&[(
+            "owner/repo#4",
+            PrSnapshot {
+                in_review: true,
+                ci_failed: true,
+                ci_passing: false,
+                ..snap()
+            },
+        )]);
+        let next = map(&[(
+            "owner/repo#4",
+            PrSnapshot {
+                in_review: true,
+                ci_failed: false,
+                ci_passing: true,
+                ..snap()
+            },
+        )]);
+        assert_eq!(
+            diff_snapshots(&prev, &next),
+            vec!["CI green on owner/repo#4".to_string()]
+        );
+    }
+
+    #[test]
+    fn ci_green_but_not_in_review_does_not_notify() {
+        let prev = map(&[(
+            "owner/repo#5",
+            PrSnapshot {
+                in_review: false,
+                ci_failed: true,
+                ..snap()
+            },
+        )]);
+        let next = map(&[(
+            "owner/repo#5",
+            PrSnapshot {
+                in_review: false,
+                ci_failed: false,
+                ci_passing: true,
+                ..snap()
+            },
+        )]);
+        assert!(diff_snapshots(&prev, &next).is_empty());
+    }
+
+    #[test]
+    fn ci_pending_after_failure_does_not_notify() {
+        // Failing -> still pending (not yet green) must not fire.
+        let prev = map(&[(
+            "owner/repo#6",
+            PrSnapshot {
+                in_review: true,
+                ci_failed: true,
+                ..snap()
+            },
+        )]);
+        let next = map(&[(
+            "owner/repo#6",
+            PrSnapshot {
+                in_review: true,
+                ci_failed: false,
+                ci_passing: false,
+                ..snap()
+            },
+        )]);
+        assert!(diff_snapshots(&prev, &next).is_empty());
+    }
+
+    #[test]
+    fn new_commits_on_review_request_notifies() {
+        let prev = map(&[(
+            "owner/repo#7",
+            PrSnapshot {
+                review_requested: true,
+                head_sha: "sha_old".to_string(),
+                ..snap()
+            },
+        )]);
+        let next = map(&[(
+            "owner/repo#7",
+            PrSnapshot {
+                review_requested: true,
+                head_sha: "sha_new".to_string(),
+                ..snap()
+            },
+        )]);
+        assert_eq!(
+            diff_snapshots(&prev, &next),
+            vec!["New commits on owner/repo#7".to_string()]
+        );
+    }
+
+    #[test]
+    fn new_commits_on_authored_pr_does_not_notify() {
+        let prev = map(&[(
+            "owner/repo#8",
+            PrSnapshot {
+                review_requested: false,
+                head_sha: "sha_old".to_string(),
+                ..snap()
+            },
+        )]);
+        let next = map(&[(
+            "owner/repo#8",
+            PrSnapshot {
+                review_requested: false,
+                head_sha: "sha_new".to_string(),
+                ..snap()
+            },
+        )]);
+        assert!(diff_snapshots(&prev, &next).is_empty());
+    }
+
+    #[test]
+    fn no_change_yields_no_messages() {
+        let s = map(&[(
+            "owner/repo#9",
+            PrSnapshot {
+                review_requested: true,
+                head_sha: "sha_x".to_string(),
+                ..snap()
+            },
+        )]);
+        assert!(diff_snapshots(&s, &s).is_empty());
+    }
+
+    #[test]
+    fn coalesce_empty_single_and_many() {
+        assert_eq!(coalesce_notifications(&[]), None);
+
+        let one = vec!["Review requested: A".to_string()];
+        assert_eq!(
+            coalesce_notifications(&one),
+            Some(("Cockpit".to_string(), "Review requested: A".to_string()))
+        );
+
+        let many = vec![
+            "Review requested: A".to_string(),
+            "CI green on B".to_string(),
+            "New commits on C".to_string(),
+        ];
+        assert_eq!(
+            coalesce_notifications(&many),
+            Some((
+                "Cockpit".to_string(),
+                "3 reviews need attention".to_string()
+            ))
+        );
+    }
+
+    fn config_with(notify_poll_secs: Option<u16>) -> Config {
+        Config {
+            notify_poll_secs,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn notify_interval_floors_and_disables() {
+        assert_eq!(notify_interval_secs(&config_with(None)), None);
+        assert_eq!(notify_interval_secs(&config_with(Some(0))), None);
+        assert_eq!(
+            notify_interval_secs(&config_with(Some(5))),
+            Some(NOTIFY_POLL_FLOOR_SECS)
+        );
+        assert_eq!(notify_interval_secs(&config_with(Some(90))), Some(90));
+    }
 }

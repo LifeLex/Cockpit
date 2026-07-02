@@ -11,6 +11,7 @@
 import type { Review } from "../bindings/Review";
 import type { GateState } from "../bindings/GateState";
 import { elapsedSince } from "./relative-time";
+import { attentionReasons } from "./attention";
 
 function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
@@ -30,6 +31,23 @@ export interface CardSignal {
   readonly reason: string;
   /** Semantic tone driving the reason line color. */
   readonly tone: SignalTone;
+  /**
+   * Optional secondary risk note (e.g. `CI failing`, `Large diff`) layered
+   * *under* the gate reason on the same line. Present only for actionable
+   * reviews that carry a risk signal; the gate/stale reason always leads.
+   */
+  readonly note?: string;
+}
+
+/**
+ * Attach the sharpest risk note to an actionable review's signal, keeping the
+ * gate reason as the loud headline. Precedence follows {@link attentionReasons}
+ * (CI failing, then size, then sensitive paths); `undefined` when the review is
+ * clean, so `note` is omitted rather than set empty.
+ */
+function withRiskNote(signal: CardSignal, review: Review): CardSignal {
+  const note = attentionReasons(review)[0];
+  return note === undefined ? signal : { ...signal, note };
 }
 
 /**
@@ -46,11 +64,20 @@ export function cardSignal(review: Review, now: number = Date.now()): CardSignal
   const state: GateState = review.gate_state;
   switch (state) {
     case "Pending":
-      return { reason: "Needs your review", tone: "attention" };
+      return withRiskNote(
+        { reason: "Needs your review", tone: "attention" },
+        review,
+      );
     case "InReview":
-      return { reason: "Needs your review", tone: "attention" };
+      return withRiskNote(
+        { reason: "Needs your review", tone: "attention" },
+        review,
+      );
     case "Reworked":
-      return { reason: "Agent reworked — re-review", tone: "attention" };
+      return withRiskNote(
+        { reason: "Agent reworked — re-review", tone: "attention" },
+        review,
+      );
     case "Dispatched": {
       const elapsed =
         review.agent !== null

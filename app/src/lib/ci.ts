@@ -19,6 +19,11 @@ export type CiState = "pass" | "fail" | "pending" | "none";
 /**
  * Classify a single check outcome. Mirrors the Rust `summarize` rules:
  * neutral/skipped/cancelled count as pass; unknown states count as pending.
+ *
+ * CROSS-LANGUAGE MIRROR: these arms reproduce `classify_check_signal` in
+ * `cockpit-core`'s github adapter one-for-one (incl. the commit-status `error`
+ * -> fail). Any signal added or moved on the Rust side must be mirrored here,
+ * and vice versa, or the board badge and the server rollup will disagree.
  */
 export function checkOutcome(check: CiCheck): CheckOutcome {
   const signal = (check.bucket !== "" ? check.bucket : check.state).toLowerCase();
@@ -38,6 +43,7 @@ export function checkOutcome(check: CiCheck): CheckOutcome {
     case "action_required":
     case "startup_failure":
     case "stale":
+    case "error":
       return "fail";
     default:
       return "pending";

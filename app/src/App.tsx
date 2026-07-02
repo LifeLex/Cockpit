@@ -11,6 +11,7 @@ import type { ShortcutId } from "./lib/shortcuts";
 import { Sidebar } from "./components/Sidebar";
 import { ReviewCard } from "./components/ReviewCard";
 import { StackContainer } from "./components/StackContainer";
+import { FastLaneShelf } from "./components/FastLaneShelf";
 import { ProjectCard } from "./components/ProjectCard";
 import { ReviewWorkspace } from "./components/ReviewWorkspace";
 import { PlanView } from "./components/PlanView";
@@ -38,6 +39,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { buildBoardItems } from "./lib/stack-tree";
+import { isFastLane } from "./lib/attention";
 import type { CardDensity } from "./components/ReviewCard";
 import type { GateState } from "./bindings/GateState";
 import type { Review } from "./bindings/Review";
@@ -514,13 +516,18 @@ function App() {
 
   function renderProjectGroupedList(items: readonly Review[]) {
     const filtered = filterReviews(items);
-    const groups = groupReviewsByProject(filtered, projects);
+    // Fast lane filters AFTER search/state filters, then its members are
+    // excluded from the project groups below so nothing renders twice.
+    const fastLane = filtered.filter(isFastLane);
+    const fastLaneIds = new Set(fastLane.map((r) => r.id));
+    const rest = filtered.filter((r) => !fastLaneIds.has(r.id));
+    const groups = groupReviewsByProject(rest, projects);
 
-    if (groups.length === 0) {
+    if (fastLane.length === 0 && groups.length === 0) {
       return null;
     }
 
-    return groups.map((group) => (
+    const projectSections = groups.map((group) => (
       <section key={group.key} className="mb-6">
         <h2 className="mb-3 font-display text-sm font-semibold uppercase tracking-wide text-muted-foreground">
           {group.title}{" "}
@@ -552,6 +559,20 @@ function App() {
         </div>
       </section>
     ));
+
+    return (
+      <>
+        {fastLane.length > 0 && (
+          <FastLaneShelf
+            reviews={fastLane}
+            density={prsDensity}
+            onAction={handleReviewAction}
+            onRestack={handleRestack}
+          />
+        )}
+        {projectSections}
+      </>
+    );
   }
 
   function renderPrsContent(items: readonly Review[], emptyIcon: LucideIcon, emptyTitle: string, emptyDescription: string) {

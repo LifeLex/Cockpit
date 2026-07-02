@@ -47,6 +47,13 @@ describe("checkOutcome", () => {
     );
   });
 
+  it("classifies commit-status 'error' as fail (mirrors Rust classify_check_signal)", () => {
+    // The legacy commit-status `ERROR` state is a failure — it must not fall
+    // through to the pending default. Mirrors the Rust `error` -> fail arm.
+    expect(checkOutcome(check({ bucket: "error" }))).toBe("fail");
+    expect(checkOutcome(check({ bucket: "", state: "ERROR" }))).toBe("fail");
+  });
+
   it("is case-insensitive on the signal", () => {
     expect(checkOutcome(check({ bucket: "PASS" }))).toBe("pass");
     expect(checkOutcome(check({ bucket: "", state: "Failure" }))).toBe("fail");

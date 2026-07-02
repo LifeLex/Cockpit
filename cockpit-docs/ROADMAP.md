@@ -107,6 +107,30 @@ in A9). Next:
 - **E3. Linear description in intent** — kickoff reviews currently carry only the issue
   title; fetch the description for the intent panel and prompts.
 
+## Phase F — interaction refinements (from research round 2)
+
+Locked in by [`RESEARCH_INTERACTION_PATTERNS.md`](./RESEARCH_INTERACTION_PATTERNS.md)
+(2026-07-02). Not scheduled yet; sequenced after B–E land.
+
+- **F1. Finding taxonomy + downvote** — category chips on advisory findings (logic bug /
+  edge case / security / performance / …) and a per-finding thumbs-down feeding a local
+  noise metric (Graphite's field-tested trust mechanic). Extends `ReviewFinding`.
+- **F2. Amortized steering rules** — org/repo-level natural-language review rules
+  (a `review-rules.md` alongside skills) injected into the pre-pass prompt; steering
+  configured once, not per review.
+- **F3. Plan editing** — the plan gate gains direct authoring/editing (9/11 experts author
+  plans themselves; approve/reject-only serves the minority mode).
+- **F4. Chunked plan checkpoints** — experts hand agents ~2 steps at a time; explore
+  splitting batch builds into gated step-chunks rather than one fan-out (needs design; must
+  not fork the Gated loop).
+- **F5. Guided reading order** — risk-sorted file tree (signals-driven) that orders
+  attention without pre-supplying verdicts (priming hazard).
+- **F6. Size discipline nudge** — ">400 changed LOC — consider splitting" on cards/evidence
+  strip (Cisco sizing data).
+- **Binding constraint from the trust-miscalibration study**: no confidence scores or
+  polished provenance displays unless validated against detection *accuracy* — faster+more
+  confident with unchanged accuracy is the failure mode.
+
 ## Deliberate non-goals (guardrails, restated)
 
 - **No auto-approve, no auto-merge, no batch-approve.** Every terminal action stays behind

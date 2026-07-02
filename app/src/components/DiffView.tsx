@@ -56,6 +56,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { GatePill } from "./GatePill";
 import { IntentPanel } from "./IntentPanel";
+import { ConversationBand } from "./ConversationBand";
 import { AddressedRequests } from "./AddressedRequests";
 import { EvidenceStrip } from "./EvidenceStrip";
 import { SubmitReviewControl } from "./SubmitReviewControl";
@@ -629,22 +630,46 @@ export function DiffView({
   const submitGithubReview = useAppStore((s) => s.submitGithubReview);
   const fetchInterdiff = useAppStore((s) => s.fetchInterdiff);
 
+  // -- Phase E store actions (teammate conversation + interdiff) --
+  const fetchConversation = useAppStore((s) => s.fetchConversation);
+  const fetchTeammateInterdiff = useAppStore((s) => s.fetchTeammateInterdiff);
+
   // -- Phase B store actions (evidence / pre-review / full-file) --
   const fetchEvidence = useAppStore((s) => s.fetchEvidence);
   const preReview = useAppStore((s) => s.preReview);
   const fetchFilePair = useAppStore((s) => s.fetchFilePair);
   const listCiChecks = useAppStore((s) => s.listCiChecks);
 
-  // -- D10: interdiff (changes since the last review dispatch) --
+  // -- D10: authored interdiff (changes since the last review dispatch) --
   // A dispatch snapshot survives the Reworked→InReview reopen (it is cleared
   // only on the next dispatch), so the "changes since your review" view and the
   // D1 request pairing apply in BOTH states: Reworked (before reopen) and
-  // InReview (after reopen, where the Approve button lives).
-  const hasInterdiff =
+  // InReview (after reopen, where the Approve button lives). Never for a
+  // review-requested (teammate) PR — that uses the E2 last_reviewed_sha path.
+  const hasAuthoredInterdiff =
+    review.source !== "ReviewRequested" &&
     review.dispatch_snapshot != null &&
     (review.gate_state === "Reworked" || review.gate_state === "InReview");
+
+  // -- E2: teammate interdiff (changes since the user's last GitHub review) --
+  // Driven by last_reviewed_sha (set by submit_github_review), only for
+  // review-requested PRs. Distinct from the authored dispatch_snapshot path;
+  // by construction the two are mutually exclusive (a teammate PR carries no
+  // dispatch snapshot), but the source guard keeps them defensively separate.
+  const hasTeammateInterdiff =
+    review.source === "ReviewRequested" &&
+    review.last_reviewed_sha != null &&
+    review.last_reviewed_sha !== "" &&
+    review.head_sha !== "" &&
+    review.last_reviewed_sha !== review.head_sha;
+
+  // Whichever interdiff path applies drives the shared toggle machinery below.
+  const hasInterdiff = hasAuthoredInterdiff || hasTeammateInterdiff;
   const [interdiff, setInterdiff] = useState<DiffData | null>(null);
   const [diffSource, setDiffSource] = useState<"interdiff" | "full">("full");
+
+  // -- E1: whether a GitHub conversation fetch/refresh is in flight. --
+  const [conversationLoading, setConversationLoading] = useState(false);
 
   // Whether the interdiff is the active view (it exempts the full-file toggle).
   const interdiffActive = diffSource === "interdiff" && interdiff !== null;
@@ -884,8 +909,10 @@ export function DiffView({
     setActiveComment(null);
   }, [selectedFile]);
 
-  // -- D10: default a reworked review to its interdiff and fetch it. A fetch
-  // failure falls back to the full diff (the store surfaces the error). --
+  // -- Default a review with an interdiff to the "since your review" view and
+  // fetch it. The authored (D10) and teammate (E2) paths share this machinery
+  // but use different backend fetchers; a fetch failure (or nothing new to
+  // re-review) falls back to the full diff. --
   const reviewPr = review.pr;
   useEffect(() => {
     if (!hasInterdiff) {
@@ -895,10 +922,13 @@ export function DiffView({
     }
     setDiffSource("interdiff");
     let cancelled = false;
-    void fetchInterdiff(reviewPr).then((data) => {
+    const fetcher = hasTeammateInterdiff
+      ? fetchTeammateInterdiff
+      : fetchInterdiff;
+    void fetcher(reviewPr).then((data) => {
       if (cancelled) return;
       if (data === null) {
-        // Fetch failed; keep the full diff visible.
+        // Fetch failed (or no new commits); keep the full diff visible.
         setDiffSource("full");
         return;
       }
@@ -907,7 +937,39 @@ export function DiffView({
     return () => {
       cancelled = true;
     };
-  }, [reviewPr, hasInterdiff, fetchInterdiff]);
+  }, [
+    reviewPr,
+    hasInterdiff,
+    hasTeammateInterdiff,
+    fetchInterdiff,
+    fetchTeammateInterdiff,
+  ]);
+
+  // -- E1: fetch the GitHub conversation for a review-requested PR. Best-effort
+  // (the store never blocks on it); the band renders review.conversation, which
+  // the store mirrors from the returned items. Used both on entry and by the
+  // band's refresh button. --
+  const isReviewRequested = review.source === "ReviewRequested";
+  const handleRefreshConversation = useCallback(async () => {
+    setConversationLoading(true);
+    try {
+      await fetchConversation(reviewPr);
+    } finally {
+      setConversationLoading(false);
+    }
+  }, [fetchConversation, reviewPr]);
+
+  useEffect(() => {
+    if (!isReviewRequested) return;
+    let cancelled = false;
+    setConversationLoading(true);
+    void fetchConversation(reviewPr).finally(() => {
+      if (!cancelled) setConversationLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reviewPr, isReviewRequested, fetchConversation]);
 
   // -- Keep the selected file valid when the file set changes (e.g. toggling
   // between the interdiff and the full diff). --
@@ -1760,6 +1822,20 @@ export function DiffView({
                   {agentReason}
                 </span>
               )}
+
+              {/* E2: new commits landed since the user's last GitHub review. */}
+              {hasTeammateInterdiff && (
+                <span
+                  className="inline-flex shrink-0 items-center gap-1 text-warning"
+                  title="New commits were pushed since your last GitHub review"
+                >
+                  <span
+                    className="h-1.5 w-1.5 shrink-0 rounded-full bg-warning"
+                    aria-hidden="true"
+                  />
+                  pushed since your review
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -2108,6 +2184,19 @@ export function DiffView({
           onToggle={toggleIntent}
           onOpenIssue={(href) => {
             void openExternal(href);
+          }}
+        />
+      )}
+
+      {/* ----------------------------------------------------------------- */}
+      {/* GitHub conversation — read-only teammate context (E1)             */}
+      {/* ----------------------------------------------------------------- */}
+      {isReviewRequested && (
+        <ConversationBand
+          items={review.conversation}
+          loading={conversationLoading}
+          onRefresh={() => {
+            void handleRefreshConversation();
           }}
         />
       )}

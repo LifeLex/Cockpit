@@ -8,6 +8,7 @@ import type { Review } from "../bindings/Review";
 import type { GateState } from "../bindings/GateState";
 import type { CiCheck } from "../bindings/CiCheck";
 import type { AgentRun } from "../bindings/AgentRun";
+import type { ConversationItem } from "../bindings/ConversationItem";
 
 /** A minimal running agent, for the stale/agent-active edges. */
 export function makeAgentRun(overrides: Partial<AgentRun> = {}): AgentRun {
@@ -52,6 +53,25 @@ export function makeReview(overrides: Partial<Review> = {}): Review {
     conversation: [],
   };
   return { ...base, ...overrides };
+}
+
+/** A valid read-only `ConversationItem` (E1), an issue comment by default. */
+export function makeConversationItem(
+  overrides: Partial<ConversationItem> = {},
+): ConversationItem {
+  return {
+    id: "conv-1",
+    kind: "IssueComment",
+    author: "octocat",
+    body: "Looks reasonable to me.",
+    path: null,
+    line: null,
+    side: null,
+    state: null,
+    created_at: "2026-07-01T12:00:00Z",
+    url: "https://github.com/o/r/pull/1#issuecomment-1",
+    ...overrides,
+  };
 }
 
 /** A valid `CiCheck` with pass defaults. */

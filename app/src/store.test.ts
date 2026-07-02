@@ -10,7 +10,12 @@ import {
   mockInvokeReject,
   callsFor,
 } from "./test/tauri-mock";
-import { makeReview, makeCheck, makeAgentRun } from "./test/fixtures";
+import {
+  makeReview,
+  makeCheck,
+  makeAgentRun,
+  makeConversationItem,
+} from "./test/fixtures";
 
 // Route the store's Tauri imports through the typed mock. The factory returns
 // the singleton `invoke`/`listen` from the shared mock module so tests can
@@ -451,6 +456,85 @@ describe("fetchInterdiff", () => {
 
     expect(result).toBeNull();
     expect(useAppStore.getState().error).toContain("no snapshot");
+  });
+});
+
+describe("fetchConversation", () => {
+  it("mirrors the returned items onto the active review + lists (E1)", async () => {
+    const before = makeReview({ pr: "pr-1", conversation: [] });
+    useAppStore.setState({
+      activeReview: before,
+      reviews: [before],
+      reviewRequests: [before],
+    });
+    const items = [
+      makeConversationItem({ id: "c-1", kind: "Review", state: "APPROVED" }),
+    ];
+    mockInvoke("fetch_conversation", (args) => {
+      expect(args.pr).toBe("pr-1");
+      return items;
+    });
+
+    const returned = await useAppStore.getState().fetchConversation("pr-1");
+
+    expect(returned).toEqual(items);
+    const state = useAppStore.getState();
+    expect(state.activeReview?.conversation).toEqual(items);
+    expect(state.reviews[0]?.conversation).toEqual(items);
+    expect(state.reviewRequests[0]?.conversation).toEqual(items);
+    expect(state.error).toBeNull();
+  });
+
+  it("returns null and never sets the blocking error on failure (Invariant 1)", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockInvokeReject("fetch_conversation", "gh not found");
+
+    const result = await useAppStore.getState().fetchConversation("pr-1");
+
+    expect(result).toBeNull();
+    // Non-fatal: read-only context must not set the blocking store error.
+    expect(useAppStore.getState().error).toBeNull();
+    spy.mockRestore();
+  });
+});
+
+describe("fetchTeammateInterdiff", () => {
+  it("returns the teammate interdiff on success (E2)", async () => {
+    const diff = { raw: "diff --git a/x b/x" };
+    mockInvoke("get_teammate_interdiff", (args) => {
+      expect(args.pr).toBe("pr-1");
+      return diff;
+    });
+
+    const result = await useAppStore.getState().fetchTeammateInterdiff("pr-1");
+
+    expect(result).toEqual(diff);
+    expect(useAppStore.getState().error).toBeNull();
+  });
+
+  it("returns null silently for the benign 'no new commits' case", async () => {
+    mockInvokeReject(
+      "get_teammate_interdiff",
+      "Review pr-1 has no new commits since your last review",
+    );
+
+    const result = await useAppStore.getState().fetchTeammateInterdiff("pr-1");
+
+    expect(result).toBeNull();
+    // Nothing to re-review is not an error worth surfacing.
+    expect(useAppStore.getState().error).toBeNull();
+  });
+
+  it("surfaces other typed errors as a non-fatal store error", async () => {
+    mockInvokeReject(
+      "get_teammate_interdiff",
+      "Review pr-1 has no prior review recorded; submit a GitHub review first",
+    );
+
+    const result = await useAppStore.getState().fetchTeammateInterdiff("pr-1");
+
+    expect(result).toBeNull();
+    expect(useAppStore.getState().error).toContain("no prior review recorded");
   });
 });
 

@@ -18,12 +18,7 @@ import type { SizeClass } from "../bindings/SizeClass";
 import type { RiskFlag } from "../bindings/RiskFlag";
 import type { CiState } from "./ci";
 import { ciState } from "./ci";
-import {
-  diffTotals,
-  sizeClass,
-  sensitiveFlags,
-  hasSensitivePath,
-} from "./diff-signals";
+import { diffTotals, sizeClass, sensitiveFlags } from "./diff-signals";
 
 function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
@@ -117,10 +112,67 @@ function sizeAdjustment(size: SizeClass): number {
   }
 }
 
-/** The diff size class for a review, derived from its raw unified diff. */
-function reviewSizeClass(review: Review): SizeClass {
+/**
+ * The memoized triage signals derived for a single review: its rank plus the
+ * diff-scan results the cards and the fast lane read. Bundled so a review's
+ * (potentially large) diff is parsed at most once, no matter how many of
+ * `attentionRank` / `attentionReasons` / `isFastLane` / the stack-tree sort keys
+ * touch it within a render pass.
+ */
+interface ReviewSignals {
+  /** Full attention rank (lower sorts first). */
+  readonly rank: number;
+  /** Rolled-up CI state (`"none"` when no checks are loaded). */
+  readonly ci: CiState;
+  /** Diff size class, from the add/del totals. */
+  readonly size: SizeClass;
+  /** Total changed lines (additions + deletions), for the fast-lane cutoff. */
+  readonly totalLines: number;
+  /** Sensitive-path risk flags, at most one per touched file, in diff order. */
+  readonly sensitiveFlags: readonly RiskFlag[];
+  /** Whether the diff touches any sensitive path. */
+  readonly hasSensitive: boolean;
+}
+
+/**
+ * Per-review signal cache, keyed on object identity.
+ *
+ * A `WeakMap<Review, …>` is safe against staleness precisely because it is keyed
+ * on identity: every fetch/refresh replaces a review with a *fresh* object, so a
+ * mutated review can never hit a stale entry (the old object is simply gone and
+ * gets garbage-collected with its cache slot). The cache lives only to spare
+ * repeated diff scans of the *same* object within a single render pass.
+ */
+const signalsCache = new WeakMap<Review, ReviewSignals>();
+
+/** Compute (or return the cached) triage signals for a review. */
+function signalsFor(review: Review): ReviewSignals {
+  const cached = signalsCache.get(review);
+  if (cached !== undefined) {
+    return cached;
+  }
+
   const { additions, deletions } = diffTotals(review.diff.raw);
-  return sizeClass(additions, deletions);
+  const size = sizeClass(additions, deletions);
+  const flags = sensitiveFlags(review.diff.raw);
+  const hasSensitive = flags.length > 0;
+  const ci = reviewCiState(review);
+
+  const stalePenalty = review.stale ? 100 : 0;
+  const within =
+    ciAdjustment(ci) + sizeAdjustment(size) + (hasSensitive ? SENSITIVE : 0);
+  const rank = stalePenalty + gateStateRank(review.gate_state) + within;
+
+  const signals: ReviewSignals = {
+    rank,
+    ci,
+    size,
+    totalLines: additions + deletions,
+    sensitiveFlags: flags,
+    hasSensitive,
+  };
+  signalsCache.set(review, signals);
+  return signals;
 }
 
 /**
@@ -130,12 +182,7 @@ function reviewSizeClass(review: Review): SizeClass {
  * within-bucket signal adjustments order the rest.
  */
 export function attentionRank(review: Review): number {
-  const stalePenalty = review.stale ? 100 : 0;
-  const within =
-    ciAdjustment(reviewCiState(review)) +
-    sizeAdjustment(reviewSizeClass(review)) +
-    (hasSensitivePath(review.diff.raw) ? SENSITIVE : 0);
-  return stalePenalty + gateStateRank(review.gate_state) + within;
+  return signalsFor(review).rank;
 }
 
 /** Human-readable phrase for a sensitive-path risk flag. */
@@ -166,13 +213,13 @@ function riskReason(flag: RiskFlag): string {
  * green review (its gate reason stands alone).
  */
 export function attentionReasons(review: Review): string[] {
+  const { ci, size, sensitiveFlags: flags } = signalsFor(review);
   const reasons: string[] = [];
 
-  if (reviewCiState(review) === "fail") {
+  if (ci === "fail") {
     reasons.push("CI failing");
   }
 
-  const size = reviewSizeClass(review);
   if (size === "Xl") {
     reasons.push("Very large diff");
   } else if (size === "L") {
@@ -181,7 +228,7 @@ export function attentionReasons(review: Review): string[] {
 
   // One reason per distinct flag, in first-seen order (dedupe repeats).
   const seen = new Set<RiskFlag>();
-  for (const flag of sensitiveFlags(review.diff.raw)) {
+  for (const flag of flags) {
     if (!seen.has(flag)) {
       seen.add(flag);
       reasons.push(riskReason(flag));
@@ -204,9 +251,9 @@ function isActionable(review: Review): boolean {
 }
 
 /**
- * The upper bound (exclusive) on changed lines for the fast lane. Covers the
- * whole `S` bucket and the small half of `M` ("M-small"), matching the roadmap's
- * "small" definition.
+ * The upper bound (exclusive) on changed lines for the fast lane. `< 200` covers
+ * the whole `S` bucket (< 50) *and* the whole `M` bucket (`M` is [50, 200)),
+ * matching the roadmap's "small" definition; `L`/`Xl` (>= 200) never qualify.
  */
 const FAST_LANE_MAX_LINES = 200;
 
@@ -215,11 +262,17 @@ const FAST_LANE_MAX_LINES = 200;
  * "small + green + low-risk" review whose decision should take ~2 minutes.
  *
  * A review qualifies when it is actionable (Pending/InReview/Reworked and not
- * stale), its diff is small (< {@link FAST_LANE_MAX_LINES} changed lines), CI is
- * present and fully green, and it touches no sensitive paths. The test-weakening
- * signal is deliberately *not* consulted: it is computed server-side and is not
- * part of the card-subset TS mirror, so the fast lane is defined on size + CI +
- * paths only (a weakening flag still surfaces later at the diff gate).
+ * stale), it is a stack ROOT (no parents), its diff is small (<
+ * {@link FAST_LANE_MAX_LINES} changed lines), CI is present and fully green, and
+ * it touches no sensitive paths. The test-weakening signal is deliberately *not*
+ * consulted: it is computed server-side and is not part of the card-subset TS
+ * mirror, so the fast lane is defined on size + CI + paths only (a weakening flag
+ * still surfaces later at the diff gate).
+ *
+ * The stack-root requirement keeps stacks intact: surfacing a child in the fast
+ * lane ahead of its unreviewed parent violates frontier-root-first ordering and
+ * leaves a visual hole in the stack below it, so a parented review stays in its
+ * stack group even when it is small + green + low-risk.
  *
  * The fast lane compresses the *decision*, never the *authority*: it is not
  * auto-approve and grants no new terminal action (see roadmap C2 / CLAUDE.md
@@ -229,15 +282,19 @@ export function isFastLane(review: Review): boolean {
   if (!isActionable(review)) {
     return false;
   }
-  const { additions, deletions } = diffTotals(review.diff.raw);
-  if (additions + deletions >= FAST_LANE_MAX_LINES) {
+  // Only a stack root (no parents) may enter the fast lane — see the note above.
+  if (review.parents.length > 0) {
+    return false;
+  }
+  const { totalLines, ci, hasSensitive } = signalsFor(review);
+  if (totalLines >= FAST_LANE_MAX_LINES) {
     return false;
   }
   // CI must be loaded and fully green; absent CI ("none") does not qualify.
-  if (reviewCiState(review) !== "pass") {
+  if (ci !== "pass") {
     return false;
   }
-  if (hasSensitivePath(review.diff.raw)) {
+  if (hasSensitive) {
     return false;
   }
   return true;

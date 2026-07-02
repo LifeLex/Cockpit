@@ -83,10 +83,6 @@ pub struct PrData {
     /// Empty for legacy field sets, so defaulted.
     #[serde(default)]
     pub head_ref_oid: String,
-    /// Base commit SHA (`baseRefOid`), pinned at fetch (see `head_ref_oid`).
-    /// Empty for legacy field sets, so defaulted.
-    #[serde(default)]
-    pub base_ref_oid: String,
 }
 
 /// CI check status from `gh pr checks`.
@@ -148,6 +144,10 @@ enum CheckOutcome {
 /// Neutral, skipped, and cancelled map to [`CheckOutcome::Pass`] (they are not
 /// failures); an unknown signal maps conservatively to [`CheckOutcome::Pending`]
 /// so it is neither a false pass nor a false failure.
+///
+/// CROSS-LANGUAGE MIRROR: `checkOutcome` in `app/src/lib/ci.ts` reproduces these
+/// exact arms for the board's client-side CI badge. Any signal added or moved
+/// here (e.g. `error` -> fail) must be mirrored there, and vice versa.
 fn classify_check_signal(signal: &str) -> CheckOutcome {
     match signal.to_ascii_lowercase().as_str() {
         // gh buckets.
@@ -734,7 +734,6 @@ async fn enrich_task(index: usize, sr: SearchPrResult) -> (usize, PrData) {
                 repo_slug: slug,
                 status_check_rollup: Vec::new(),
                 head_ref_oid: String::new(),
-                base_ref_oid: String::new(),
             },
         ),
     }
@@ -832,7 +831,7 @@ async fn enrich_pr(repo_slug: &str, pr_number: u64) -> Result<PrData, Error> {
             "--repo",
             repo_slug,
             "--json",
-            "number,headRefName,baseRefName,title,body,state,url,statusCheckRollup,headRefOid,baseRefOid",
+            "number,headRefName,baseRefName,title,body,state,url,statusCheckRollup,headRefOid",
         ])
         .output()
         .await?;
@@ -917,14 +916,19 @@ pub fn build_review_from_pr(
         body: pr.body.clone(),
         branch: pr.head_ref_name.clone(),
         base: pr.base_ref_name.clone(),
-        // Pin the base/head SHAs from the fetch so the diff and full-file
-        // fallback resolve the exact revisions rather than re-resolving the base
-        // by branch name (which drifts as the base branch advances).
-        base_sha: pr.base_ref_oid.clone(),
+        // `base_sha` is the restack fork point (see [`Review::base_sha`]),
+        // computed locally at kickoff by walking git history — it is NOT the base
+        // branch tip. Pinning it to `baseRefOid` (the base branch's current tip)
+        // would break restack once the base advances, so imported PRs (which have
+        // no locally-known fork point) leave it empty; `get_file_pair` then
+        // resolves the base by branch name (see its doc for the drift limitation).
+        base_sha: String::new(),
         source,
         worktree: repo_path.to_path_buf(),
         gate_state: GateState::Pending,
         diff: DiffData { raw: diff },
+        // Pin `head_sha` from `headRefOid` so the diff / full-file view resolve
+        // the exact PR head revision rather than a drifting branch lookup.
         head_sha: pr.head_ref_oid.clone(),
         comments: vec![],
         parents: vec![],
@@ -1766,12 +1770,14 @@ mod tests {
         // Legacy JSON omits the rollup + OID fields; they default cleanly.
         assert!(prs[0].status_check_rollup.is_empty());
         assert_eq!(prs[0].head_ref_oid, "");
-        assert_eq!(prs[0].base_ref_oid, "");
     }
 
     #[test]
     fn deserialize_pr_data_with_rollup_and_oids() {
-        // The enriched field set: the rollup array plus pinned head/base OIDs.
+        // The enriched field set: the rollup array plus the pinned head OID. A
+        // `baseRefOid` in the payload is tolerated (unknown fields are ignored)
+        // but deliberately not deserialized — base_sha is the local fork point,
+        // never the base branch tip.
         let json = r#"[
             {
                 "number": 7,
@@ -1796,10 +1802,6 @@ mod tests {
         assert_eq!(
             prs[0].head_ref_oid,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
-        assert_eq!(
-            prs[0].base_ref_oid,
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
         assert_eq!(prs[0].status_check_rollup.len(), 3);
         // A CheckRun's completed conclusion, an in-flight null conclusion, and a
@@ -1826,7 +1828,6 @@ mod tests {
                 repo_slug: String::new(),
                 status_check_rollup: Vec::new(),
                 head_ref_oid: String::new(),
-                base_ref_oid: String::new(),
             },
             PrData {
                 number: 2,
@@ -1839,7 +1840,6 @@ mod tests {
                 repo_slug: String::new(),
                 status_check_rollup: Vec::new(),
                 head_ref_oid: String::new(),
-                base_ref_oid: String::new(),
             },
             PrData {
                 number: 3,
@@ -1852,7 +1852,6 @@ mod tests {
                 repo_slug: String::new(),
                 status_check_rollup: Vec::new(),
                 head_ref_oid: String::new(),
-                base_ref_oid: String::new(),
             },
         ];
 
@@ -2497,7 +2496,7 @@ index 1111111..2222222 100644
     // -- build_review_from_pr --
 
     #[test]
-    fn build_review_pins_shas_and_ci_summary() {
+    fn build_review_pins_head_sha_and_ci_summary() {
         let pr = PrData {
             number: 7,
             head_ref_name: "alejandro/NEX-7-thing".into(),
@@ -2515,7 +2514,6 @@ index 1111111..2222222 100644
             )
             .expect("rollup parses"),
             head_ref_oid: "aaa111".into(),
-            base_ref_oid: "bbb222".into(),
         };
 
         let review = build_review_from_pr(
@@ -2525,9 +2523,13 @@ index 1111111..2222222 100644
             ReviewSource::Authored,
         );
 
-        // SHAs are pinned from the fetched OIDs, not left empty (the drift fix).
+        // head_sha is pinned from headRefOid so the diff resolves the exact PR
+        // head. base_sha is the restack fork point (computed locally at kickoff),
+        // NOT the base branch tip, so an import leaves it empty — pinning it to
+        // baseRefOid would break restack once the base advances. This assertion
+        // guards that invariant against a re-pinning regression.
         assert_eq!(review.head_sha, "aaa111");
-        assert_eq!(review.base_sha, "bbb222");
+        assert_eq!(review.base_sha, "");
         // The rollup is summarized into ci_summary (1 pass, 1 fail).
         let ci = review.ci_summary.expect("rollup yields a summary");
         assert_eq!((ci.passed, ci.failed, ci.pending, ci.total), (1, 1, 0, 2));
@@ -2547,7 +2549,6 @@ index 1111111..2222222 100644
             repo_slug: String::new(),
             status_check_rollup: Vec::new(),
             head_ref_oid: String::new(),
-            base_ref_oid: String::new(),
         };
 
         let review = build_review_from_pr(

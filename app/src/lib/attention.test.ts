@@ -238,4 +238,24 @@ describe("isFastLane", () => {
     const review = makeReview({ gate_state: "Pending", ci_summary: CI_GREEN, diff: { raw: SENSITIVE } });
     expect(isFastLane(review)).toBe(false);
   });
+
+  it("excludes a parented (non-root) review to keep stacks intact", () => {
+    // A child that is otherwise fast-lane-eligible must stay in its stack group
+    // so it never surfaces ahead of its unreviewed parent (frontier-root-first).
+    const child = makeReview({
+      gate_state: "Pending",
+      ci_summary: CI_GREEN,
+      diff: { raw: SMALL },
+      parents: ["rev-parent"],
+    });
+    expect(isFastLane(child)).toBe(false);
+    // The same review with no parents (a stack root) does qualify.
+    const root = makeReview({
+      gate_state: "Pending",
+      ci_summary: CI_GREEN,
+      diff: { raw: SMALL },
+      parents: [],
+    });
+    expect(isFastLane(root)).toBe(true);
+  });
 });

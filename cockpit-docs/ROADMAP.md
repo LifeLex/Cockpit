@@ -40,7 +40,7 @@ it is the precondition for everything else.
 | A13 | Dead-code removal (workflow.rs engine, `get_version`, `transition_event`, dead frontier slice) | Unused seams misleading every future change |
 | A14 | Stack-grouped board (render the DAG with the existing `stack-tree` lib, enabled by A6) | Reviews form a dependency DAG; the board showed a flat list |
 
-## Phase B — Verification instead of reading
+## Phase B — Verification instead of reading (implemented — PR #13)
 
 DORA's mechanism (volume exposes weak control systems, R§1) and Meta's RADAR result (R§3)
 both say the same thing: the cheapest review minute is the one replaced by machine evidence
@@ -62,7 +62,7 @@ the reviewer can *trust at a glance*.
   contents when not) so reviewers can scroll beyond hunks and LSP hovers are truthful.
   (A1 fixed the line numbers; this fixes the blindfold.)
 
-## Phase C — Route human attention by risk
+## Phase C — Route human attention by risk (implemented — PR #14)
 
 Cockpit can't train a Diff Risk Score on Meta-scale history, but the *minimum viable risk
 signal* (open question R-OQ1) is computable locally today: diff size, path sensitivity
@@ -80,7 +80,7 @@ anomalies (retries, scope excursions, long thinking on one file).
 - **C4. Batch CI without N subprocesses** — `gh pr list/search --json statusCheckRollup` gives
   rollups in the list call; cards get CI state at fetch cost ~0.
 
-## Phase D — Make the rework cycle disappear
+## Phase D — Make the rework cycle disappear (implemented — PR #15)
 
 The loop is cockpit's moat (R§4). After A10's interdiff, the remaining cycle costs:
 
@@ -95,7 +95,7 @@ The loop is cockpit's moat (R§4). After A10's interdiff, the remaining cycle co
 - **D4. Notify on reviewable** — background refresh + OS notification when a PR flips
   Reworked / a new review-request arrives; suggest the next frontier item while agents run.
 
-## Phase E — The teammate half of the job
+## Phase E — The teammate half of the job (implemented — PR #16)
 
 The user reviews colleagues' PRs too; today that flow is read-only-plus-comment-spam (fixed
 in A9). Next:

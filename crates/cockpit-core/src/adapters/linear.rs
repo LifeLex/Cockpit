@@ -53,6 +53,7 @@ query ProjectIssues($projectId: String!) {
         id
         identifier
         title
+        description
         branchName
       }
     }
@@ -93,6 +94,10 @@ pub struct IssueNode {
     pub identifier: String,
     /// Issue title.
     pub title: String,
+    /// Issue description (markdown). Defaulted so an issue with no description —
+    /// and legacy fixtures that predate this field — parse to an empty string.
+    #[serde(default)]
+    pub description: String,
     /// The git branch name Linear generates for the issue.
     pub branch_name: String,
 }
@@ -330,7 +335,7 @@ mod tests {
             "project": {
                 "issues": {
                     "nodes": [
-                        { "id": "id-1", "identifier": "NEX-1", "title": "First", "branchName": "alejandro/nex-1-first" },
+                        { "id": "id-1", "identifier": "NEX-1", "title": "First", "description": "Define the trait and its contract.", "branchName": "alejandro/nex-1-first" },
                         { "id": "id-2", "identifier": "NEX-2", "title": "Second", "branchName": "alejandro/nex-2-second" },
                         { "id": "id-3", "identifier": "NEX-3", "title": "Third", "branchName": "alejandro/nex-3-third" }
                     ]
@@ -385,7 +390,11 @@ mod tests {
         let first = &data.issues[0];
         assert_eq!(first.identifier, "NEX-1");
         assert_eq!(first.title, "First");
+        assert_eq!(first.description, "Define the trait and its contract.");
         assert_eq!(first.branch_name, "alejandro/nex-1-first");
+
+        // NEX-2 omits `description`; serde default yields an empty string.
+        assert_eq!(data.issues[1].description, "");
     }
 
     #[test]

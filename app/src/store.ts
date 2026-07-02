@@ -19,6 +19,7 @@ import type { DiffSide } from "./bindings/DiffSide";
 import type { EvidenceSummary } from "./bindings/EvidenceSummary";
 import type { FilePair } from "./bindings/FilePair";
 import type { TrajectorySummary } from "./bindings/TrajectorySummary";
+import type { ConversationItem } from "./bindings/ConversationItem";
 
 /**
  * Live progress of a whole-stack restack (D3), mirroring the backend's
@@ -182,6 +183,29 @@ interface AppStore {
    * back to the full diff (D10). Requires a dispatch snapshot server-side.
    */
   fetchInterdiff: (pr: string) => Promise<DiffData | null>;
+
+  /**
+   * Fetch a review-requested PR's GitHub conversation (E1) and mirror it onto
+   * the in-memory review's `conversation` field. The backend also persists it
+   * server-side; merging the returned items here lets the read-only band
+   * re-render without a full review refetch.
+   *
+   * Best-effort (Invariant 1): the conversation is external read-only context, a
+   * glance aid, never a gate. Returns `null` and logs on failure rather than
+   * setting the blocking `error`.
+   */
+  fetchConversation: (pr: string) => Promise<ConversationItem[] | null>;
+
+  /**
+   * Fetch a teammate PR's interdiff since the user's last GitHub review (E2):
+   * the changes a review-requested PR received after it was reviewed.
+   *
+   * Returns `null` and sets a non-fatal store `error` on a typed failure (no
+   * prior review recorded, no repo slug, gh failure), EXCEPT the benign "no new
+   * commits" case, which returns `null` silently — there is simply nothing to
+   * re-review. Never blocks the loop (Invariant 1).
+   */
+  fetchTeammateInterdiff: (pr: string) => Promise<DiffData | null>;
 
   /**
    * Restack a stale review onto its parent's new head (explicit user action).
@@ -750,6 +774,54 @@ export const useAppStore = create<AppStore>((set, get) => ({
       return await invoke<DiffData>("get_interdiff", { pr });
     } catch (e: unknown) {
       set({ error: String(e) });
+      return null;
+    }
+  },
+
+  fetchConversation: async (
+    pr: string,
+  ): Promise<ConversationItem[] | null> => {
+    try {
+      const items = await invoke<ConversationItem[]>("fetch_conversation", {
+        pr,
+      });
+      // The backend overwrites the stored review.conversation; mirror that onto
+      // every in-memory list so the read-only band re-renders immediately.
+      const applyConversation = (r: Review): Review =>
+        r.pr === pr ? { ...r, conversation: items } : r;
+      const active = get().activeReview;
+      set({
+        activeReview:
+          active?.pr === pr ? applyConversation(active) : active,
+        authoredPrs: get().authoredPrs.map(applyConversation),
+        reviewRequests: get().reviewRequests.map(applyConversation),
+        reviews: get().reviews.map(applyConversation),
+      });
+      return items;
+    } catch (e: unknown) {
+      // Non-fatal (Invariant 1): the GitHub conversation is read-only context,
+      // never a gate. A fetch failure leaves the existing conversation in place.
+      console.error("fetch_conversation failed", e);
+      return null;
+    }
+  },
+
+  fetchTeammateInterdiff: async (pr: string): Promise<DiffData | null> => {
+    try {
+      return await invoke<DiffData>("get_teammate_interdiff", { pr });
+    } catch (e: unknown) {
+      const message = String(e);
+      // FRAGILE: the backend returns a typed CommandError; only its Display
+      // string reaches us here. "no new commits since your last review" is the
+      // benign case (nothing new to re-review), so swallow it silently and fall
+      // back to the full diff. Every other typed error (no prior review, no repo
+      // slug, gh failure) surfaces as a non-fatal store error. Matching on this
+      // substring couples us to the backend wording in
+      // `get_teammate_interdiff`; if that message changes, update this too.
+      if (message.includes("no new commits")) {
+        return null;
+      }
+      set({ error: message });
       return null;
     }
   },

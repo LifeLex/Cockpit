@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::config;
+use crate::config::{self, AgentPermissionMode};
 use crate::model::{AgentMode, AgentRun};
 use crate::prompt::AssembledPrompt;
 
@@ -189,6 +189,100 @@ impl SpawnConfig {
     pub fn with_extra_dir(mut self, dir: &Path) -> Self {
         self.tail_args.push("--add-dir".into());
         self.tail_args.push(dir.to_string_lossy().into_owned());
+        self
+    }
+
+    /// Auto-approve agent writes anywhere under `dir` by adding an
+    /// `--allowedTools` rule of the form `Write(//<abs-dir>/**)`.
+    ///
+    /// In headless (`--print`) mode there is no interactive permission prompt,
+    /// so path-scoped `--allowedTools` rules are how a write is pre-authorized.
+    /// The `//` prefix anchors the rule to the filesystem root and `**` crosses
+    /// subdirectories, so any file beneath `dir` is writable. `dir` should be an
+    /// absolute path; its leading slash is folded into the `//` anchor and any
+    /// trailing slash is stripped so the emitted rule is well-formed.
+    ///
+    /// The Claude CLI treats a repeated `--allowedTools` flag as a *replacement*
+    /// rather than an accumulation, so when a rule already exists this merges the
+    /// new one into it comma-separated (a single flag carrying all rules) instead
+    /// of passing the flag twice.
+    #[must_use]
+    pub fn allow_write_under(mut self, dir: &Path) -> Self {
+        let dir_str = dir.to_string_lossy();
+        // CONTRACT: Claude Code permission rules use gitignore-style paths where
+        // `//path` anchors to the filesystem root (docs example:
+        // `Read(//Users/alice/secrets/**)`). We therefore fold the absolute
+        // dir's leading slash into the `//` anchor and append `**` to cross
+        // subdirectories. Adjust here if the CLI's path syntax changes.
+        let anchored = dir_str.trim_end_matches('/').trim_start_matches('/');
+        let rule = format!("Write(//{anchored}/**)");
+
+        if let Some(pos) = self
+            .tail_args
+            .iter()
+            .position(|arg| arg == "--allowedTools")
+            && let Some(existing) = self.tail_args.get_mut(pos + 1)
+        {
+            existing.push(',');
+            existing.push_str(&rule);
+            return self;
+        }
+
+        self.tail_args.push("--allowedTools".into());
+        self.tail_args.push(rule);
+        self
+    }
+
+    /// Apply the configured [`AgentPermissionMode`] to this spawn configuration.
+    ///
+    /// - [`AgentPermissionMode::Bypass`] pushes `--dangerously-skip-permissions`
+    ///   (equivalent to `--permission-mode bypassPermissions`): no checks run.
+    /// - [`AgentPermissionMode::AcceptEdits`] pushes `--permission-mode
+    ///   acceptEdits`: file edits auto-approve, everything else uses the default
+    ///   policy.
+    /// - [`AgentPermissionMode::Approve`] pushes `--permission-mode default`.
+    ///   When `approve_url` is `Some`, it additionally routes permission prompts
+    ///   to cockpit's MCP `approve` tool (`--permission-prompt-tool
+    ///   mcp__cockpit__approve` plus a `--mcp-config` pointing at the
+    ///   streamable-HTTP endpoint). When `approve_url` is `None` there is no
+    ///   server to reach, so it falls back to plain default mode with no prompt
+    ///   tool — callers should always pass the URL so a request can reach a
+    ///   human rather than being silently denied.
+    #[must_use]
+    pub fn apply_permission_mode(
+        mut self,
+        mode: AgentPermissionMode,
+        approve_url: Option<&str>,
+    ) -> Self {
+        match mode {
+            AgentPermissionMode::Bypass => {
+                self.tail_args.push("--dangerously-skip-permissions".into());
+            }
+            AgentPermissionMode::AcceptEdits => {
+                self.tail_args.push("--permission-mode".into());
+                self.tail_args.push("acceptEdits".into());
+            }
+            AgentPermissionMode::Approve => {
+                self.tail_args.push("--permission-mode".into());
+                self.tail_args.push("default".into());
+                if let Some(url) = approve_url {
+                    self.tail_args.push("--permission-prompt-tool".into());
+                    self.tail_args.push("mcp__cockpit__approve".into());
+                    self.tail_args.push("--mcp-config".into());
+                    // Build the inline MCP config with serde_json so the URL is
+                    // JSON-escaped rather than string-formatted into the arg.
+                    let mcp_config = serde_json::json!({
+                        "mcpServers": {
+                            "cockpit": {
+                                "type": "http",
+                                "url": url,
+                            }
+                        }
+                    });
+                    self.tail_args.push(mcp_config.to_string());
+                }
+            }
+        }
         self
     }
 }
@@ -482,6 +576,135 @@ mod tests {
         let config = config::Config::default();
         let spawn = SpawnConfig::from_config(&config);
         assert_eq!(spawn.command, "claude");
+    }
+
+    #[test]
+    fn allow_write_under_appends_anchored_rule() {
+        let spawn = SpawnConfig::default().allow_write_under(Path::new("/home/u/.cockpit/plans"));
+        let default_len = SpawnConfig::default().tail_args.len();
+        let tail: Vec<&str> = spawn.tail_args.iter().map(String::as_str).collect();
+        assert_eq!(
+            &tail[default_len..],
+            ["--allowedTools", "Write(//home/u/.cockpit/plans/**)"]
+        );
+    }
+
+    #[test]
+    fn allow_write_under_strips_trailing_slash() {
+        let spawn = SpawnConfig::default().allow_write_under(Path::new("/home/u/plans/"));
+        assert!(
+            spawn
+                .tail_args
+                .iter()
+                .any(|a| a == "Write(//home/u/plans/**)"),
+            "trailing slash must not double up, got: {:?}",
+            spawn.tail_args
+        );
+    }
+
+    #[test]
+    fn allow_write_under_merges_repeated_rules() {
+        let spawn = SpawnConfig::default()
+            .allow_write_under(Path::new("/a/plans"))
+            .allow_write_under(Path::new("/b/findings"));
+        // Exactly one --allowedTools flag, carrying both rules comma-separated.
+        let flags = spawn
+            .tail_args
+            .iter()
+            .filter(|a| *a == "--allowedTools")
+            .count();
+        assert_eq!(
+            flags, 1,
+            "rules must merge into one flag: {:?}",
+            spawn.tail_args
+        );
+        let pos = spawn
+            .tail_args
+            .iter()
+            .position(|a| a == "--allowedTools")
+            .expect("flag present");
+        assert_eq!(
+            spawn.tail_args[pos + 1],
+            "Write(//a/plans/**),Write(//b/findings/**)"
+        );
+    }
+
+    #[test]
+    fn allow_write_under_combines_with_extra_dir() {
+        let spawn = SpawnConfig::default()
+            .with_extra_dir(Path::new("/out/findings"))
+            .allow_write_under(Path::new("/out/findings"));
+        let default_len = SpawnConfig::default().tail_args.len();
+        let tail: Vec<&str> = spawn.tail_args.iter().map(String::as_str).collect();
+        assert_eq!(
+            &tail[default_len..],
+            [
+                "--add-dir",
+                "/out/findings",
+                "--allowedTools",
+                "Write(//out/findings/**)"
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_permission_mode_bypass_skips_permissions() {
+        let spawn = SpawnConfig::default().apply_permission_mode(AgentPermissionMode::Bypass, None);
+        let default_len = SpawnConfig::default().tail_args.len();
+        assert_eq!(
+            &spawn.tail_args[default_len..],
+            ["--dangerously-skip-permissions"]
+        );
+    }
+
+    #[test]
+    fn apply_permission_mode_accept_edits() {
+        let spawn = SpawnConfig::default()
+            .apply_permission_mode(AgentPermissionMode::AcceptEdits, Some("http://x/mcp/o"));
+        let default_len = SpawnConfig::default().tail_args.len();
+        // acceptEdits ignores the approve_url — it never routes to cockpit.
+        assert_eq!(
+            &spawn.tail_args[default_len..],
+            ["--permission-mode", "acceptEdits"]
+        );
+    }
+
+    #[test]
+    fn apply_permission_mode_approve_with_url_wires_mcp() {
+        let spawn = SpawnConfig::default().apply_permission_mode(
+            AgentPermissionMode::Approve,
+            Some("http://127.0.0.1:19876/mcp/review-1"),
+        );
+        let default_len = SpawnConfig::default().tail_args.len();
+        let tail = &spawn.tail_args[default_len..];
+        assert_eq!(tail[0], "--permission-mode");
+        assert_eq!(tail[1], "default");
+        assert_eq!(tail[2], "--permission-prompt-tool");
+        assert_eq!(tail[3], "mcp__cockpit__approve");
+        assert_eq!(tail[4], "--mcp-config");
+
+        // The inline config is valid JSON pointing at the approve URL.
+        let parsed: serde_json::Value = serde_json::from_str(&tail[5]).expect("valid mcp json");
+        assert_eq!(
+            parsed["mcpServers"]["cockpit"]["type"].as_str(),
+            Some("http")
+        );
+        assert_eq!(
+            parsed["mcpServers"]["cockpit"]["url"].as_str(),
+            Some("http://127.0.0.1:19876/mcp/review-1")
+        );
+    }
+
+    #[test]
+    fn apply_permission_mode_approve_without_url_falls_back_to_default() {
+        let spawn =
+            SpawnConfig::default().apply_permission_mode(AgentPermissionMode::Approve, None);
+        let default_len = SpawnConfig::default().tail_args.len();
+        // Without a server URL, no prompt tool is wired — plain default mode.
+        assert_eq!(
+            &spawn.tail_args[default_len..],
+            ["--permission-mode", "default"]
+        );
     }
 
     // ---------------------------------------------------------------

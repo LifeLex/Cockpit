@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { sendNotification } from "@tauri-apps/plugin-notification";
 import { useAppStore } from "./store";
-import type { ViewState } from "./store";
+import type { ViewState, RestackProgress } from "./store";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import type { ShortcutMap } from "./hooks/useKeyboardShortcuts";
 import { SHORTCUTS } from "./lib/shortcuts";
@@ -225,6 +225,7 @@ function App() {
   const generatePlan = useAppStore((s) => s.generatePlan);
   const batchStatus = useAppStore((s) => s.batchStatus);
   const restackPr = useAppStore((s) => s.restackPr);
+  const applyRestackProgress = useAppStore((s) => s.applyRestackProgress);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
@@ -352,8 +353,40 @@ function App() {
       void sendNotification({ title, body });
     });
 
+    // D4: the notify poller emits `board-updated` (empty payload) when it detects
+    // external changes (new review requests, CI going green, new commits).
+    // Refresh the review lists so the board reflects them. The backend owns the
+    // OS notification — do NOT notify here.
+    const unlistenBoard = listen("board-updated", () => {
+      void fetchReviews();
+      void fetchAuthoredPrs();
+      void fetchReviewRequests();
+      void refreshActiveReview();
+    });
+
+    // D3: track whole-stack restack progress in the store (StackContainer reads
+    // it per root). On a terminal status refresh so cleared-stale members and any
+    // dispatched conflict-resolver agent show up.
+    const unlistenRestack = listen<RestackProgress>(
+      "restack-progress",
+      (event) => {
+        const p = event.payload;
+        applyRestackProgress(p);
+        if (p.status === "done" || p.status === "conflict" || p.status === "error") {
+          void fetchReviews();
+          void fetchAuthoredPrs();
+        }
+      },
+    );
+
     return () => {
       void unlisten.then((f) => {
+        f();
+      });
+      void unlistenBoard.then((f) => {
+        f();
+      });
+      void unlistenRestack.then((f) => {
         f();
       });
     };
@@ -362,8 +395,10 @@ function App() {
     fetchPlan,
     fetchConfig,
     fetchAuthoredPrs,
+    fetchReviewRequests,
     listProjects,
     refreshActiveReview,
+    applyRestackProgress,
   ]);
 
   const filterReviews = useCallback(

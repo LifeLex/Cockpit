@@ -4,6 +4,7 @@ import type { CiCheck } from "./bindings/CiCheck";
 import type { SubmitReviewResult } from "./bindings/SubmitReviewResult";
 import type { EvidenceSummary } from "./bindings/EvidenceSummary";
 import type { FilePair } from "./bindings/FilePair";
+import type { TrajectorySummary } from "./bindings/TrajectorySummary";
 import {
   mockInvoke,
   mockInvokeReject,
@@ -576,5 +577,89 @@ describe("fetchFilePair", () => {
     expect(result).toBeNull();
     expect(useAppStore.getState().error).toBeNull();
     spy.mockRestore();
+  });
+});
+
+/** Minimal trajectory summary for the store-action tests. */
+function makeTrajectory(): TrajectorySummary {
+  return {
+    mode: "Fix",
+    tools_used: 4,
+    commands: [{ command: "cargo test", ok: true }],
+    duration_ms: 12_000,
+    final_text: "done",
+    ended_at_epoch_ms: 1_700_000_000_000,
+  };
+}
+
+describe("fetchTrajectorySummary", () => {
+  it("returns the persisted summary on success (D2)", async () => {
+    const summary = makeTrajectory();
+    mockInvoke("get_trajectory_summary", (args) => {
+      expect(args.pr).toBe("pr-1");
+      return summary;
+    });
+
+    const result = await useAppStore.getState().fetchTrajectorySummary("pr-1");
+
+    expect(result).toEqual(summary);
+    expect(useAppStore.getState().error).toBeNull();
+  });
+
+  it("returns null and never sets the blocking error on failure (Invariant 1)", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockInvokeReject("get_trajectory_summary", "read failed");
+
+    const result = await useAppStore.getState().fetchTrajectorySummary("pr-1");
+
+    expect(result).toBeNull();
+    expect(useAppStore.getState().error).toBeNull();
+    spy.mockRestore();
+  });
+});
+
+describe("restackStack", () => {
+  it("invokes restack_stack with the root PR (D3)", async () => {
+    mockInvoke("restack_stack", (args) => {
+      expect(args.rootPr).toBe("pr-root");
+      return null;
+    });
+
+    await useAppStore.getState().restackStack("pr-root");
+
+    expect(callsFor("restack_stack")[0]?.args.rootPr).toBe("pr-root");
+    expect(useAppStore.getState().error).toBeNull();
+  });
+
+  it("sets error (non-fatal) and does not throw when the launch rejects", async () => {
+    mockInvokeReject("restack_stack", "nothing to restack");
+
+    await useAppStore.getState().restackStack("pr-root");
+
+    expect(useAppStore.getState().error).toContain("nothing to restack");
+  });
+});
+
+describe("applyRestackProgress", () => {
+  it("merges progress keyed by root PR without dropping other roots (D3)", () => {
+    useAppStore.getState().applyRestackProgress({
+      root_pr: "root-a",
+      current: 1,
+      total: 3,
+      current_pr: "child-1",
+      status: "restacking",
+    });
+    useAppStore.getState().applyRestackProgress({
+      root_pr: "root-b",
+      current: 2,
+      total: 2,
+      current_pr: "",
+      status: "done",
+    });
+
+    const progress = useAppStore.getState().restackProgress;
+    expect(progress["root-a"]?.status).toBe("restacking");
+    expect(progress["root-a"]?.current_pr).toBe("child-1");
+    expect(progress["root-b"]?.status).toBe("done");
   });
 });

@@ -18,6 +18,27 @@ import type { CiCheck } from "./bindings/CiCheck";
 import type { DiffSide } from "./bindings/DiffSide";
 import type { EvidenceSummary } from "./bindings/EvidenceSummary";
 import type { FilePair } from "./bindings/FilePair";
+import type { TrajectorySummary } from "./bindings/TrajectorySummary";
+
+/**
+ * Live progress of a whole-stack restack (D3), mirroring the backend's
+ * `restack-progress` event payload (hand-typed; no ts-rs binding). `current` /
+ * `total` are 1-based over the dependency-ordered descendants; `status` is
+ * `"restacking"` before a child, its outcome afterwards, and `"done"` once the
+ * sequence completes cleanly.
+ */
+export interface RestackProgress {
+  /** PR ref of the stack root the run was requested for. */
+  readonly root_pr: string;
+  /** 1-based index of the child currently being restacked (0 on a load error). */
+  readonly current: number;
+  /** Total number of descendants in the restack order. */
+  readonly total: number;
+  /** PR ref of the child this event is about (empty on the final `"done"`). */
+  readonly current_pr: string;
+  /** Phase of the run. */
+  readonly status: "restacking" | "clean" | "conflict" | "done" | "error";
+}
 
 /**
  * Navigation state discriminated union.
@@ -174,6 +195,35 @@ interface AppStore {
    * `error` and never blocks the loop.
    */
   killAgent: (pr: string) => Promise<void>;
+
+  /**
+   * Fetch the persisted trajectory summary for a PR's last agent run (D2).
+   *
+   * Best-effort: returns `null` and logs on failure rather than setting the
+   * blocking `error` — the summary is a glance aid ("what did the agent try?"),
+   * never a gate (Invariant 1). `null` also when no run has been recorded.
+   */
+  fetchTrajectorySummary: (pr: string) => Promise<TrajectorySummary | null>;
+
+  /**
+   * Restack a whole stack rooted at `rootPr` in dependency order (explicit user
+   * action; D3). The command returns immediately and drives the sequence on a
+   * background task, emitting `restack-progress` events. Failure is non-fatal:
+   * it sets the store `error` and never blocks the loop.
+   */
+  restackStack: (rootPr: string) => Promise<void>;
+
+  /**
+   * Latest whole-stack restack progress keyed by the stack root's PR ref (D3).
+   *
+   * Fed from the `restack-progress` Tauri listener (owned by `App`) via
+   * {@link applyRestackProgress}; read by `StackContainer` to show a live
+   * progress line / conflict note in place of the restack button.
+   */
+  readonly restackProgress: Readonly<Record<string, RestackProgress>>;
+
+  /** Merge a `restack-progress` event into {@link restackProgress} by root (D3). */
+  applyRestackProgress: (progress: RestackProgress) => void;
 
   /**
    * Ensure a review has a checked-out worktree on disk and return its path
@@ -379,6 +429,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   reviewRequests: [],
   prFetchLoading: false,
   filePairCache: new Map<string, FilePair>(),
+  restackProgress: {},
 
   fetchReviews: async () => {
     set({ loading: true, error: null });
@@ -728,6 +779,39 @@ export const useAppStore = create<AppStore>((set, get) => ({
       set({ error: String(e) });
       return null;
     }
+  },
+
+  fetchTrajectorySummary: async (
+    pr: string,
+  ): Promise<TrajectorySummary | null> => {
+    try {
+      return await invoke<TrajectorySummary | null>(
+        "get_trajectory_summary",
+        { pr },
+      );
+    } catch (e: unknown) {
+      // Non-fatal (Invariant 1): the trajectory summary is a glance aid.
+      console.error("get_trajectory_summary failed", e);
+      return null;
+    }
+  },
+
+  restackStack: async (rootPr: string) => {
+    try {
+      await invoke("restack_stack", { rootPr });
+    } catch (e: unknown) {
+      // Non-fatal (Invariant 1): a failed launch never blocks the loop.
+      set({ error: String(e) });
+    }
+  },
+
+  applyRestackProgress: (progress: RestackProgress) => {
+    set({
+      restackProgress: {
+        ...get().restackProgress,
+        [progress.root_pr]: progress,
+      },
+    });
   },
 
   // -------------------------------------------------------------------------

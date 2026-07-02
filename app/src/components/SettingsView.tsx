@@ -27,6 +27,7 @@ import {
   ListTree,
   SlidersHorizontal,
   ChevronDown,
+  Bell,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -114,6 +115,10 @@ export function SettingsView() {
   const [appTheme, setAppTheme] = useState("dark");
   const [editorTheme, setEditorTheme] = useState("vs-dark");
 
+  // --- Background refresh & notifications ---
+  // String-backed so an empty field (disabled) round-trips cleanly to `null`.
+  const [notifyPollSecs, setNotifyPollSecs] = useState("");
+
   // --- Advanced ---
   const [hookPort, setHookPort] = useState(19876);
 
@@ -139,6 +144,9 @@ export function SettingsView() {
     setSkillsAutoSync(c.skills_github?.auto_sync ?? false);
     setAppTheme(c.app_theme ?? "dark");
     setEditorTheme(c.editor_theme ?? "vs-dark");
+    setNotifyPollSecs(
+      c.notify_poll_secs === null ? "" : String(c.notify_poll_secs),
+    );
     setHookPort(c.hook_port);
   }, []);
 
@@ -181,6 +189,12 @@ export function SettingsView() {
           }
         : null;
 
+    // Background polling: empty / 0 / non-positive disables it (null); any
+    // positive value is kept (the backend floors it at 30s).
+    const parsedPoll = Number.parseInt(notifyPollSecs.trim(), 10);
+    const notifyPoll =
+      Number.isNaN(parsedPoll) || parsedPoll <= 0 ? null : parsedPoll;
+
     // Spread the loaded config so kept-but-unedited fields (e.g. ide_command,
     // agent_prompts) survive round-trips, then override only edited fields.
     const next: Config = {
@@ -193,6 +207,7 @@ export function SettingsView() {
       skills_github: skillsGithub,
       app_theme: appTheme !== "" ? appTheme : null,
       editor_theme: editorTheme !== "" ? editorTheme : null,
+      notify_poll_secs: notifyPoll,
       hook_port: hookPort,
     };
 
@@ -216,6 +231,7 @@ export function SettingsView() {
     skillsAutoSync,
     appTheme,
     editorTheme,
+    notifyPollSecs,
     hookPort,
     saveConfig,
   ]);
@@ -611,6 +627,40 @@ export function SettingsView() {
                   aria-hidden="true"
                 />
               </div>
+            </SettingsRow>
+          </CardContent>
+        </Card>
+
+        {/* --------------------------------------------------------------- */}
+        {/* Background refresh & notifications                              */}
+        {/* --------------------------------------------------------------- */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Bell className="h-4 w-4 text-muted-foreground" />
+              <CardTitle>Background refresh &amp; notifications</CardTitle>
+            </div>
+            <CardDescription>
+              Poll GitHub in the background and notify you when a PR becomes
+              reviewable.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-6">
+            <SettingsRow
+              label="Poll interval (seconds)"
+              htmlFor="notify-poll-secs"
+              description="Polls GitHub every N seconds (min 30) and notifies on new review requests, CI going green, and new commits. Leave empty or 0 to disable."
+            >
+              <Input
+                id="notify-poll-secs"
+                type="number"
+                min={30}
+                value={notifyPollSecs}
+                onChange={(e) => {
+                  setNotifyPollSecs(e.target.value);
+                }}
+                placeholder="90"
+              />
             </SettingsRow>
           </CardContent>
         </Card>

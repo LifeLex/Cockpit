@@ -87,6 +87,7 @@ interface DiffViewProps {
     lineStart: number,
     lineEnd: number,
     body: string,
+    side: DiffSide,
   ) => Promise<void>;
   readonly onRequestChanges: () => Promise<void>;
   readonly onMirrorComments: () => Promise<MirrorResult | null>;
@@ -106,6 +107,8 @@ interface PortalEntry {
    * submitting (D1). Zone placement uses the fragment line instead.
    */
   readonly lineNumber: number;
+  /** Which diff side this zone lives on: `New` (modified) or `Old` (original). */
+  readonly side: DiffSide;
   readonly comments: readonly Comment[];
   readonly hasInput: boolean;
 }
@@ -344,12 +347,14 @@ function detectLanguage(filePath: string): string {
 function InlineCommentThread({
   comments,
   lineNumber,
+  side,
   hasInput,
   onSubmit,
   onCancel,
 }: {
   readonly comments: readonly Comment[];
   readonly lineNumber: number;
+  readonly side: DiffSide;
   readonly hasInput: boolean;
   readonly onSubmit: (body: string) => void;
   readonly onCancel: () => void;
@@ -437,7 +442,8 @@ function InlineCommentThread({
           />
           <div className="flex items-center justify-between mt-1.5">
             <span className="text-[10px] text-muted-foreground">
-              Line {String(lineNumber)}
+              {side === "Old" ? "old line " : "Line "}
+              {String(lineNumber)}
             </span>
             <div className="flex gap-1.5">
               <Button
@@ -520,9 +526,12 @@ export function DiffView({
   const [submitting, setSubmitting] = useState(false);
 
   // -- Inline comment state --
-  const [activeCommentLine, setActiveCommentLine] = useState<number | null>(
-    null,
-  );
+  // Holds the FRAGMENT (Monaco) line and which diff side its editor belongs to,
+  // so the New (modified) and Old (original) gutters each open their own form.
+  const [activeComment, setActiveComment] = useState<{
+    readonly side: DiffSide;
+    readonly line: number;
+  } | null>(null);
   const [editorReady, setEditorReady] = useState(false);
   const [portals, setPortals] = useState<readonly PortalEntry[]>([]);
 
@@ -563,10 +572,15 @@ export function DiffView({
   const diffEditorRef = useRef<MonacoDiffEditor | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
   const zoneIdsRef = useRef<string[]>([]);
+  const originalZoneIdsRef = useRef<string[]>([]);
   const domNodeCacheRef = useRef<Map<string, HTMLDivElement>>(new Map());
   const glyphDecorRef =
     useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
   const commentDecorRef =
+    useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
+  const originalGlyphDecorRef =
+    useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
+  const originalCommentDecorRef =
     useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
   const lspAttachmentRef = useRef<LspAttachment | null>(null);
 
@@ -600,7 +614,7 @@ export function DiffView({
   const canAddComments = review.gate_state === "InReview";
 
   // Only open the input form when the review is InReview
-  const effectiveInputLine = canAddComments ? activeCommentLine : null;
+  const effectiveActiveComment = canAddComments ? activeComment : null;
 
   // -- Relocated PR-info: external reference links --
   const prHref = useMemo(() => prUrl(review.pr), [review.pr]);
@@ -633,7 +647,7 @@ export function DiffView({
 
   // -- Close inline form on file change --
   useEffect(() => {
-    setActiveCommentLine(null);
+    setActiveComment(null);
   }, [selectedFile]);
 
   // -- D10: default a reworked review to its interdiff and fetch it. A fetch
@@ -742,8 +756,8 @@ export function DiffView({
         }
       });
 
-      // Click on gutter: toggle inline comment form. `activeCommentLine` holds
-      // the FRAGMENT (Monaco) line for zone placement; the real file line is
+      // Click on gutter: toggle inline comment form. `activeComment` holds the
+      // FRAGMENT (Monaco) line + side for zone placement; the real file line is
       // resolved when the comment is submitted (D1).
       modified.onMouseDown((e) => {
         const target = e.target;
@@ -760,7 +774,64 @@ export function DiffView({
           ) {
             return;
           }
-          setActiveCommentLine((prev) => (prev === line ? null : line));
+          setActiveComment((prev) =>
+            prev !== null && prev.side === "New" && prev.line === line
+              ? null
+              : { side: "New", line },
+          );
+        }
+      });
+
+      // -- Original (left/old-side) editor: mirror the hover + click gutter so
+      // reviewers can comment on removed / pre-change lines (D12). Old-side
+      // comments render in this editor; New-side stay in the modified editor. --
+      const original = editor.getOriginalEditor();
+      original.updateOptions({ glyphMargin: true });
+
+      originalGlyphDecorRef.current = original.createDecorationsCollection([]);
+      originalCommentDecorRef.current = original.createDecorationsCollection([]);
+
+      original.onMouseMove((e) => {
+        if (originalGlyphDecorRef.current == null) return;
+        const target = e.target;
+        const isHoverArea =
+          target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN ||
+          target.type === monaco.editor.MouseTargetType.GUTTER_LINE_NUMBERS ||
+          target.type ===
+            monaco.editor.MouseTargetType.GUTTER_LINE_DECORATIONS ||
+          target.type === monaco.editor.MouseTargetType.CONTENT_TEXT;
+
+        if (isHoverArea && target.position != null) {
+          const ln = target.position.lineNumber;
+          originalGlyphDecorRef.current.set([
+            {
+              range: new monaco.Range(ln, 1, ln, 1),
+              options: { glyphMarginClassName: "inline-comment-glyph" },
+            },
+          ]);
+        } else {
+          originalGlyphDecorRef.current.clear();
+        }
+      });
+
+      original.onMouseDown((e) => {
+        const target = e.target;
+        const isGutterClick =
+          target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN ||
+          target.type === monaco.editor.MouseTargetType.GUTTER_LINE_NUMBERS;
+
+        if (isGutterClick && target.position != null) {
+          const line = target.position.lineNumber;
+          if (
+            fragmentToReal(currentFileDiffRef.current, "Old", line) === undefined
+          ) {
+            return;
+          }
+          setActiveComment((prev) =>
+            prev !== null && prev.side === "Old" && prev.line === line
+              ? null
+              : { side: "Old", line },
+          );
         }
       });
 
@@ -771,7 +842,9 @@ export function DiffView({
 
   // -- Sync view zones with comments + active input line --
   // useEffect (not useLayoutEffect) so zones are created AFTER Monaco's
-  // internal useEffect updates the editor models on file switch.
+  // internal useEffect updates the editor models on file switch. Both sides are
+  // synced: New-side comments live in the modified editor, Old-side comments in
+  // the original editor (D12).
   useEffect(() => {
     if (
       !editorReady ||
@@ -781,109 +854,142 @@ export function DiffView({
       return;
     }
 
-    const modified = diffEditorRef.current.getModifiedEditor();
     const monaco = monacoRef.current;
 
-    // Re-apply glyph margin after mode changes
-    modified.updateOptions({ glyphMargin: true });
+    // Build (and place) the view zones for one diff side in its editor,
+    // returning the portal entries and the DOM-node cache keys it used. Anchors
+    // store REAL file lines (D1), so each is translated back to the current
+    // fragment; comments whose real line is not present in the fragment (e.g.
+    // after a diff refresh, or an interdiff that no longer touches that line)
+    // are skipped gracefully.
+    const syncSide = (
+      ed: MonacoEditorNs.IStandaloneCodeEditor,
+      side: DiffSide,
+      zoneIds: { current: string[] },
+      commentDecor: MonacoEditorNs.IEditorDecorationsCollection | null,
+    ): { readonly portals: PortalEntry[]; readonly usedKeys: Set<string> } => {
+      // Re-apply glyph margin after mode changes.
+      ed.updateOptions({ glyphMargin: true });
 
-    // Group comments by the FRAGMENT (editor) line their real anchor maps to.
-    // Anchors store REAL file lines (D1), so translate each back to the current
-    // fragment. New-side only for now — original-side rendering is a follow-up
-    // (D12). Comments whose real line is not present in the current fragment
-    // (e.g. after a diff refresh, or an interdiff that no longer touches that
-    // line) are skipped gracefully.
-    const commentsByLine = new Map<number, Comment[]>();
-    for (const c of commentsForFile) {
-      if (anchorSide(c.anchor) !== "New") continue;
-      const range = anchorRange(c.anchor);
-      if (range === null) continue;
-      const fragLine = realToFragment(currentFileDiff, "New", range[1]);
-      if (fragLine === undefined) continue;
-      const arr = commentsByLine.get(fragLine) ?? [];
-      arr.push(c);
-      commentsByLine.set(fragLine, arr);
-    }
-
-    // All fragment lines that need a view zone
-    const zoneLines = new Set<number>(commentsByLine.keys());
-    if (effectiveInputLine != null) {
-      zoneLines.add(effectiveInputLine);
-    }
-
-    const newPortals: PortalEntry[] = [];
-    const usedKeys = new Set<string>();
-
-    modified.changeViewZones((accessor) => {
-      // Remove all previous zones
-      for (const id of zoneIdsRef.current) {
-        accessor.removeZone(id);
+      const commentsByLine = new Map<number, Comment[]>();
+      for (const c of commentsForFile) {
+        if (anchorSide(c.anchor) !== side) continue;
+        const range = anchorRange(c.anchor);
+        if (range === null) continue;
+        const fragLine = realToFragment(currentFileDiff, side, range[1]);
+        if (fragLine === undefined) continue;
+        const arr = commentsByLine.get(fragLine) ?? [];
+        arr.push(c);
+        commentsByLine.set(fragLine, arr);
       }
-      zoneIdsRef.current = [];
 
-      // Create zones for each line
-      for (const line of Array.from(zoneLines).sort((a, b) => a - b)) {
-        const comments = commentsByLine.get(line) ?? [];
-        const hasInput = line === effectiveInputLine;
+      const inputLine =
+        effectiveActiveComment?.side === side
+          ? effectiveActiveComment.line
+          : null;
 
-        const commentHeight = comments.length * 52;
-        const inputHeight = hasInput ? 130 : 0;
-        const padding =
-          comments.length > 0 || hasInput ? 8 : 0;
-        const totalHeight = commentHeight + inputHeight + padding;
+      const zoneLines = new Set<number>(commentsByLine.keys());
+      if (inputLine != null) {
+        zoneLines.add(inputLine);
+      }
 
-        if (totalHeight === 0) continue;
+      const portals: PortalEntry[] = [];
+      const usedKeys = new Set<string>();
 
-        const key = `zone-${String(line)}`;
-        usedKeys.add(key);
-
-        // Reuse DOM nodes so React portals keep component state
-        let domNode = domNodeCacheRef.current.get(key);
-        if (domNode == null) {
-          domNode = document.createElement("div");
-          domNode.style.zIndex = "10";
-          domNodeCacheRef.current.set(key, domNode);
+      ed.changeViewZones((accessor) => {
+        for (const id of zoneIds.current) {
+          accessor.removeZone(id);
         }
+        zoneIds.current = [];
 
-        const zoneId = accessor.addZone({
-          afterLineNumber: line,
-          heightInPx: totalHeight,
-          domNode,
-          suppressMouseDown: false,
-        });
+        for (const line of Array.from(zoneLines).sort((a, b) => a - b)) {
+          const comments = commentsByLine.get(line) ?? [];
+          const hasInput = line === inputLine;
 
-        // Display + anchor use the real file line; placement used the fragment.
-        const realLine = fragmentToReal(currentFileDiff, "New", line) ?? line;
-        zoneIdsRef.current.push(zoneId);
-        newPortals.push({
-          key,
-          domNode,
-          lineNumber: realLine,
-          comments,
-          hasInput,
-        });
+          const commentHeight = comments.length * 52;
+          const inputHeight = hasInput ? 130 : 0;
+          const padding = comments.length > 0 || hasInput ? 8 : 0;
+          const totalHeight = commentHeight + inputHeight + padding;
+
+          if (totalHeight === 0) continue;
+
+          // Key by side so the two editors never collide in the DOM cache.
+          const key = `zone-${side}-${String(line)}`;
+          usedKeys.add(key);
+
+          // Reuse DOM nodes so React portals keep component state.
+          let domNode = domNodeCacheRef.current.get(key);
+          if (domNode == null) {
+            domNode = document.createElement("div");
+            domNode.style.zIndex = "10";
+            domNodeCacheRef.current.set(key, domNode);
+          }
+
+          const zoneId = accessor.addZone({
+            afterLineNumber: line,
+            heightInPx: totalHeight,
+            domNode,
+            suppressMouseDown: false,
+          });
+
+          // Display + anchor use the real file line; placement used the fragment.
+          const realLine = fragmentToReal(currentFileDiff, side, line) ?? line;
+          zoneIds.current.push(zoneId);
+          portals.push({
+            key,
+            domNode,
+            lineNumber: realLine,
+            side,
+            comments,
+            hasInput,
+          });
+        }
+      });
+
+      // Highlight lines that have comments on this side.
+      if (commentDecor != null) {
+        commentDecor.set(
+          Array.from(commentsByLine.keys()).map((line) => ({
+            range: new monaco.Range(line, 1, line, 1),
+            options: {
+              isWholeLine: true,
+              className: "inline-comment-line-bg",
+              glyphMarginClassName: "inline-comment-line-glyph",
+            },
+          })),
+        );
       }
-    });
 
-    // Purge stale cached DOM nodes
+      return { portals, usedKeys };
+    };
+
+    const modified = diffEditorRef.current.getModifiedEditor();
+    const original = diffEditorRef.current.getOriginalEditor();
+
+    const newResult = syncSide(
+      modified,
+      "New",
+      zoneIdsRef,
+      commentDecorRef.current,
+    );
+    const oldResult = syncSide(
+      original,
+      "Old",
+      originalZoneIdsRef,
+      originalCommentDecorRef.current,
+    );
+
+    const newPortals = [...newResult.portals, ...oldResult.portals];
+
+    // Purge stale cached DOM nodes across both sides.
+    const usedKeys = new Set<string>([
+      ...newResult.usedKeys,
+      ...oldResult.usedKeys,
+    ]);
     for (const cachedKey of domNodeCacheRef.current.keys()) {
       if (!usedKeys.has(cachedKey)) {
         domNodeCacheRef.current.delete(cachedKey);
       }
-    }
-
-    // Highlight lines that have comments
-    if (commentDecorRef.current != null) {
-      commentDecorRef.current.set(
-        Array.from(commentsByLine.keys()).map((line) => ({
-          range: new monaco.Range(line, 1, line, 1),
-          options: {
-            isWholeLine: true,
-            className: "inline-comment-line-bg",
-            glyphMarginClassName: "inline-comment-line-glyph",
-          },
-        })),
-      );
     }
 
     setPortals(newPortals);
@@ -891,7 +997,7 @@ export function DiffView({
     editorReady,
     commentsForFile,
     currentFileDiff,
-    effectiveInputLine,
+    effectiveActiveComment,
     selectedFile,
     diffMode,
   ]);
@@ -948,12 +1054,12 @@ export function DiffView({
 
   // -- Handlers --
   const handleInlineSubmit = useCallback(
-    async (lineNumber: number, body: string) => {
+    async (lineNumber: number, body: string, side: DiffSide) => {
       setSubmitting(true);
       setCommentError(null);
       try {
-        await onAddComment(selectedFile, lineNumber, lineNumber, body);
-        setActiveCommentLine(null);
+        await onAddComment(selectedFile, lineNumber, lineNumber, body, side);
+        setActiveComment(null);
       } catch (e: unknown) {
         setCommentError(String(e));
       } finally {
@@ -1792,12 +1898,13 @@ export function DiffView({
               <InlineCommentThread
                 comments={entry.comments}
                 lineNumber={entry.lineNumber}
+                side={entry.side}
                 hasInput={entry.hasInput}
                 onSubmit={(body) => {
-                  void handleInlineSubmit(entry.lineNumber, body);
+                  void handleInlineSubmit(entry.lineNumber, body, entry.side);
                 }}
                 onCancel={() => {
-                  setActiveCommentLine(null);
+                  setActiveComment(null);
                 }}
               />,
               entry.domNode,

@@ -15,6 +15,7 @@ import type { Skill } from "./bindings/Skill";
 import type { SyncReport } from "./bindings/SyncReport";
 import type { AgentMode } from "./bindings/AgentMode";
 import type { CiCheck } from "./bindings/CiCheck";
+import type { DiffSide } from "./bindings/DiffSide";
 
 /**
  * Navigation state discriminated union.
@@ -80,12 +81,16 @@ interface AppStore {
   /** Navigate to the settings view. */
   navigateToSettings: () => void;
 
-  /** Add an anchored comment to the active review. */
+  /**
+   * Add an anchored comment to the active review. `side` selects which side of
+   * the diff the line refers to (D12).
+   */
   addComment: (
     file: string,
     lineStart: number,
     lineEnd: number,
     body: string,
+    side: DiffSide,
   ) => Promise<void>;
 
   /** Request changes on the active review (InReview -> Dispatched). */
@@ -160,6 +165,24 @@ interface AppStore {
    * Failure is non-fatal: it sets the store `error` and never blocks the loop.
    */
   restackPr: (pr: string) => Promise<void>;
+
+  /**
+   * Kill the agent running on a review (explicit user action; D11/D12).
+   *
+   * Applies the returned reconciled [`Review`] (comments preserved, agent
+   * cleared, back to `InReview`). Failure is non-fatal: it sets the store
+   * `error` and never blocks the loop.
+   */
+  killAgent: (pr: string) => Promise<void>;
+
+  /**
+   * Ensure a review has a checked-out worktree on disk and return its path
+   * (D12). Materializes a dedicated branch worktree for an imported same-repo
+   * PR; a no-op for cockpit-managed worktrees. Returns `null` on failure
+   * (also surfaced via `error`) so callers can fall back to the review's
+   * recorded worktree.
+   */
+  ensureReviewWorktree: (pr: string) => Promise<string | null>;
 
   // -------------------------------------------------------------------------
   // Config
@@ -431,6 +454,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     lineStart: number,
     lineEnd: number,
     body: string,
+    side: DiffSide,
   ) => {
     const { view } = get();
     if (view.kind !== "diff") return;
@@ -441,6 +465,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       lineStart,
       lineEnd,
       body,
+      side,
     });
     const replace = (r: Review) => (r.pr === review.pr ? review : r);
     set({
@@ -662,6 +687,32 @@ export const useAppStore = create<AppStore>((set, get) => ({
       });
     } catch (e: unknown) {
       set({ error: String(e) });
+    }
+  },
+
+  killAgent: async (pr: string) => {
+    try {
+      const review = await invoke<Review>("kill_agent", { pr });
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      set({
+        activeReview:
+          get().activeReview?.pr === review.pr ? review : get().activeReview,
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        frontier: get().frontier.map(replace),
+        reviews: get().reviews.map(replace),
+      });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  ensureReviewWorktree: async (pr: string): Promise<string | null> => {
+    try {
+      return await invoke<string>("ensure_review_worktree", { pr });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+      return null;
     }
   },
 

@@ -361,6 +361,81 @@ describe("submitGithubReview", () => {
   });
 });
 
+describe("killAgent", () => {
+  it("applies the reconciled review across lists + activeReview on success (D12)", async () => {
+    const running = makeReview({
+      pr: "pr-1",
+      gate_state: "Dispatched",
+      agent: makeAgentRun({ mode: "Fix" }),
+    });
+    const settled = makeReview({
+      pr: "pr-1",
+      gate_state: "InReview",
+      agent: null,
+    });
+    useAppStore.setState({
+      activeReview: running,
+      reviews: [running],
+      frontier: [running],
+      authoredPrs: [running],
+    });
+    mockInvoke("kill_agent", (args) => {
+      expect(args.pr).toBe("pr-1");
+      return settled;
+    });
+
+    await useAppStore.getState().killAgent("pr-1");
+
+    const state = useAppStore.getState();
+    expect(state.activeReview?.gate_state).toBe("InReview");
+    expect(state.activeReview?.agent).toBeNull();
+    expect(state.reviews[0]?.agent).toBeNull();
+    expect(state.frontier[0]?.agent).toBeNull();
+    expect(state.authoredPrs[0]?.agent).toBeNull();
+    expect(state.error).toBeNull();
+  });
+
+  it("sets error (non-fatal) and leaves the review untouched on rejection", async () => {
+    const running = makeReview({
+      pr: "pr-1",
+      gate_state: "Dispatched",
+      agent: makeAgentRun({ mode: "Fix" }),
+    });
+    useAppStore.setState({ activeReview: running, reviews: [running] });
+    mockInvokeReject("kill_agent", "no such process");
+
+    await useAppStore.getState().killAgent("pr-1");
+
+    const state = useAppStore.getState();
+    expect(state.error).toContain("no such process");
+    // Non-fatal: the agent handle is untouched so the loop is not blocked.
+    expect(state.activeReview?.agent).not.toBeNull();
+  });
+});
+
+describe("ensureReviewWorktree", () => {
+  it("returns the materialized worktree path on success (D12)", async () => {
+    mockInvoke("ensure_review_worktree", (args) => {
+      expect(args.pr).toBe("pr-1");
+      return "/tmp/wt/pr-1";
+    });
+
+    const path = await useAppStore.getState().ensureReviewWorktree("pr-1");
+
+    expect(path).toBe("/tmp/wt/pr-1");
+    expect(useAppStore.getState().error).toBeNull();
+  });
+
+  it("returns null and sets error on failure", async () => {
+    mockInvokeReject("ensure_review_worktree", "checkout failed");
+
+    const path = await useAppStore.getState().ensureReviewWorktree("pr-1");
+
+    expect(path).toBeNull();
+    expect(useAppStore.getState().error).toContain("checkout failed");
+  });
+});
+
 describe("fetchInterdiff", () => {
   it("returns the interdiff on success (D10)", async () => {
     const diff = { raw: "diff --git a/x b/x" };

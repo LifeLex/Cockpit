@@ -149,7 +149,9 @@ pub async fn get_interdiff(
 /// Add an anchored comment to a review at the diff gate.
 ///
 /// Creates an ephemeral [`Comment`] with a `DiffLine` anchor and
-/// appends it to the review's comment list.
+/// appends it to the review's comment list. `side` selects which side of the
+/// diff the range refers to; `None` defaults to [`DiffSide::New`] so existing
+/// callers keep commenting on the post-change side unchanged (D12).
 #[tauri::command]
 pub fn add_comment(
     state: State<'_, Arc<AppState>>,
@@ -158,6 +160,7 @@ pub fn add_comment(
     line_start: u32,
     line_end: u32,
     body: String,
+    side: Option<DiffSide>,
 ) -> Result<Review, CommandError> {
     let pr_ref = PrRef::new(&pr);
 
@@ -167,7 +170,7 @@ pub fn add_comment(
         anchor: Anchor::DiffLine {
             path: PathBuf::from(&file),
             range: (line_start, line_end),
-            side: DiffSide::New,
+            side: side.unwrap_or(DiffSide::New),
         },
         body,
         origin: CommentOrigin::Local,

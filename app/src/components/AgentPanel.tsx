@@ -2,11 +2,16 @@
  * Agent activity timeline — the product's signature surface for watching an
  * agent rework a PR in real time.
  *
- * Listens for Tauri `"agent-event"` events, maintains a local list, and renders
- * each event as a row on a vertical timeline rail: an SVG icon tile (no emoji)
- * colored by event tone, a bold title, a faint mono detail line, and a
- * right-aligned tabular-nums elapsed timestamp. A header LED pulses while the
- * agent runs and stops on a terminal Complete / Error event.
+ * Listens for Tauri `"agent-event"` envelopes, keeps a per-object buffer so
+ * switching between reviews never interleaves or wipes timelines, and renders
+ * the current object's events as rows on a vertical timeline rail: an SVG icon
+ * tile (no emoji) colored by event tone, a bold title, a faint mono detail
+ * line, and a right-aligned tabular-nums elapsed timestamp. A header LED pulses
+ * while the agent runs and stops on a terminal Complete / Error event.
+ *
+ * The panel also owns two explicit agent controls for the current object: a
+ * Stop button (visible while an agent is attached) that kills the run, and an
+ * Open-log affordance that opens the run's log file in the configured editor.
  *
  * Presentation (icon + tone + copy per event variant) lives in
  * `@/lib/agent-event`; this component owns streaming, layout, and lifecycle.
@@ -14,14 +19,16 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import type { Event } from "../bindings/Event";
+import { useAppStore } from "../store";
 import {
   presentEvent,
   toneTileClass,
   AgentMark,
   type EventPresentation,
 } from "@/lib/agent-event";
-import { X, Trash2 } from "lucide-react";
+import { X, Trash2, Square, FileText } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /**
@@ -44,9 +51,97 @@ interface TimelineEntry {
   readonly timestamp: number;
 }
 
+/** Per-object timeline snapshot: its entries plus whether it was user-stopped. */
+interface ObjectTimeline {
+  readonly entries: readonly TimelineEntry[];
+  /** True once the user stopped this object's run (terminal, danger banner). */
+  readonly stopped: boolean;
+}
+
+/**
+ * Module-level per-object event buffers, keyed by `object_id`.
+ *
+ * The panel stays mounted per workspace and its `objectId` prop changes as the
+ * user navigates between reviews; buffering here (rather than in component
+ * state) means each object keeps its full timeline across those switches and
+ * across panel remounts. Buffers are append-only for the app's lifetime, which
+ * is acceptable for the number of agent runs in a session.
+ */
+const timelines = new Map<string, ObjectTimeline>();
+
+/** Monotonic sequence source for stable React keys across all objects. */
+let globalSeq = 0;
+
+/** Read (or lazily create) the timeline buffer for an object. */
+function timelineFor(objectId: string): ObjectTimeline {
+  const existing = timelines.get(objectId);
+  if (existing !== undefined) return existing;
+  const created: ObjectTimeline = { entries: [], stopped: false };
+  timelines.set(objectId, created);
+  return created;
+}
+
+/**
+ * Append an incoming stream event to an object's buffer, returning a fresh
+ * snapshot. Consecutive `Thinking` events collapse onto a single row (latest
+ * token count wins) instead of spamming the rail. A real stream event means the
+ * agent is active again, so any prior user-stop marker is cleared.
+ */
+function appendEvent(
+  objectId: string,
+  event: Event,
+  now: number,
+): ObjectTimeline {
+  const cur = timelineFor(objectId);
+  let entries: TimelineEntry[];
+
+  if (event.kind === "Thinking") {
+    const lastIdx = cur.entries.length - 1;
+    const last = lastIdx >= 0 ? cur.entries[lastIdx] : undefined;
+    if (last !== undefined && last.event.kind === "Thinking") {
+      entries = [...cur.entries];
+      entries[lastIdx] = { ...last, event, timestamp: now };
+    } else {
+      globalSeq += 1;
+      entries = [...cur.entries, { seq: globalSeq, event, timestamp: now }];
+    }
+  } else {
+    globalSeq += 1;
+    entries = [...cur.entries, { seq: globalSeq, event, timestamp: now }];
+  }
+
+  const next: ObjectTimeline = { entries, stopped: false };
+  timelines.set(objectId, next);
+  return next;
+}
+
+/**
+ * Push a synthetic terminal "stopped" entry after a user Stop, returning a
+ * fresh snapshot. The entry is a plain `Error` event so it reuses the existing
+ * error-row presentation; the `stopped` flag drives the terminal banner copy.
+ */
+function appendStopped(objectId: string, now: number): ObjectTimeline {
+  const cur = timelineFor(objectId);
+  globalSeq += 1;
+  const event: Event = { kind: "Error", message: "Agent stopped by you" };
+  const next: ObjectTimeline = {
+    entries: [...cur.entries, { seq: globalSeq, event, timestamp: now }],
+    stopped: true,
+  };
+  timelines.set(objectId, next);
+  return next;
+}
+
+/** Clear an object's buffer (Clear button). */
+function clearTimeline(objectId: string): void {
+  timelines.set(objectId, { entries: [], stopped: false });
+}
+
 interface AgentPanelProps {
   /** Whether the panel is visible. */
   readonly visible: boolean;
+  /** UI key of the object whose timeline this panel shows (PR ref / project id). */
+  readonly objectId: string;
   /** Callback to hide the panel / return to the diff. */
   readonly onClose: () => void;
 }
@@ -179,8 +274,19 @@ function EmptyState() {
 }
 
 /** Terminal banner shown after the run finishes. */
-function EndBanner({ phase }: { readonly phase: "complete" | "failed" }) {
-  const complete = phase === "complete";
+function EndBanner({
+  phase,
+  stopped,
+}: {
+  readonly phase: "complete" | "failed";
+  readonly stopped: boolean;
+}) {
+  const complete = phase === "complete" && !stopped;
+  const label = complete
+    ? "Reworked — ready to re-review"
+    : stopped
+      ? "Stopped by you"
+      : "Failed";
   return (
     <div
       className={cn(
@@ -196,22 +302,33 @@ function EndBanner({ phase }: { readonly phase: "complete" | "failed" }) {
           complete ? "bg-success" : "bg-danger",
         )}
       />
-      <span className="font-medium">
-        {complete ? "Reworked — ready to re-review" : "Failed"}
-      </span>
+      <span className="font-medium">{label}</span>
     </div>
   );
 }
 
-export function AgentPanel({ visible, onClose }: AgentPanelProps) {
-  const [entries, setEntries] = useState<readonly TimelineEntry[]>([]);
-  const [startTime, setStartTime] = useState<number | null>(null);
+export function AgentPanel({ visible, objectId, onClose }: AgentPanelProps) {
+  const initial = timelineFor(objectId);
+  const [entries, setEntries] = useState<readonly TimelineEntry[]>(
+    initial.entries,
+  );
+  const [stopped, setStopped] = useState<boolean>(initial.stopped);
   const [elapsed, setElapsed] = useState(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const seqRef = useRef(0);
+
+  // The review whose agent this panel controls, when it is the current object.
+  // AgentPanel is mounted per workspace, so `activeReview.pr === objectId`.
+  const activeReview = useAppStore((s) => s.activeReview);
+  const killAgent = useAppStore((s) => s.killAgent);
+  const reviewForObject = activeReview?.pr === objectId ? activeReview : null;
+  const agentAttached = reviewForObject?.agent != null;
+  const logPath = reviewForObject?.agent?.log_path ?? null;
 
   const phase = runPhase(entries);
   const isRunning = phase === "running";
+  // The first event's timestamp is the run anchor for elapsed stamps; null
+  // until any event has arrived.
+  const anchor = entries[0]?.timestamp ?? null;
 
   // Count tool uses and total thinking tokens for the header telemetry.
   let toolCount = 0;
@@ -223,48 +340,41 @@ export function AgentPanel({ visible, onClose }: AgentPanelProps) {
     }
   }
 
+  // Keep the current object id reachable from the (mount-once) event listener.
+  const objectIdRef = useRef(objectId);
+  useEffect(() => {
+    objectIdRef.current = objectId;
+  }, [objectId]);
+
+  // Load the buffered timeline whenever the shown object changes.
+  useEffect(() => {
+    const t = timelineFor(objectId);
+    setEntries(t.entries);
+    setStopped(t.stopped);
+    setElapsed(0);
+  }, [objectId]);
+
   // Elapsed timer while running.
   useEffect(() => {
-    if (!isRunning || startTime === null) return;
+    if (!isRunning || anchor === null) return;
     const interval = setInterval(() => {
-      setElapsed(Date.now() - startTime);
+      setElapsed(Date.now() - anchor);
     }, 200);
     return () => {
       clearInterval(interval);
     };
-  }, [isRunning, startTime]);
+  }, [isRunning, anchor]);
 
-  // Listen for agent events from Tauri.
+  // Listen for agent events from Tauri. Registered once; every event is
+  // buffered under its own object_id and only the shown object updates state.
   useEffect(() => {
     const unlisten = listen<AgentEventEnvelope>("agent-event", (tauriEvent) => {
-      // Unwrap the object-keyed envelope. Scoping/filtering by object_id is a
-      // later wave — for now the panel behaves exactly as before.
-      const event = tauriEvent.payload.event;
-      const now = Date.now();
-      setStartTime((prev) => prev ?? now);
-
-      // Thinking events collapse in place: keep the latest token count on a
-      // single row instead of spamming the rail.
-      if (event.kind === "Thinking") {
-        setEntries((prev) => {
-          const lastIdx = prev.length - 1;
-          const last = lastIdx >= 0 ? prev[lastIdx] : undefined;
-          if (last !== undefined && last.event.kind === "Thinking") {
-            const updated = [...prev];
-            updated[lastIdx] = { ...last, event, timestamp: now };
-            return updated;
-          }
-          seqRef.current += 1;
-          return [...prev, { seq: seqRef.current, event, timestamp: now }];
-        });
-        return;
+      const { object_id, event } = tauriEvent.payload;
+      const next = appendEvent(object_id, event, Date.now());
+      if (object_id === objectIdRef.current) {
+        setEntries(next.entries);
+        setStopped(next.stopped);
       }
-
-      seqRef.current += 1;
-      setEntries((prev) => [
-        ...prev,
-        { seq: seqRef.current, event, timestamp: now },
-      ]);
     });
 
     return () => {
@@ -283,18 +393,49 @@ export function AgentPanel({ visible, onClose }: AgentPanelProps) {
   }, [entries]);
 
   const handleClear = useCallback(() => {
+    clearTimeline(objectId);
     setEntries([]);
-    seqRef.current = 0;
-    setStartTime(null);
+    setStopped(false);
     setElapsed(0);
-  }, []);
+  }, [objectId]);
+
+  const handleStop = useCallback(async () => {
+    const confirmed = window.confirm(
+      `Stop the agent working on ${objectId}?`,
+    );
+    if (!confirmed) return;
+    await killAgent(objectId);
+    // Only mark the timeline stopped when the kill actually settled the review
+    // (its agent handle was cleared). A failed kill leaves the agent running
+    // and surfaces via the store error, so the timeline is left untouched.
+    const settled = useAppStore.getState().activeReview;
+    if (settled?.pr === objectId && settled.agent != null) return;
+    const next = appendStopped(objectId, Date.now());
+    setEntries(next.entries);
+    setStopped(next.stopped);
+  }, [objectId, killAgent]);
+
+  const handleOpenLog = useCallback(() => {
+    if (logPath === null) return;
+    // Open the local log file in the configured editor. `open_in_editor`
+    // resolves an absolute path as-is and uses existing capabilities (no
+    // opener-plugin URL scheme needed for a local file).
+    void invoke("open_in_editor", {
+      filePath: logPath,
+      repoSlug: null,
+      branch: null,
+    });
+  }, [logPath]);
 
   if (!visible) return null;
 
-  const modeLabel = phase === "failed" ? "failed" : isRunning ? "running" : "idle";
-  // Once any event has arrived, startTime is set; captured here so the render
-  // path never needs a non-null assertion.
-  const anchor = startTime;
+  const modeLabel = stopped
+    ? "stopped"
+    : phase === "failed"
+      ? "failed"
+      : isRunning
+        ? "running"
+        : "idle";
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-card">
@@ -323,6 +464,28 @@ export function AgentPanel({ visible, onClose }: AgentPanelProps) {
                 <span>{String(thinkingTokens)} tok</span>
               )}
             </span>
+          )}
+          {logPath !== null && (
+            <button
+              type="button"
+              onClick={handleOpenLog}
+              title="Open the agent log in your editor"
+              className="flex cursor-pointer items-center gap-1 border-none bg-transparent text-xs text-muted-foreground hover:text-foreground"
+            >
+              <FileText className="h-3.5 w-3.5" />
+              Open log
+            </button>
+          )}
+          {agentAttached && (
+            <button
+              type="button"
+              onClick={() => void handleStop()}
+              title="Stop the running agent"
+              className="flex cursor-pointer items-center gap-1 border-none bg-transparent text-xs text-danger hover:text-danger/80"
+            >
+              <Square className="h-3.5 w-3.5" />
+              Stop
+            </button>
           )}
           <button
             type="button"
@@ -364,7 +527,7 @@ export function AgentPanel({ visible, onClose }: AgentPanelProps) {
               ))}
             </ol>
             {(phase === "complete" || phase === "failed") && (
-              <EndBanner phase={phase} />
+              <EndBanner phase={phase} stopped={stopped} />
             )}
           </>
         )}

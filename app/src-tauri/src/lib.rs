@@ -726,7 +726,7 @@ const NOTIFY_POLL_FLOOR_SECS: u64 = 30;
 fn notify_interval_secs(config: &Config) -> Option<u64> {
     match config.notify_poll_secs {
         None | Some(0) => None,
-        Some(secs) => Some((secs as u64).max(NOTIFY_POLL_FLOOR_SECS)),
+        Some(secs) => Some(u64::from(secs).max(NOTIFY_POLL_FLOOR_SECS)),
     }
 }
 

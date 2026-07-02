@@ -70,7 +70,19 @@ pub struct TrajectorySummary {
     /// Number of tool invocations the agent made.
     pub tools_used: u32,
     /// Commands the agent ran, each paired with its observed outcome.
+    ///
+    /// Only commands whose matching tool result was actually observed appear
+    /// here, so a `✓`/`✗` in the UI always reflects a confirmed outcome.
     pub commands: Vec<CommandRun>,
+    /// Commands the agent started that never received a matching tool result
+    /// before the stream ended.
+    ///
+    /// Kept as a count (not folded into [`Self::commands`]) so an unconfirmed
+    /// run is neither inflated to a false `✓` nor flagged as a false `✗`.
+    /// `#[serde(default)]` so summaries written before this field existed still
+    /// load (Invariant §0.1).
+    #[serde(default)]
+    pub unresolved_commands: u32,
     /// Wall-clock duration of the run in milliseconds.
     #[ts(type = "number")]
     pub duration_ms: u64,
@@ -190,6 +202,7 @@ mod tests {
                     ok: false,
                 },
             ],
+            unresolved_commands: 1,
             duration_ms: 15_800,
             final_text: "Fixed the failing assertion.".into(),
             ended_at_epoch_ms: 1_720_000_000_000,

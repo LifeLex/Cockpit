@@ -38,6 +38,11 @@ export interface RestackProgress {
   readonly current_pr: string;
   /** Phase of the run. */
   readonly status: "restacking" | "clean" | "conflict" | "done" | "error";
+  /**
+   * Human-readable reason for a halt (currently only the TOCTOU agent-guard
+   * `"error"`). Optional — omitted from the wire when the backend has none.
+   */
+  readonly detail?: string;
 }
 
 /**
@@ -224,6 +229,15 @@ interface AppStore {
 
   /** Merge a `restack-progress` event into {@link restackProgress} by root (D3). */
   applyRestackProgress: (progress: RestackProgress) => void;
+
+  /**
+   * Drop the recorded progress for a stack root (D3).
+   *
+   * Called when the user launches a fresh restack for `rootPr` so a terminal
+   * `conflict`/`error` entry from a previous run does not linger under the new
+   * sequence's live progress.
+   */
+  clearRestackProgress: (rootPr: string) => void;
 
   /**
    * Ensure a review has a checked-out worktree on disk and return its path
@@ -812,6 +826,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
         [progress.root_pr]: progress,
       },
     });
+  },
+
+  clearRestackProgress: (rootPr: string) => {
+    const next = { ...get().restackProgress };
+    delete next[rootPr];
+    set({ restackProgress: next });
   },
 
   // -------------------------------------------------------------------------

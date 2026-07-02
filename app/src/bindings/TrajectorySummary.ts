@@ -20,8 +20,21 @@ mode: AgentMode,
 tools_used: number, 
 /**
  * Commands the agent ran, each paired with its observed outcome.
+ *
+ * Only commands whose matching tool result was actually observed appear
+ * here, so a `✓`/`✗` in the UI always reflects a confirmed outcome.
  */
 commands: Array<CommandRun>, 
+/**
+ * Commands the agent started that never received a matching tool result
+ * before the stream ended.
+ *
+ * Kept as a count (not folded into [`Self::commands`]) so an unconfirmed
+ * run is neither inflated to a false `✓` nor flagged as a false `✗`.
+ * `#[serde(default)]` so summaries written before this field existed still
+ * load (Invariant §0.1).
+ */
+unresolved_commands: number, 
 /**
  * Wall-clock duration of the run in milliseconds.
  */

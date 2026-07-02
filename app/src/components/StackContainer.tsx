@@ -80,6 +80,7 @@ export function StackContainer({
   // -- D3: whole-stack restack control --
   const rootPr = root.review.pr;
   const restackStack = useAppStore((s) => s.restackStack);
+  const clearRestackProgress = useAppStore((s) => s.clearRestackProgress);
   const progress = useAppStore((s) => s.restackProgress[rootPr]);
   const staleCount = health.stale;
   // Refuse the offer while any member is mid-rework: restacking a branch out from
@@ -95,8 +96,30 @@ export function StackContainer({
       } onto their parents in dependency order?\n\nOn a conflict, an agent is dispatched to resolve it and the remaining PRs stay stale until it lands.`,
     );
     if (!confirmed) return;
+    // Fresh sequence: drop any lingering terminal (conflict/error) progress so
+    // the live spinner replaces the stale note instead of racing it.
+    clearRestackProgress(rootPr);
     void restackStack(rootPr);
-  }, [restackStack, rootPr, staleCount]);
+  }, [clearRestackProgress, restackStack, rootPr, staleCount]);
+
+  // The offer button, reused both as the initial control and when re-offered
+  // beside a terminal conflict/error note (so a halted run is never stuck).
+  const restackButton: ReactNode = (
+    <button
+      type="button"
+      onClick={handleRestackStack}
+      className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-warning/40 bg-transparent px-2 py-1 text-xs font-medium text-warning transition-colors hover:bg-warning/10"
+      title="Rebase every stale member onto its parent, in dependency order"
+    >
+      <Layers className="h-3 w-3" />
+      Restack stack ({staleCount} stale, in order)
+    </button>
+  );
+
+  // After a terminal halt (conflict/error), re-offer the button once the stack
+  // is settled (no member mid-rework) and stale members remain — otherwise the
+  // sticky note would hide the control forever.
+  const canRetry = !anyAgent && staleCount > 0;
 
   let restackControl: ReactNode = null;
   if (
@@ -112,38 +135,39 @@ export function StackContainer({
     );
   } else if (progress?.status === "conflict") {
     restackControl = (
-      <span className="inline-flex items-center gap-1.5 text-xs text-warning">
-        <span
-          className="h-1.5 w-1.5 shrink-0 rounded-full bg-warning"
-          aria-hidden="true"
-        />
-        conflict on {progress.current_pr} — resolver dispatched, remaining PRs
-        still stale
-      </span>
+      <div className="flex flex-col gap-1.5">
+        <span className="inline-flex items-center gap-1.5 text-xs text-warning">
+          <span
+            className="h-1.5 w-1.5 shrink-0 rounded-full bg-warning"
+            aria-hidden="true"
+          />
+          conflict on {progress.current_pr} — resolver dispatched, remaining PRs
+          still stale
+        </span>
+        {canRetry && restackButton}
+      </div>
     );
   } else if (progress?.status === "error") {
+    const detail =
+      progress.detail !== undefined && progress.detail !== ""
+        ? ` — ${progress.detail}`
+        : "";
     restackControl = (
-      <span className="inline-flex items-center gap-1.5 text-xs text-danger">
-        <span
-          className="h-1.5 w-1.5 shrink-0 rounded-full bg-danger"
-          aria-hidden="true"
-        />
-        restack failed
-        {progress.current_pr !== "" ? ` on ${progress.current_pr}` : ""}
-      </span>
+      <div className="flex flex-col gap-1.5">
+        <span className="inline-flex items-center gap-1.5 text-xs text-danger">
+          <span
+            className="h-1.5 w-1.5 shrink-0 rounded-full bg-danger"
+            aria-hidden="true"
+          />
+          restack halted
+          {progress.current_pr !== "" ? ` on ${progress.current_pr}` : ""}
+          {detail}
+        </span>
+        {canRetry && restackButton}
+      </div>
     );
   } else if (staleCount > 0 && !anyAgent) {
-    restackControl = (
-      <button
-        type="button"
-        onClick={handleRestackStack}
-        className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-warning/40 bg-transparent px-2 py-1 text-xs font-medium text-warning transition-colors hover:bg-warning/10"
-        title="Rebase every stale member onto its parent, in dependency order"
-      >
-        <Layers className="h-3 w-3" />
-        Restack stack ({staleCount} stale, in order)
-      </button>
-    );
+    restackControl = restackButton;
   }
 
   return (

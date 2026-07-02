@@ -586,6 +586,7 @@ function makeTrajectory(): TrajectorySummary {
     mode: "Fix",
     tools_used: 4,
     commands: [{ command: "cargo test", ok: true }],
+    unresolved_commands: 0,
     duration_ms: 12_000,
     final_text: "done",
     ended_at_epoch_ms: 1_700_000_000_000,

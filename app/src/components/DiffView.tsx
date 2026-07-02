@@ -873,7 +873,11 @@ export function DiffView({
     () => pairings.filter((p) => p.match === null).length,
     [pairings],
   );
-  const showAddressed = hasInterdiff && pairings.length > 0;
+  // Gate on the loaded interdiff (not merely `hasInterdiff`), same as the
+  // Approve warning below: while the interdiff is still fetching, `interdiff` is
+  // null and every request pairs as unmatched — showing the panel then would
+  // flash the requests as unaddressed before the real pairing resolves.
+  const showAddressed = interdiff !== null && pairings.length > 0;
 
   // -- Close inline form on file change --
   useEffect(() => {

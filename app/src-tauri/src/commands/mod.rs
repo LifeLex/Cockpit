@@ -2480,9 +2480,17 @@ struct RestackProgressPayload {
     current_pr: String,
     /// Phase of the run: `restacking` | `clean` | `conflict` | `done` | `error`.
     status: &'static str,
+    /// Human-readable reason for a halt (currently only the TOCTOU agent-guard
+    /// `"error"`); omitted from the wire when absent so the optional frontend
+    /// field stays `undefined` rather than `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 /// Emit a `"restack-progress"` event, swallowing any emit failure.
+///
+/// `detail` carries an optional human-readable reason (used by the TOCTOU
+/// agent-guard halt); pass `None` for the ordinary progress transitions.
 fn emit_restack_progress(
     app_handle: &tauri::AppHandle,
     root_pr: &str,
@@ -2490,6 +2498,7 @@ fn emit_restack_progress(
     total: u32,
     current_pr: &str,
     status: &'static str,
+    detail: Option<String>,
 ) {
     use tauri::Emitter;
     let payload = RestackProgressPayload {
@@ -2498,6 +2507,7 @@ fn emit_restack_progress(
         total,
         current_pr: current_pr.to_string(),
         status,
+        detail,
     };
     let _ = app_handle.emit("restack-progress", &payload);
 }
@@ -2539,6 +2549,18 @@ pub async fn restack_stack(
     if order.is_empty() {
         return Err(CommandError {
             message: format!("Stack rooted at {root_pr} has nothing to restack"),
+        });
+    }
+
+    // Guard: refuse if the root itself is mid-rework. The root is NOT part of
+    // `order` (only its descendants are), so it needs its own check —
+    // restacking descendants onto a root whose branch an agent is actively
+    // rewriting would build on an unstable base.
+    if root.agent.is_some() {
+        return Err(CommandError {
+            message: format!(
+                "Stack root {root_pr} is mid-rework (agent attached); wait for it to finish before restacking the stack"
+            ),
         });
     }
 
@@ -2595,7 +2617,10 @@ async fn run_restack_sequence(
     root_pr: String,
     steps: Vec<(PrRef, String)>,
 ) {
-    let total = steps.len() as u32;
+    // The step count cannot realistically exceed u32::MAX; saturate defensively
+    // rather than silence the conversion with `as`.
+    let total = u32::try_from(steps.len()).unwrap_or(u32::MAX);
+    let root_ref = PrRef::new(&root_pr);
 
     // Load config + repo path once for the whole sequence. A load failure aborts
     // before touching any branch.
@@ -2603,7 +2628,7 @@ async fn run_restack_sequence(
         Ok(c) => c,
         Err(e) => {
             eprintln!("restack_stack: config load failed: {e}");
-            emit_restack_progress(&app_handle, &root_pr, 0, total, "", "error");
+            emit_restack_progress(&app_handle, &root_pr, 0, total, "", "error", None);
             return;
         }
     };
@@ -2613,8 +2638,31 @@ async fn run_restack_sequence(
         .unwrap_or_else(|| PathBuf::from("."));
 
     for (idx, (pr_ref, parent_branch)) in steps.iter().enumerate() {
-        let current = idx as u32 + 1;
+        // 1-based; saturate rather than silence the conversion with `as`.
+        let current = u32::try_from(idx).unwrap_or(u32::MAX).saturating_add(1);
         let current_pr = pr_ref.as_str().to_string();
+
+        // TOCTOU guard: the launch-time agent check ran once, over a snapshot of
+        // the whole order. Since then an agent could have attached to this
+        // not-yet-processed child — or to the ROOT, which is never in `order` —
+        // and restacking a branch out from under a running agent would clobber
+        // its work. Re-read both from the store immediately before the restack
+        // and halt if either is now mid-rework. This closes the TOCTOU window;
+        // the check is best-effort (a race within one child's restack remains
+        // theoretically possible, but restack_one aborts on conflict and only
+        // moves the ref on a clean success).
+        if let Some(reason) = restack_blocked_reason(&state, &root_ref, pr_ref) {
+            emit_restack_progress(
+                &app_handle,
+                &root_pr,
+                current,
+                total,
+                &current_pr,
+                "error",
+                Some(reason),
+            );
+            return;
+        }
 
         emit_restack_progress(
             &app_handle,
@@ -2623,6 +2671,7 @@ async fn run_restack_sequence(
             total,
             &current_pr,
             "restacking",
+            None,
         );
 
         match restack_one(
@@ -2636,7 +2685,15 @@ async fn run_restack_sequence(
         .await
         {
             Ok(RestackStep::Clean) => {
-                emit_restack_progress(&app_handle, &root_pr, current, total, &current_pr, "clean");
+                emit_restack_progress(
+                    &app_handle,
+                    &root_pr,
+                    current,
+                    total,
+                    &current_pr,
+                    "clean",
+                    None,
+                );
             }
             Ok(RestackStep::Conflict) => {
                 // The conflict-resolver agent now owns this branch; stop here so
@@ -2648,6 +2705,7 @@ async fn run_restack_sequence(
                     total,
                     &current_pr,
                     "conflict",
+                    None,
                 );
                 return;
             }
@@ -2656,14 +2714,52 @@ async fn run_restack_sequence(
                     "restack_stack: restack failed for {current_pr}: {}",
                     e.message
                 );
-                emit_restack_progress(&app_handle, &root_pr, current, total, &current_pr, "error");
+                emit_restack_progress(
+                    &app_handle,
+                    &root_pr,
+                    current,
+                    total,
+                    &current_pr,
+                    "error",
+                    None,
+                );
                 return;
             }
         }
     }
 
     // The whole sequence completed cleanly.
-    emit_restack_progress(&app_handle, &root_pr, total, total, "", "done");
+    emit_restack_progress(&app_handle, &root_pr, total, total, "", "done", None);
+}
+
+/// Re-read the child and root reviews from the store and report which one, if
+/// any, now has an agent attached.
+///
+/// Closes the [`run_restack_sequence`] TOCTOU window: the launch-time guard in
+/// [`restack_stack`] checks the whole order once, but a Fix/Review/Restack agent
+/// can attach to a not-yet-processed child — or to the ROOT, which is never in
+/// the order — before its turn arrives. Returns a human-readable reason when
+/// either is mid-rework, otherwise `None`.
+fn restack_blocked_reason(state: &AppState, root_ref: &PrRef, child_ref: &PrRef) -> Option<String> {
+    if state
+        .reviews
+        .get(child_ref)
+        .is_some_and(|r| r.agent.is_some())
+    {
+        return Some(format!(
+            "{child_ref} is now mid-rework (agent attached); halted the stack restack here"
+        ));
+    }
+    if state
+        .reviews
+        .get(root_ref)
+        .is_some_and(|r| r.agent.is_some())
+    {
+        return Some(format!(
+            "stack root {root_ref} is now mid-rework (agent attached); halted the stack restack"
+        ));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------

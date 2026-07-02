@@ -307,6 +307,11 @@ function TrajectoryCard({ summary }: { readonly summary: TrajectorySummary }) {
             {formatElapsed(summary.duration_ms)}
           </span>
           <span>{String(summary.tools_used)} tools</span>
+          {summary.unresolved_commands > 0 && (
+            <span title="Commands that never reported a result before the run ended — outcome unknown, so shown as neither ✓ nor ✗">
+              · {String(summary.unresolved_commands)} unresolved
+            </span>
+          )}
           <span title="When the run ended">{endedAgo} ago</span>
         </span>
       </div>

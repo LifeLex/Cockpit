@@ -183,9 +183,13 @@ impl TrajectoryAccumulator {
     /// `mode` comes from the [`StreamContext`], not the stream. Duration
     /// prefers the `Complete` event's value, falling back to measured
     /// wall-clock when that is absent or reported as zero (a zero duration means
-    /// the result event omitted the field). A command with no matching result is
-    /// recorded as `ok = true`: the process ended without that tool failing
-    /// loudly, so we do not flag it.
+    /// the result event omitted the field).
+    ///
+    /// A command with no matching tool result (the stream ended before its
+    /// outcome was observed) is DROPPED from `commands` and counted in
+    /// `unresolved_commands` instead: recording it as `ok = true` would inflate
+    /// an unconfirmed run to a false `✓`, and `ok = false` would raise a false
+    /// alarm, so an unconfirmed command is reported honestly as neither.
     fn finish(self, mode: AgentMode) -> TrajectorySummary {
         let duration_ms = self
             .complete_duration_ms
@@ -196,12 +200,19 @@ impl TrajectoryAccumulator {
 
         let final_text = self.complete_text.or(self.last_text).unwrap_or_default();
 
+        let mut unresolved_commands: u32 = 0;
         let commands = self
             .commands
             .into_iter()
-            .map(|c| CommandRun {
-                command: c.command,
-                ok: c.ok.unwrap_or(true),
+            .filter_map(|c| match c.ok {
+                Some(ok) => Some(CommandRun {
+                    command: c.command,
+                    ok,
+                }),
+                None => {
+                    unresolved_commands = unresolved_commands.saturating_add(1);
+                    None
+                }
             })
             .collect();
 
@@ -209,6 +220,7 @@ impl TrajectoryAccumulator {
             mode,
             tools_used: self.tools_used,
             commands,
+            unresolved_commands,
             duration_ms,
             final_text,
             ended_at_epoch_ms: now_epoch_ms(),

@@ -51,6 +51,12 @@ export function makeReview(overrides: Partial<Review> = {}): Review {
     project: null,
     review_findings: [],
     conversation: [],
+    // Serde emits `Option::None` as `null` with the key present — fixtures
+    // must mirror the wire shape, not omit the fields (omission hid a
+    // null-deref crash the type system couldn't see).
+    dispatch_snapshot: null,
+    ci_summary: null,
+    last_reviewed_sha: null,
   };
   return { ...base, ...overrides };
 }

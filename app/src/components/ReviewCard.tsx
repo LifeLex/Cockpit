@@ -323,7 +323,7 @@ function RiskChips({ review }: { readonly review: Review }) {
 
   return (
     <>
-      {ci !== undefined && ci.total > 0 && (
+      {ci !== null && ci.total > 0 && (
         <RiskChip
           tone={ciSummaryTone(ci)}
           title={`CI: ${String(ci.passed)} passed, ${String(ci.failed)} failed, ${String(ci.pending)} pending`}

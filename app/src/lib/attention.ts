@@ -76,8 +76,10 @@ const SENSITIVE = 0.15; // auth/migrations/config/etc. warrant scrutiny — sink
 
 /** The rolled-up CI state for a review, or `"none"` when no checks are loaded. */
 function reviewCiState(review: Review): CiState {
+  // Serde serializes `Option::None` as `null` (the key is always present on
+  // the wire), so the empty state is `null` — never `undefined`.
   const ci = review.ci_summary;
-  return ci === undefined ? "none" : ciState(ci);
+  return ci === null ? "none" : ciState(ci);
 }
 
 /** Within-bucket adjustment from CI status. */

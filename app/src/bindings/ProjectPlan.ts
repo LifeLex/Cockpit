@@ -38,4 +38,4 @@ agent: AgentRun | null,
  * file is read back and parsed into [`Self::doc`]. `None` for plans that
  * were loaded directly from a document rather than produced by an agent.
  */
-plan_path?: string, };
+plan_path: string | null, };

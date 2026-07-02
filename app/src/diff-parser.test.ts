@@ -6,6 +6,7 @@ import {
   realToFragment,
   extractFilePaths,
   diffStats,
+  identityLineMap,
 } from "./diff-parser";
 
 /** Fetch the single parsed file, failing loudly if the diff produced none. */
@@ -54,6 +55,39 @@ describe("parseDiff line mapping — single hunk deep in a file", () => {
     expect(fragmentToReal(file, "New", 6)).toBeUndefined();
     expect(fragmentToReal(file, "New", 0)).toBeUndefined();
     expect(fragmentToReal(file, "Old", 5)).toBeUndefined();
+  });
+});
+
+describe("identityLineMap — full-file view (B4)", () => {
+  it("maps every fragment line to the same real line on both sides", () => {
+    const file: FileDiff = {
+      path: "src/full.ts",
+      original: "a\nb\nc",
+      modified: "a\nB\nc\nd",
+      lineMap: identityLineMap("a\nb\nc", "a\nB\nc\nd"),
+    };
+    expect(fragmentToReal(file, "Old", 1)).toBe(1);
+    expect(fragmentToReal(file, "Old", 3)).toBe(3);
+    expect(fragmentToReal(file, "New", 4)).toBe(4);
+    expect(realToFragment(file, "Old", 2)).toBe(2);
+    expect(realToFragment(file, "New", 4)).toBe(4);
+  });
+
+  it("returns undefined past each side's line count", () => {
+    const file: FileDiff = {
+      path: "src/full.ts",
+      original: "a\nb\nc",
+      modified: "a\nB\nc\nd",
+      lineMap: identityLineMap("a\nb\nc", "a\nB\nc\nd"),
+    };
+    expect(fragmentToReal(file, "Old", 4)).toBeUndefined();
+    expect(fragmentToReal(file, "New", 5)).toBeUndefined();
+  });
+
+  it("treats an empty side (added/deleted file) as zero lines", () => {
+    const map = identityLineMap("", "x\ny");
+    expect(map.Old.toReal).toEqual([]);
+    expect(map.New.toReal).toEqual([1, 2]);
   });
 });
 

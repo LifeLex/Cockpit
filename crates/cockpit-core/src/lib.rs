@@ -15,6 +15,8 @@ pub mod model;
 
 pub mod adapters;
 pub mod dag;
+pub mod diff_signals;
+pub mod findings;
 pub mod gate;
 pub mod kickoff;
 pub mod persist;

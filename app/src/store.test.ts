@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import type { Review } from "./bindings/Review";
 import type { CiCheck } from "./bindings/CiCheck";
 import type { SubmitReviewResult } from "./bindings/SubmitReviewResult";
+import type { EvidenceSummary } from "./bindings/EvidenceSummary";
+import type { FilePair } from "./bindings/FilePair";
 import {
   mockInvoke,
   mockInvokeReject,
@@ -448,5 +450,131 @@ describe("fetchInterdiff", () => {
 
     expect(result).toBeNull();
     expect(useAppStore.getState().error).toContain("no snapshot");
+  });
+});
+
+/** Minimal evidence bundle for the store-action tests. */
+function makeEvidence(): EvidenceSummary {
+  return {
+    signals: {
+      additions: 1,
+      deletions: 0,
+      files_changed: 1,
+      size_class: "S",
+      test_delta: {
+        test_files_changed: 0,
+        assertions_added: 0,
+        assertions_removed: 0,
+      },
+      risk_paths: [],
+      weakening: [],
+    },
+    ci: null,
+    agent_ran: [],
+  };
+}
+
+describe("fetchEvidence", () => {
+  it("returns the evidence bundle on success (B1)", async () => {
+    const evidence = makeEvidence();
+    mockInvoke("get_evidence", (args) => {
+      expect(args.pr).toBe("pr-1");
+      return evidence;
+    });
+
+    const result = await useAppStore.getState().fetchEvidence("pr-1");
+
+    expect(result).toEqual(evidence);
+    expect(useAppStore.getState().error).toBeNull();
+  });
+
+  it("returns null and never sets the blocking error on failure (Invariant 1)", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockInvokeReject("get_evidence", "boom");
+
+    const result = await useAppStore.getState().fetchEvidence("pr-1");
+
+    expect(result).toBeNull();
+    expect(useAppStore.getState().error).toBeNull();
+    spy.mockRestore();
+  });
+});
+
+describe("preReview", () => {
+  it("applies the returned review with its running Review agent across lists (B2)", async () => {
+    const before = makeReview({ pr: "pr-1", gate_state: "InReview", agent: null });
+    const running = makeReview({
+      pr: "pr-1",
+      gate_state: "InReview",
+      agent: makeAgentRun({ mode: "Review" }),
+    });
+    useAppStore.setState({ activeReview: before, reviews: [before] });
+    mockInvoke("pre_review", (args) => {
+      expect(args.pr).toBe("pr-1");
+      return running;
+    });
+
+    await useAppStore.getState().preReview("pr-1");
+
+    const agent = useAppStore.getState().activeReview?.agent;
+    expect(agent).not.toBeNull();
+    if (agent == null) throw new Error("expected a running review agent");
+    expect(agent.mode).toBe("Review");
+    expect(useAppStore.getState().reviews[0]?.agent).not.toBeNull();
+    expect(useAppStore.getState().error).toBeNull();
+  });
+
+  it("sets error (non-fatal) when the pre-pass refuses to start", async () => {
+    const before = makeReview({ pr: "pr-1", gate_state: "InReview" });
+    useAppStore.setState({ activeReview: before, reviews: [before] });
+    mockInvokeReject("pre_review", "already has a running agent");
+
+    await useAppStore.getState().preReview("pr-1");
+
+    expect(useAppStore.getState().error).toContain("already has a running agent");
+  });
+});
+
+describe("fetchFilePair", () => {
+  it("returns the pair and memoizes by pr:path:head (B4)", async () => {
+    useAppStore.getState().filePairCache.clear();
+    useAppStore.setState({
+      activeReview: makeReview({ pr: "pr-1", head_sha: "h1" }),
+    });
+    const pair: FilePair = { original: "a", modified: "b", full: true };
+    let calls = 0;
+    mockInvoke("get_file_pair", (args) => {
+      calls += 1;
+      expect(args.pr).toBe("pr-1");
+      expect(args.path).toBe("src/x.ts");
+      return pair;
+    });
+
+    const first = await useAppStore.getState().fetchFilePair("pr-1", "src/x.ts");
+    const second = await useAppStore
+      .getState()
+      .fetchFilePair("pr-1", "src/x.ts");
+
+    expect(first).toEqual(pair);
+    expect(second).toEqual(pair);
+    // Second call is served from the cache, so the backend is hit only once.
+    expect(calls).toBe(1);
+  });
+
+  it("returns null and never sets the blocking error on failure (Invariant 1)", async () => {
+    useAppStore.getState().filePairCache.clear();
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    useAppStore.setState({
+      activeReview: makeReview({ pr: "pr-2", head_sha: "h2" }),
+    });
+    mockInvokeReject("get_file_pair", "no such file");
+
+    const result = await useAppStore
+      .getState()
+      .fetchFilePair("pr-2", "missing.ts");
+
+    expect(result).toBeNull();
+    expect(useAppStore.getState().error).toBeNull();
+    spy.mockRestore();
   });
 });

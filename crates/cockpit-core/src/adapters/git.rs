@@ -193,6 +193,60 @@ pub fn diff_range(worktree: &Path, from: &str, to: &str) -> Result<String, Error
     Ok(patch)
 }
 
+/// Maximum blob size served by [`file_at_rev`], in bytes.
+///
+/// The full-file view feeds Monaco, which degrades badly on very large
+/// documents; a blob past this cap yields `Ok(None)` so the UI stays on the
+/// diff view rather than trying to render an enormous file.
+pub const MAX_FULL_FILE_BYTES: usize = 512 * 1024;
+
+/// Read the text content of a file at a specific revision.
+///
+/// Opens the repository at `repo_dir` (a worktree or a main checkout — `git2`
+/// handles both via `Repository::open`), resolves `rev` to its tree, and looks
+/// up `path` within that tree.
+///
+/// Returns:
+/// - `Ok(Some(text))` when the path exists at `rev` and its blob is UTF-8 text
+///   within [`MAX_FULL_FILE_BYTES`].
+/// - `Ok(None)` when the path is absent at `rev` (an added or deleted file
+///   viewed from the wrong side), when the entry is not a plain file, when the
+///   blob is binary (contains a NUL byte or is not valid UTF-8 — the full-file
+///   view is text-only), or when the blob exceeds [`MAX_FULL_FILE_BYTES`].
+/// - `Err(..)` when `rev` itself cannot be resolved, so a mistyped revision is
+///   distinguishable from a legitimately absent file.
+pub fn file_at_rev(repo_dir: &Path, rev: &str, path: &str) -> Result<Option<String>, Error> {
+    let repo = Repository::open(repo_dir)?;
+    let tree = repo.revparse_single(rev)?.peel_to_tree()?;
+
+    let entry = match tree.get_path(Path::new(path)) {
+        Ok(entry) => entry,
+        // A missing path is a normal outcome (added/deleted file), not an error.
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(Error::Git2(e)),
+    };
+
+    let object = entry.to_object(&repo)?;
+    // The entry may resolve to a subtree or submodule rather than a file.
+    let Some(blob) = object.as_blob() else {
+        return Ok(None);
+    };
+
+    let content = blob.content();
+    if content.len() > MAX_FULL_FILE_BYTES {
+        return Ok(None);
+    }
+    // Binary blobs are not rendered: the full-file view is text-only. A NUL byte
+    // is valid UTF-8, so it is checked separately from the UTF-8 decode below.
+    if content.contains(&0) {
+        return Ok(None);
+    }
+    match std::str::from_utf8(content) {
+        Ok(text) => Ok(Some(text.to_string())),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Remove a worktree and clean up its directory.
 ///
 /// Accepts the branch name and flattens it with [`worktree_name`] to match
@@ -856,6 +910,55 @@ mod tests {
             patch.is_empty(),
             "identical revisions should produce an empty diff, got:\n{patch}"
         );
+    }
+
+    #[test]
+    fn file_at_rev_reads_content_across_revisions() {
+        let (repo, dir) = scratch_repo_with_file();
+        // scratch_repo_with_file seeds base.txt with "line 1\n" on the initial
+        // commit. Add a second revision that changes the same file.
+        commit_file(&repo, "base.txt", b"line two\n", "edit base");
+
+        let at_head = file_at_rev(dir.path(), "HEAD", "base.txt").unwrap();
+        assert_eq!(at_head.as_deref(), Some("line two\n"), "HEAD content");
+
+        let at_prev = file_at_rev(dir.path(), "HEAD~1", "base.txt").unwrap();
+        assert_eq!(at_prev.as_deref(), Some("line 1\n"), "HEAD~1 content");
+    }
+
+    #[test]
+    fn file_at_rev_absent_path_is_none() {
+        let (_repo, dir) = scratch_repo_with_file();
+        let result = file_at_rev(dir.path(), "HEAD", "does-not-exist.txt").unwrap();
+        assert_eq!(result, None, "an absent path yields Ok(None), not an error");
+    }
+
+    #[test]
+    fn file_at_rev_bad_rev_errors() {
+        let (_repo, dir) = scratch_repo_with_file();
+        let result = file_at_rev(dir.path(), "no-such-rev", "base.txt");
+        assert!(
+            matches!(result, Err(Error::Git2(_))),
+            "a bad revision must error, not return None, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn file_at_rev_binary_blob_is_none() {
+        let (repo, dir) = scratch_repo_with_file();
+        // A blob with an embedded NUL is binary; the text-only view returns None.
+        commit_file(&repo, "bin.dat", b"abc\x00def\n", "add binary blob");
+        let result = file_at_rev(dir.path(), "HEAD", "bin.dat").unwrap();
+        assert_eq!(result, None, "binary blob should return None");
+    }
+
+    #[test]
+    fn file_at_rev_oversize_blob_is_none() {
+        let (repo, dir) = scratch_repo_with_file();
+        let big = vec![b'x'; MAX_FULL_FILE_BYTES + 1];
+        commit_file(&repo, "big.txt", &big, "add oversize blob");
+        let result = file_at_rev(dir.path(), "HEAD", "big.txt").unwrap();
+        assert_eq!(result, None, "blob over the cap should return None");
     }
 
     #[test]

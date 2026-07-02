@@ -237,3 +237,15 @@
 .inline-comment-line-glyph {
   border-left: 3px solid var(--color-state-in-review);
 }
+
+/* Advisory review-finding rails in the glyph margin (B2). Dashed to read as
+   distinct from the solid human-comment accent, colored by severity. */
+.finding-line-info {
+  border-left: 3px dashed var(--color-muted-foreground);
+}
+.finding-line-warning {
+  border-left: 3px dashed var(--color-warning);
+}
+.finding-line-critical {
+  border-left: 3px dashed var(--color-danger);
+}

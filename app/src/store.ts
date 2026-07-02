@@ -16,6 +16,8 @@ import type { SyncReport } from "./bindings/SyncReport";
 import type { AgentMode } from "./bindings/AgentMode";
 import type { CiCheck } from "./bindings/CiCheck";
 import type { DiffSide } from "./bindings/DiffSide";
+import type { EvidenceSummary } from "./bindings/EvidenceSummary";
+import type { FilePair } from "./bindings/FilePair";
 
 /**
  * Navigation state discriminated union.
@@ -183,6 +185,39 @@ interface AppStore {
   ensureReviewWorktree: (pr: string) => Promise<string | null>;
 
   // -------------------------------------------------------------------------
+  // Diff-gate evidence (Phase B; best-effort UI reads, never block the loop)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Fetch the review-time evidence bundle (diff signals, CI rollup, agent
+   * commands) for a PR (B1). Best-effort: returns `null` and logs on failure
+   * rather than setting the blocking `error` — evidence is a glance aid and
+   * never blocks the loop (Invariant 1).
+   */
+  fetchEvidence: (pr: string) => Promise<EvidenceSummary | null>;
+
+  /**
+   * Run the advisory read-only pre-pass reviewer for a PR (B2). Applies the
+   * returned [`Review`] (which now carries a running Review agent) across every
+   * list. Non-fatal: a spawn failure sets `error` and never blocks the loop.
+   */
+  preReview: (pr: string) => Promise<void>;
+
+  /**
+   * Per `pr:path:head_sha` cache of resolved full-file pairs (B4). Populated by
+   * {@link fetchFilePair}; keyed on the head SHA so a force-push naturally
+   * misses and refetches. Not reactive — read only through {@link fetchFilePair}.
+   */
+  readonly filePairCache: Map<string, FilePair>;
+
+  /**
+   * Fetch the full text of a file on both sides of a review's diff for the
+   * full-file view (B4), memoized in {@link filePairCache}. Best-effort:
+   * returns `null` and logs on failure (never blocks the loop, Invariant 1).
+   */
+  fetchFilePair: (pr: string, path: string) => Promise<FilePair | null>;
+
+  // -------------------------------------------------------------------------
   // Config
   // -------------------------------------------------------------------------
 
@@ -343,6 +378,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   authoredPrs: [],
   reviewRequests: [],
   prFetchLoading: false,
+  filePairCache: new Map<string, FilePair>(),
 
   fetchReviews: async () => {
     set({ loading: true, error: null });
@@ -690,6 +726,69 @@ export const useAppStore = create<AppStore>((set, get) => ({
       return await invoke<string>("ensure_review_worktree", { pr });
     } catch (e: unknown) {
       set({ error: String(e) });
+      return null;
+    }
+  },
+
+  // -------------------------------------------------------------------------
+  // Diff-gate evidence (Phase B)
+  // -------------------------------------------------------------------------
+
+  fetchEvidence: async (pr: string): Promise<EvidenceSummary | null> => {
+    try {
+      return await invoke<EvidenceSummary>("get_evidence", { pr });
+    } catch (e: unknown) {
+      // Non-fatal (Invariant 1): evidence is a glance aid, never a gate.
+      console.error("get_evidence failed", e);
+      return null;
+    }
+  },
+
+  preReview: async (pr: string) => {
+    try {
+      const review = await invoke<Review>("pre_review", { pr });
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      const active = get().activeReview;
+      set({
+        activeReview: active?.pr === review.pr ? review : active,
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        reviews: get().reviews.map(replace),
+      });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  fetchFilePair: async (
+    pr: string,
+    path: string,
+  ): Promise<FilePair | null> => {
+    // Key the cache on the review's head SHA so a force-push (new head) misses
+    // and refetches instead of showing stale content.
+    const known =
+      get().activeReview?.pr === pr
+        ? get().activeReview
+        : ([
+            ...get().reviews,
+            ...get().authoredPrs,
+            ...get().reviewRequests,
+          ].find((r) => r.pr === pr) ?? null);
+    const head = known?.head_sha ?? "";
+    const key = `${pr}:${path}:${head}`;
+
+    const cache = get().filePairCache;
+    const cached = cache.get(key);
+    if (cached !== undefined) return cached;
+
+    try {
+      const pair = await invoke<FilePair>("get_file_pair", { pr, path });
+      cache.set(key, pair);
+      return pair;
+    } catch (e: unknown) {
+      // Non-fatal (Invariant 1): the full-file view is optional; fall back to
+      // the diff fragments rather than blocking.
+      console.error("get_file_pair failed", e);
       return null;
     }
   },

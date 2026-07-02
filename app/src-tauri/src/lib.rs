@@ -167,6 +167,13 @@ pub fn run() {
                             }
                             "completed"
                         }
+                        AgentMode::Review => {
+                            // Advisory pre-pass reviewer finished: ingest its
+                            // findings file onto the review. This NEVER touches
+                            // the gate state — the pre-pass is read-only
+                            // (Invariant 5).
+                            ingest_review_findings(&app_state_ref, &event.object_id)
+                        }
                     };
 
                     // Best-effort: if no frontend window is listening, the
@@ -253,6 +260,9 @@ pub fn run() {
             commands::open_review,
             commands::get_review_diff,
             commands::get_interdiff,
+            commands::get_evidence,
+            commands::get_file_pair,
+            commands::pre_review,
             commands::add_comment,
             commands::request_changes,
             commands::mirror_comments,
@@ -502,6 +512,94 @@ fn ingest_plan_output(state: &AppState, project_id: &ProjectId) -> &'static str 
     outcome
 }
 
+/// Ingest the advisory reviewer's findings after an [`AgentMode::Review`]
+/// completion and return the outcome label for the `"agent-completed"` payload.
+///
+/// The read-only pre-pass reviewer writes a JSON findings array to
+/// [`config::findings_file_path`](cockpit_core::config::findings_file_path),
+/// keyed by the PR ref used at spawn (the completion event's `object_id`). This
+/// reads that file, parses it with
+/// [`findings::parse_findings`](cockpit_core::findings::parse_findings), stores
+/// the result on the review, and always clears the review's running agent handle.
+///
+/// Every failure mode is non-fatal (Invariant 1) and maps to `"failed"`: no
+/// review resolves for the object id, the path cannot be resolved, the file is
+/// missing or unreadable, or the parse returns
+/// [`Error::NoArrayFound`](cockpit_core::findings::Error::NoArrayFound). A
+/// successful parse (including a located-but-empty array) stores the findings and
+/// returns `"completed"`.
+///
+/// INVARIANT: this NEVER touches `gate_state`. The advisory pre-pass is
+/// read-only and never advances the gate (Invariant 5).
+///
+/// The findings file is a transport, not a store: it is deleted after ingest —
+/// findings now live on the [`Review`] and in persistence.
+fn ingest_review_findings(state: &AppState, object_id: &str) -> &'static str {
+    let Some(pr_ref) = resolve_review_pr(state, object_id) else {
+        // No stored review resolved for this object id — nothing to ingest.
+        return "failed";
+    };
+
+    // Read + parse the reviewer's findings file (keyed by the PR ref used at
+    // spawn). Any failure yields `None`; a successful parse yields the findings.
+    let path = cockpit_core::config::findings_file_path(object_id);
+    let parsed = match &path {
+        Ok(path) => match std::fs::read_to_string(path) {
+            Ok(raw) => match cockpit_core::findings::parse_findings(&raw) {
+                Ok(findings) => Some(findings),
+                Err(e) => {
+                    eprintln!(
+                        "ingest_review_findings: parse failed for {}: {e}",
+                        path.display()
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "ingest_review_findings: read failed for {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("ingest_review_findings: findings path for {object_id}: {e}");
+            None
+        }
+    };
+
+    let outcome = if parsed.is_some() {
+        "completed"
+    } else {
+        "failed"
+    };
+
+    // Always clear the running agent; store the findings on a successful parse.
+    // INVARIANT: gate_state is never touched here (read-only pre-pass).
+    state.reviews.update(&pr_ref, |r| {
+        r.agent = None;
+        if let Some(findings) = parsed {
+            r.review_findings = findings;
+        }
+    });
+
+    // The findings file is a transport, not a store — delete it after ingest.
+    // Best-effort: a delete failure (other than a missing file) is logged but
+    // never changes the outcome.
+    if let Ok(path) = &path
+        && let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "ingest_review_findings: remove {} failed: {e}",
+            path.display()
+        );
+    }
+
+    outcome
+}
+
 /// Resolve a review's [`PrRef`] from a completion event's `object_id`.
 ///
 /// The object id may be a [`PrRef`] string (the Fix/Restack path keys sessions
@@ -548,6 +646,13 @@ async fn refresh_review_diff(state: &AppState, pr_ref: &PrRef) {
         Some(slug) => github::pr_diff_by_repo(slug, pr_number).await,
         None => github::pr_diff(pr_number).await,
     };
+
+    // The advisory findings were anchored to the previous diff/head; the head
+    // has already moved by the time a refresh is requested, so drop them even
+    // when the re-fetch fails (stale pins on changed content mislead).
+    state.reviews.update(pr_ref, |review| {
+        review.review_findings.clear();
+    });
 
     if let Ok(raw_diff) = diff_result {
         state.reviews.update(pr_ref, |review| {

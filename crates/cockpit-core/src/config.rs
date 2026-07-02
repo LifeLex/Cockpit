@@ -71,6 +71,9 @@ pub struct AgentPrompts {
     /// Override for [`AgentMode::Restack`].
     #[serde(default)]
     pub restack: Option<String>,
+    /// Override for [`AgentMode::Review`].
+    #[serde(default)]
+    pub review: Option<String>,
 }
 
 impl AgentPrompts {
@@ -85,6 +88,7 @@ impl AgentPrompts {
             AgentMode::Plan => self.plan.as_deref(),
             AgentMode::Fix => self.fix.as_deref(),
             AgentMode::Restack => self.restack.as_deref(),
+            AgentMode::Review => self.review.as_deref(),
         };
         value.filter(|s| !s.trim().is_empty())
     }
@@ -100,6 +104,7 @@ impl AgentPrompts {
             AgentMode::Plan => self.plan = value,
             AgentMode::Fix => self.fix = value,
             AgentMode::Restack => self.restack = value,
+            AgentMode::Review => self.review = value,
         }
     }
 }
@@ -306,6 +311,13 @@ pub struct Config {
     /// Controls whether the bridge runs and which binaries back each language.
     #[serde(default)]
     pub lsp_servers: LspServers,
+
+    // ----- Notifications -----
+    /// Seconds between background board polls for review-request changes.
+    ///
+    /// `None` or `0` disables background board polling. The UI default is 90.
+    #[serde(default)]
+    pub notify_poll_secs: Option<u16>,
 }
 
 /// Default agent command value for serde deserialization.
@@ -338,6 +350,7 @@ impl Default for Config {
             agent_prompts: AgentPrompts::default(),
             skills_github: None,
             lsp_servers: LspServers::default(),
+            notify_poll_secs: None,
         }
     }
 }
@@ -437,17 +450,50 @@ pub fn plans_dir() -> Result<PathBuf, Error> {
 /// project id with filesystem-hostile characters replaced by `-` so an
 /// arbitrary Linear project id or ad-hoc name yields a safe single filename.
 pub fn plan_file_path(project_id: &str) -> Result<PathBuf, Error> {
-    let slug: String = project_id
+    let slug = path_slug(project_id, "plan");
+    Ok(plans_dir()?.join(format!("{slug}.md")))
+}
+
+/// Return the directory that holds advisory reviewer findings files
+/// (`<cockpit_home>/findings`).
+///
+/// Findings are the JSON arrays written by the read-only pre-pass reviewer
+/// ([`crate::model::AgentMode::Review`]); each PR's findings are one file under
+/// this directory, parsed back with [`crate::findings::parse_findings`]. Like
+/// [`plans_dir`], this only resolves the path — it does not create the
+/// directory.
+pub fn findings_dir() -> Result<PathBuf, Error> {
+    Ok(cockpit_home()?.join("findings"))
+}
+
+/// Return the path to the findings JSON file for the PR identified by `pr`.
+///
+/// The convention is `<cockpit_home>/findings/<slug>.json`, where `<slug>` is
+/// `pr` with filesystem-hostile characters replaced by `-` (the same
+/// sanitization [`plan_file_path`] applies), so an arbitrary PR reference such
+/// as `owner/repo#42` yields a safe single filename. Like [`plan_file_path`],
+/// this only resolves the path and does not create the directory.
+pub fn findings_file_path(pr: &str) -> Result<PathBuf, Error> {
+    let slug = path_slug(pr, "findings");
+    Ok(findings_dir()?.join(format!("{slug}.json")))
+}
+
+/// Turn an arbitrary id into a single filesystem-safe filename stem.
+///
+/// Every non-alphanumeric character becomes `-`. An id that reduces to only
+/// separators (or is empty) falls back to `fallback`, so we never emit an empty
+/// or dotfile-only name. Shared by [`plan_file_path`] and [`findings_file_path`]
+/// so both use identical sanitization.
+fn path_slug(id: &str, fallback: &str) -> String {
+    let slug: String = id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    // Guard against an all-separator or empty id producing a dotfile-only name.
-    let slug = if slug.trim_matches('-').is_empty() {
-        "plan".to_owned()
+    if slug.trim_matches('-').is_empty() {
+        fallback.to_owned()
     } else {
         slug
-    };
-    Ok(plans_dir()?.join(format!("{slug}.md")))
+    }
 }
 
 /// Return the path to `<cockpit_home>/config.toml`.
@@ -475,6 +521,7 @@ mod tests {
         assert!(config.ide_command.is_none());
         assert!(config.app_theme.is_none());
         assert!(config.editor_theme.is_none());
+        assert!(config.notify_poll_secs.is_none());
     }
 
     #[test]
@@ -494,6 +541,7 @@ mod tests {
                 plan: None,
                 fix: Some("custom fix".into()),
                 restack: None,
+                review: Some("custom review".into()),
             },
             skills_github: Some(SkillsGithub {
                 owner: "acme".into(),
@@ -507,6 +555,7 @@ mod tests {
                 pyright_command: Some("pyright-langserver".into()),
                 typescript_command: None,
             },
+            notify_poll_secs: Some(90),
         };
 
         let serialized = toml::to_string_pretty(&config).expect("serialize should succeed");
@@ -531,8 +580,13 @@ mod tests {
             deserialized.agent_prompts.restack,
             config.agent_prompts.restack
         );
+        assert_eq!(
+            deserialized.agent_prompts.review,
+            config.agent_prompts.review
+        );
         assert_eq!(deserialized.skills_github, config.skills_github);
         assert_eq!(deserialized.lsp_servers, config.lsp_servers);
+        assert_eq!(deserialized.notify_poll_secs, config.notify_poll_secs);
     }
 
     #[test]
@@ -563,6 +617,7 @@ mod tests {
             agent_prompts: AgentPrompts::default(),
             skills_github: None,
             lsp_servers: LspServers::default(),
+            notify_poll_secs: None,
         };
 
         // Save to a specific path (test helper).
@@ -629,8 +684,11 @@ hook_port = 19876
                 .is_none()
         );
         assert!(config.agent_prompts.for_mode(AgentMode::Restack).is_none());
+        assert!(config.agent_prompts.for_mode(AgentMode::Review).is_none());
         // skills_github must default to None when absent (migration).
         assert!(config.skills_github.is_none());
+        // notify_poll_secs must default to None when absent (migration).
+        assert!(config.notify_poll_secs.is_none());
     }
 
     #[test]
@@ -695,11 +753,13 @@ path = "skills"
             plan: None,
             fix: Some("fix it".into()),
             restack: None,
+            review: Some("review it".into()),
         };
         assert_eq!(prompts.for_mode(AgentMode::Implement), Some("build it"));
         assert_eq!(prompts.for_mode(AgentMode::Fix), Some("fix it"));
         assert_eq!(prompts.for_mode(AgentMode::Plan), None);
         assert_eq!(prompts.for_mode(AgentMode::Restack), None);
+        assert_eq!(prompts.for_mode(AgentMode::Review), Some("review it"));
     }
 
     #[test]
@@ -709,6 +769,7 @@ path = "skills"
             plan: Some(String::new()),
             fix: None,
             restack: None,
+            review: None,
         };
         // Whitespace-only and empty overrides fall back to builtin (None).
         assert_eq!(prompts.for_mode(AgentMode::Implement), None);
@@ -758,6 +819,40 @@ path = "skills"
         temp_env::with_var("COCKPIT_HOME", Some("/tmp/cockpit-home-test"), || {
             let path = plan_file_path("///").expect("should resolve");
             assert_eq!(path, PathBuf::from("/tmp/cockpit-home-test/plans/plan.md"));
+        });
+    }
+
+    #[test]
+    fn findings_file_path_uses_findings_dir_and_slug() {
+        temp_env::with_var("COCKPIT_HOME", Some("/tmp/cockpit-home-test"), || {
+            let path = findings_file_path("PR-1").expect("should resolve");
+            assert_eq!(
+                path,
+                PathBuf::from("/tmp/cockpit-home-test/findings/PR-1.json")
+            );
+        });
+    }
+
+    #[test]
+    fn findings_file_path_sanitizes_hostile_ids() {
+        temp_env::with_var("COCKPIT_HOME", Some("/tmp/cockpit-home-test"), || {
+            // A `owner/repo#42` PR ref must collapse to one safe filename.
+            let path = findings_file_path("owner/repo#42").expect("should resolve");
+            assert_eq!(
+                path,
+                PathBuf::from("/tmp/cockpit-home-test/findings/owner-repo-42.json")
+            );
+        });
+    }
+
+    #[test]
+    fn findings_file_path_falls_back_for_empty_slug() {
+        temp_env::with_var("COCKPIT_HOME", Some("/tmp/cockpit-home-test"), || {
+            let path = findings_file_path("###").expect("should resolve");
+            assert_eq!(
+                path,
+                PathBuf::from("/tmp/cockpit-home-test/findings/findings.json")
+            );
         });
     }
 
@@ -888,6 +983,7 @@ hook_port = 19876
             plan: Some("plan preamble".into()),
             fix: None,
             restack: Some("restack preamble".into()),
+            review: Some("review preamble".into()),
         };
         let serialized = toml::to_string_pretty(&prompts).expect("serialize");
         let deserialized: AgentPrompts = toml::from_str(&serialized).expect("deserialize");
@@ -895,5 +991,6 @@ hook_port = 19876
         assert_eq!(deserialized.plan, prompts.plan);
         assert_eq!(deserialized.fix, prompts.fix);
         assert_eq!(deserialized.restack, prompts.restack);
+        assert_eq!(deserialized.review, prompts.review);
     }
 }

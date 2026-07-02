@@ -48,6 +48,8 @@ export function makeReview(overrides: Partial<Review> = {}): Review {
     agent: null,
     repo_slug: "o/r",
     project: null,
+    review_findings: [],
+    conversation: [],
   };
   return { ...base, ...overrides };
 }

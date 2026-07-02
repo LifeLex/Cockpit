@@ -112,6 +112,11 @@ function completionNotification(
         title: "Plan Rework Complete",
         body: "Plan agent finished reworking",
       };
+    case "Review":
+      return {
+        title: "Pre-review Complete",
+        body: `Pre-review finished on ${branch}`,
+      };
     default:
       return assertNever(mode);
   }
@@ -119,7 +124,12 @@ function completionNotification(
 
 /** Whether a mode's completion is keyed by a review's PR ref (not a project). */
 function isReviewMode(mode: AgentMode): boolean {
-  return mode === "Fix" || mode === "Restack" || mode === "Implement";
+  return (
+    mode === "Fix" ||
+    mode === "Restack" ||
+    mode === "Implement" ||
+    mode === "Review"
+  );
 }
 
 /**

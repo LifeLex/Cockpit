@@ -112,6 +112,9 @@ pub enum AgentMode {
     Fix,
     /// Rebase / resolve conflicts after a parent branch changed.
     Restack,
+    /// Read-only advisory pre-pass reviewer: annotates the diff with findings
+    /// and never advances the gate.
+    Review,
 }
 
 /// Where a comment originated.
@@ -165,6 +168,30 @@ pub enum DiffSide {
     /// The new (post-change) side of the diff.
     #[default]
     New,
+}
+
+/// Severity of a [`ReviewFinding`] produced by the advisory pre-pass reviewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub enum FindingSeverity {
+    /// Informational note; no action required.
+    Info,
+    /// Worth a look, but not blocking.
+    Warning,
+    /// A serious issue the reviewer should address.
+    Critical,
+}
+
+/// The kind of GitHub conversation item mirrored into a review for context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub enum ConversationKind {
+    /// A PR review submission (approve / request-changes / comment).
+    Review,
+    /// An inline review comment anchored to a diff line.
+    ReviewComment,
+    /// A top-level issue-style comment on the PR.
+    IssueComment,
 }
 
 /// A location inside the current artifact that a [`Comment`] points to.
@@ -345,6 +372,98 @@ pub struct Project {
     pub plan: Option<ProjectPlan>,
 }
 
+/// Rollup of a set of [`CiCheck`]s into pass/fail/pending counts.
+///
+/// Drives the diff-gate CI badge. Neutral and skipped checks count as passing:
+/// they do not indicate a failure and should not block or alarm the reviewer.
+//
+// Lives here (not in the github adapter) as a pure domain rollup; the adapter's
+// `summarize()` returns this type and `CiCheck` re-exports from `crate::model`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct CiSummary {
+    /// Checks that passed (includes neutral/skipped/cancelled).
+    pub passed: u32,
+    /// Total number of checks.
+    pub total: u32,
+    /// Checks that failed.
+    pub failed: u32,
+    /// Checks still pending (queued or in progress).
+    pub pending: u32,
+}
+
+/// A single advisory finding from the read-only pre-pass reviewer
+/// ([`AgentMode::Review`]).
+///
+/// Findings annotate the diff for the human reviewer; they never advance the
+/// gate and are deliberately not [`Comment`]s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct ReviewFinding {
+    /// Stable identifier for this finding within a review cycle.
+    pub id: String,
+    /// How serious the finding is.
+    pub severity: FindingSeverity,
+    /// Path relative to the repo root the finding refers to.
+    pub path: PathBuf,
+    /// Inclusive start and end line the finding covers.
+    pub range: (u32, u32),
+    /// Which side of the diff the range refers to.
+    pub side: DiffSide,
+    /// Short one-line summary of the finding.
+    pub title: String,
+    /// Longer explanation of why this is a finding.
+    pub rationale: String,
+}
+
+/// The full text of a single file on both sides of a review's diff.
+///
+/// Feeds the diff gate's optional full-file view (Monaco). `full` is `true` only
+/// when the pair was resolved: a side that is legitimately absent (an added or
+/// deleted file) is an empty string but still counts as resolved. `full` is
+/// `false` when the content could not be determined on either side, signalling
+/// the frontend to fall back to the diff fragments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct FilePair {
+    /// File text at the base revision (empty when absent on that side).
+    pub original: String,
+    /// File text at the head revision (empty when absent on that side).
+    pub modified: String,
+    /// Whether the pair resolved (so the full-file view can be shown).
+    pub full: bool,
+}
+
+/// A read-only GitHub conversation item shown alongside a review for context.
+///
+/// This is deliberately **not** a [`Comment`]: it is external context pulled
+/// from GitHub, never cleared by the gate on `Reworked`. That §0.4 distinction
+/// keeps cockpit's own comments ephemeral while GitHub threads persist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct ConversationItem {
+    /// GitHub identifier for this item.
+    pub id: String,
+    /// Which kind of conversation item this is.
+    pub kind: ConversationKind,
+    /// Login of the author.
+    pub author: String,
+    /// The item's body text.
+    pub body: String,
+    /// Path the item is anchored to, for inline review comments.
+    pub path: Option<PathBuf>,
+    /// Line the item is anchored to, for inline review comments.
+    pub line: Option<u32>,
+    /// Which side of the diff the item is anchored to, when inline.
+    pub side: Option<DiffSide>,
+    /// Review state (e.g. `"APPROVED"`), for review submissions.
+    pub state: Option<String>,
+    /// ISO-8601 creation timestamp as reported by GitHub.
+    pub created_at: String,
+    /// Permalink to the item on GitHub.
+    pub url: Option<String>,
+}
+
 /// A single PR under review at the diff gate.
 ///
 /// Reviews form a DAG via `parents` / `children`, mirroring the Linear issue
@@ -407,6 +526,27 @@ pub struct Review {
     #[serde(default)]
     #[ts(optional)]
     pub dispatch_snapshot: Option<DispatchSnapshot>,
+    /// Rolled-up CI status for this review's PR, when fetched. `None` until a
+    /// CI check read populates it, and for legacy data that predates the field.
+    #[serde(default)]
+    #[ts(optional)]
+    pub ci_summary: Option<CiSummary>,
+    /// Advisory findings from the read-only pre-pass reviewer, if it has run.
+    ///
+    /// Empty by default; never advances the gate (see [`ReviewFinding`]).
+    #[serde(default)]
+    pub review_findings: Vec<ReviewFinding>,
+    /// Read-only GitHub conversation context mirrored for this review.
+    ///
+    /// Empty by default; not [`Comment`]s and never cleared by the gate.
+    #[serde(default)]
+    pub conversation: Vec<ConversationItem>,
+    /// The SHA the advisory pre-pass reviewer last reviewed, for staleness.
+    ///
+    /// `None` before the first pre-pass and for legacy data.
+    #[serde(default)]
+    #[ts(optional)]
+    pub last_reviewed_sha: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +581,10 @@ mod tests {
             repo_slug: None,
             project: None,
             dispatch_snapshot: None,
+            ci_summary: None,
+            review_findings: vec![],
+            conversation: vec![],
+            last_reviewed_sha: None,
         }
     }
 
@@ -587,6 +731,39 @@ mod tests {
         assert_eq!(review.title, "");
         assert_eq!(review.body, "");
         assert_eq!(review.dispatch_snapshot, None);
+    }
+
+    #[test]
+    fn review_deserializes_without_new_context_fields() {
+        // A Review payload predating `ci_summary`, `review_findings`,
+        // `conversation`, and `last_reviewed_sha` must load with those fields
+        // defaulted rather than erroring (`#[serde(default)]`).
+        let json = r#"{
+            "id": "r-1",
+            "issue": "ISSUE-1",
+            "pr": "owner/repo#1",
+            "branch": "alejandro/legacy",
+            "base": "main",
+            "base_sha": "000",
+            "source": "Frontier",
+            "worktree": "/tmp/wt",
+            "gate_state": "Pending",
+            "diff": { "raw": "" },
+            "head_sha": "abc",
+            "comments": [],
+            "parents": [],
+            "children": [],
+            "stale": false,
+            "agent": null,
+            "repo_slug": null,
+            "project": null
+        }"#;
+
+        let review: Review = serde_json::from_str(json).expect("legacy Review should deserialize");
+        assert_eq!(review.ci_summary, None);
+        assert!(review.review_findings.is_empty());
+        assert!(review.conversation.is_empty());
+        assert_eq!(review.last_reviewed_sha, None);
     }
 
     #[test]

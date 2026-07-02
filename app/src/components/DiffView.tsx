@@ -31,14 +31,20 @@ import type { MirrorResult } from "../bindings/MirrorResult";
 import type { Anchor } from "../bindings/Anchor";
 import type { DiffSide } from "../bindings/DiffSide";
 import type { CiSummary } from "../bindings/CiSummary";
+import type { CiCheck } from "../bindings/CiCheck";
 import { summarizeChecks, ciState, parseCiUpdate } from "@/lib/ci";
 import type { ReviewEvent } from "../bindings/ReviewEvent";
 import type { SubmitReviewResult } from "../bindings/SubmitReviewResult";
+import type { EvidenceSummary } from "../bindings/EvidenceSummary";
+import type { FilePair } from "../bindings/FilePair";
+import type { ReviewFinding } from "../bindings/ReviewFinding";
+import type { FindingSeverity } from "../bindings/FindingSeverity";
 import {
   parseDiff,
   extractFilePaths,
   fragmentToReal,
   realToFragment,
+  identityLineMap,
 } from "../diff-parser";
 import type { FileDiff } from "../diff-parser";
 import { elapsedSince } from "@/lib/relative-time";
@@ -50,6 +56,7 @@ import { Badge } from "@/components/ui/badge";
 import { GatePill } from "./GatePill";
 import { IntentPanel } from "./IntentPanel";
 import { AddressedRequests } from "./AddressedRequests";
+import { EvidenceStrip } from "./EvidenceStrip";
 import { SubmitReviewControl } from "./SubmitReviewControl";
 import { cn } from "@/lib/utils";
 import { invoke } from "@tauri-apps/api/core";
@@ -63,6 +70,7 @@ import {
   Send,
   AlertTriangle,
   Bot,
+  BotMessageSquare,
   Hash,
   GitBranch,
   CheckCircle2,
@@ -72,6 +80,7 @@ import {
   Layers,
   Check,
   GitMerge,
+  X,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -472,6 +481,128 @@ function InlineCommentThread({
 }
 
 // ---------------------------------------------------------------------------
+// FindingPin -- advisory review findings, rendered in Monaco view zones
+// ---------------------------------------------------------------------------
+
+/** Presentation for a finding severity: dot / border / text color + label. */
+interface SeverityMeta {
+  readonly label: string;
+  readonly dot: string;
+  readonly border: string;
+  readonly text: string;
+  /** The Monaco glyph-margin class that draws the dashed severity rail. */
+  readonly glyph: string;
+}
+
+function severityMeta(severity: FindingSeverity): SeverityMeta {
+  switch (severity) {
+    case "Info":
+      return {
+        label: "Info",
+        dot: "bg-muted-foreground",
+        border: "border-muted-foreground/50",
+        text: "text-muted-foreground",
+        glyph: "finding-line-info",
+      };
+    case "Warning":
+      return {
+        label: "Warning",
+        dot: "bg-warning",
+        border: "border-warning/60",
+        text: "text-warning",
+        glyph: "finding-line-warning",
+      };
+    case "Critical":
+      return {
+        label: "Critical",
+        dot: "bg-danger",
+        border: "border-danger/60",
+        text: "text-danger",
+        glyph: "finding-line-critical",
+      };
+    default:
+      return assertNever(severity);
+  }
+}
+
+/**
+ * An advisory finding from the read-only pre-pass reviewer, rendered inline as a
+ * Monaco view zone. Deliberately distinct from a human [`InlineCommentThread`]:
+ * a dashed severity-colored border plus a severity label, and a dismiss control.
+ * Findings never count toward the Request Changes requirement.
+ */
+function FindingPin({
+  finding,
+  onDismiss,
+}: {
+  readonly finding: ReviewFinding;
+  readonly onDismiss: () => void;
+}) {
+  const meta = severityMeta(finding.severity);
+  return (
+    <div
+      className={cn(
+        "mx-1 my-0.5 overflow-hidden rounded-md border border-dashed bg-card/80 px-3 py-2 text-xs shadow-sm",
+        meta.border,
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="inline-flex items-center gap-1.5">
+          <span
+            className={cn("h-2 w-2 shrink-0 rounded-full", meta.dot)}
+            aria-hidden="true"
+          />
+          <span
+            className={cn(
+              "font-semibold uppercase tracking-wide",
+              meta.text,
+            )}
+          >
+            {meta.label}
+          </span>
+          <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+            · advisory finding
+          </span>
+        </span>
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss finding"
+          title="Dismiss finding"
+          className="shrink-0 cursor-pointer rounded border-none bg-transparent p-0.5 text-muted-foreground hover:text-foreground"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+      <div className="mt-1 font-medium text-foreground">{finding.title}</div>
+      <div className="mt-0.5 whitespace-pre-wrap leading-relaxed text-muted-foreground">
+        {finding.rationale}
+      </div>
+    </div>
+  );
+}
+
+/** A portal entry for a finding zone (mirrors {@link PortalEntry} for comments). */
+interface FindingPortalEntry {
+  readonly key: string;
+  readonly domNode: HTMLDivElement;
+  readonly finding: ReviewFinding;
+}
+
+/**
+ * Estimate a finding zone's pixel height from its rationale, so the view zone
+ * reserves enough room. A rough character-per-line wrap is good enough; Monaco
+ * clips gracefully if the estimate is short.
+ */
+function findingZoneHeight(finding: ReviewFinding): number {
+  const perLine = 88;
+  const rationaleLines = finding.rationale
+    .split("\n")
+    .reduce((n, l) => n + Math.max(1, Math.ceil(l.length / perLine)), 0);
+  return 52 + rationaleLines * 18;
+}
+
+// ---------------------------------------------------------------------------
 // DiffView
 // ---------------------------------------------------------------------------
 
@@ -497,6 +628,12 @@ export function DiffView({
   const submitGithubReview = useAppStore((s) => s.submitGithubReview);
   const fetchInterdiff = useAppStore((s) => s.fetchInterdiff);
 
+  // -- Phase B store actions (evidence / pre-review / full-file) --
+  const fetchEvidence = useAppStore((s) => s.fetchEvidence);
+  const preReview = useAppStore((s) => s.preReview);
+  const fetchFilePair = useAppStore((s) => s.fetchFilePair);
+  const listCiChecks = useAppStore((s) => s.listCiChecks);
+
   // -- D10: interdiff (changes since the last review dispatch) --
   // Only a reworked review with a dispatch snapshot has a meaningful interdiff.
   const hasInterdiff =
@@ -504,10 +641,35 @@ export function DiffView({
   const [interdiff, setInterdiff] = useState<DiffData | null>(null);
   const [diffSource, setDiffSource] = useState<"interdiff" | "full">("full");
 
+  // Whether the interdiff is the active view (it exempts the full-file toggle).
+  const interdiffActive = diffSource === "interdiff" && interdiff !== null;
+
   // The raw diff currently shown: the interdiff when selected and available,
   // otherwise the full review diff.
-  const activeDiffRaw =
-    diffSource === "interdiff" && interdiff !== null ? interdiff.raw : diff.raw;
+  const activeDiffRaw = interdiffActive ? interdiff.raw : diff.raw;
+
+  // -- B1/B3: review-time evidence bundle (refetched on head change) --
+  const [evidence, setEvidence] = useState<EvidenceSummary | null>(null);
+  // Raw CI checks (for the evidence strip's failing-job name), kept alongside
+  // the summarized badge; populated from the initial fetch and `ci-updated`.
+  const [ciChecks, setCiChecks] = useState<readonly CiCheck[]>([]);
+
+  // -- B2: advisory pre-pass reviewer + component-local finding dismissals --
+  const [preReviewing, setPreReviewing] = useState(false);
+  const [dismissedFindings, setDismissedFindings] = useState<
+    ReadonlySet<string>
+  >(new Set());
+  const [findingPortals, setFindingPortals] = useState<
+    readonly FindingPortalEntry[]
+  >([]);
+
+  // -- B4: Hunks vs Full-file view + the resolved full-file pair --
+  const [viewMode, setViewMode] = useState<"hunks" | "full">("hunks");
+  const [fullPair, setFullPair] = useState<FilePair | null>(null);
+
+  // Bumped on each jump-to-line request so the apply effect re-runs even when
+  // the target file is already selected.
+  const [jumpNonce, setJumpNonce] = useState(0);
 
   // -- Diff parsing --
   const fileDiffs = useMemo(() => parseDiff(activeDiffRaw), [activeDiffRaw]);
@@ -574,6 +736,9 @@ export function DiffView({
   const zoneIdsRef = useRef<string[]>([]);
   const originalZoneIdsRef = useRef<string[]>([]);
   const domNodeCacheRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const findingZoneIdsRef = useRef<string[]>([]);
+  const originalFindingZoneIdsRef = useRef<string[]>([]);
+  const findingNodeCacheRef = useRef<Map<string, HTMLDivElement>>(new Map());
   const glyphDecorRef =
     useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
   const commentDecorRef =
@@ -582,7 +747,18 @@ export function DiffView({
     useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
   const originalCommentDecorRef =
     useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
+  const findingDecorRef =
+    useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
+  const originalFindingDecorRef =
+    useRef<MonacoEditorNs.IEditorDecorationsCollection | null>(null);
   const lspAttachmentRef = useRef<LspAttachment | null>(null);
+  // Pending jump-to-line request (from evidence-strip weakening chips), applied
+  // once the target file's editor + line map are ready.
+  const pendingJumpRef = useRef<{
+    readonly path: string;
+    readonly side: DiffSide;
+    readonly line: number;
+  } | null>(null);
 
   // -- Derived --
   const currentFileDiff = useMemo(
@@ -590,17 +766,49 @@ export function DiffView({
     [fileDiffs, selectedFile],
   );
 
-  // Keep the current file diff reachable from the (mount-time) Monaco mouse
+  // -- B4: full-file view is active only when the pair resolved and the
+  // interdiff is not showing (the interdiff is exempt from full-file). --
+  const fullFileActive =
+    viewMode === "full" &&
+    !interdiffActive &&
+    fullPair !== null &&
+    fullPair.full;
+
+  // The file diff the editor + zones actually consume. In full-file mode this is
+  // the complete file text with an identity line map, so the comment/zone code
+  // path (fragmentToReal / realToFragment) works unchanged on real lines.
+  const effectiveFileDiff = useMemo<FileDiff>(() => {
+    if (fullFileActive && fullPair !== null) {
+      return {
+        path: selectedFile,
+        original: fullPair.original,
+        modified: fullPair.modified,
+        lineMap: identityLineMap(fullPair.original, fullPair.modified),
+      };
+    }
+    return currentFileDiff;
+  }, [fullFileActive, fullPair, selectedFile, currentFileDiff]);
+
+  // Keep the effective file diff reachable from the (mount-time) Monaco mouse
   // handlers, which capture nothing else from render scope. Used to map a
   // clicked fragment line to its real file line for the comment anchor (D1).
-  const currentFileDiffRef = useRef(currentFileDiff);
+  const currentFileDiffRef = useRef(effectiveFileDiff);
   useEffect(() => {
-    currentFileDiffRef.current = currentFileDiff;
-  }, [currentFileDiff]);
+    currentFileDiffRef.current = effectiveFileDiff;
+  }, [effectiveFileDiff]);
 
   const commentsForFile = useMemo(
     () => fileComments(review.comments, selectedFile),
     [review.comments, selectedFile],
+  );
+
+  // -- B2: advisory findings for the current file, minus dismissed ones. --
+  const findingsForFile = useMemo(
+    () =>
+      review.review_findings.filter(
+        (f) => f.path === selectedFile && !dismissedFindings.has(f.id),
+      ),
+    [review.review_findings, selectedFile, dismissedFindings],
   );
 
   const hasLocalComments = useMemo(
@@ -731,6 +939,7 @@ export function DiffView({
 
       glyphDecorRef.current = modified.createDecorationsCollection([]);
       commentDecorRef.current = modified.createDecorationsCollection([]);
+      findingDecorRef.current = modified.createDecorationsCollection([]);
 
       // Hover: show "+" glyph on the hovered line
       modified.onMouseMove((e) => {
@@ -790,6 +999,8 @@ export function DiffView({
 
       originalGlyphDecorRef.current = original.createDecorationsCollection([]);
       originalCommentDecorRef.current = original.createDecorationsCollection([]);
+      originalFindingDecorRef.current =
+        original.createDecorationsCollection([]);
 
       original.onMouseMove((e) => {
         if (originalGlyphDecorRef.current == null) return;
@@ -876,7 +1087,7 @@ export function DiffView({
         if (anchorSide(c.anchor) !== side) continue;
         const range = anchorRange(c.anchor);
         if (range === null) continue;
-        const fragLine = realToFragment(currentFileDiff, side, range[1]);
+        const fragLine = realToFragment(effectiveFileDiff, side, range[1]);
         if (fragLine === undefined) continue;
         const arr = commentsByLine.get(fragLine) ?? [];
         arr.push(c);
@@ -933,7 +1144,8 @@ export function DiffView({
           });
 
           // Display + anchor use the real file line; placement used the fragment.
-          const realLine = fragmentToReal(currentFileDiff, side, line) ?? line;
+          const realLine =
+            fragmentToReal(effectiveFileDiff, side, line) ?? line;
           zoneIds.current.push(zoneId);
           portals.push({
             key,
@@ -996,11 +1208,117 @@ export function DiffView({
   }, [
     editorReady,
     commentsForFile,
-    currentFileDiff,
+    effectiveFileDiff,
     effectiveActiveComment,
     selectedFile,
     diffMode,
   ]);
+
+  // -- B2: sync advisory finding pins as their OWN view zones + a dashed
+  // severity rail, kept entirely separate from the comment machinery. Finding
+  // zones use dedicated zone-id arrays, DOM-node cache, and decoration
+  // collections keyed by finding id, so they never collide with a human comment
+  // on the same line — a finding and a comment on one line simply stack. --
+  useEffect(() => {
+    if (
+      !editorReady ||
+      diffEditorRef.current == null ||
+      monacoRef.current == null
+    ) {
+      return;
+    }
+    const monaco = monacoRef.current;
+
+    const syncSide = (
+      ed: MonacoEditorNs.IStandaloneCodeEditor,
+      side: DiffSide,
+      zoneIds: { current: string[] },
+      decor: MonacoEditorNs.IEditorDecorationsCollection | null,
+    ): {
+      readonly portals: FindingPortalEntry[];
+      readonly usedKeys: Set<string>;
+    } => {
+      const portals: FindingPortalEntry[] = [];
+      const usedKeys = new Set<string>();
+      const decorations: MonacoEditorNs.IModelDeltaDecoration[] = [];
+
+      ed.changeViewZones((accessor) => {
+        for (const id of zoneIds.current) {
+          accessor.removeZone(id);
+        }
+        zoneIds.current = [];
+
+        for (const finding of findingsForFile) {
+          if (finding.side !== side) continue;
+          const fragLine = realToFragment(
+            effectiveFileDiff,
+            side,
+            finding.range[1],
+          );
+          if (fragLine === undefined) continue;
+
+          const key = `finding-${finding.id}`;
+          usedKeys.add(key);
+          let domNode = findingNodeCacheRef.current.get(key);
+          if (domNode == null) {
+            domNode = document.createElement("div");
+            domNode.style.zIndex = "10";
+            findingNodeCacheRef.current.set(key, domNode);
+          }
+
+          const zoneId = accessor.addZone({
+            afterLineNumber: fragLine,
+            heightInPx: findingZoneHeight(finding),
+            domNode,
+            suppressMouseDown: false,
+          });
+          zoneIds.current.push(zoneId);
+          portals.push({ key, domNode, finding });
+
+          decorations.push({
+            range: new monaco.Range(fragLine, 1, fragLine, 1),
+            options: {
+              isWholeLine: true,
+              glyphMarginClassName: severityMeta(finding.severity).glyph,
+            },
+          });
+        }
+      });
+
+      decor?.set(decorations);
+      return { portals, usedKeys };
+    };
+
+    const modified = diffEditorRef.current.getModifiedEditor();
+    const original = diffEditorRef.current.getOriginalEditor();
+    modified.updateOptions({ glyphMargin: true });
+    original.updateOptions({ glyphMargin: true });
+
+    const newResult = syncSide(
+      modified,
+      "New",
+      findingZoneIdsRef,
+      findingDecorRef.current,
+    );
+    const oldResult = syncSide(
+      original,
+      "Old",
+      originalFindingZoneIdsRef,
+      originalFindingDecorRef.current,
+    );
+
+    const usedKeys = new Set<string>([
+      ...newResult.usedKeys,
+      ...oldResult.usedKeys,
+    ]);
+    for (const cachedKey of findingNodeCacheRef.current.keys()) {
+      if (!usedKeys.has(cachedKey)) {
+        findingNodeCacheRef.current.delete(cachedKey);
+      }
+    }
+
+    setFindingPortals([...newResult.portals, ...oldResult.portals]);
+  }, [editorReady, findingsForFile, effectiveFileDiff, diffMode]);
 
   // -- LSP: attach a language client to the modified (right-hand) model --
   // Runs once the editor is ready and whenever the selected file (and thus its
@@ -1104,11 +1422,17 @@ export function DiffView({
         console.error("fetch_ci_checks failed", e);
       });
 
+    // Raw checks (for the evidence strip's failing-job name). Best-effort.
+    void listCiChecks(prRef).then((checks) => {
+      if (!cancelled) setCiChecks(checks);
+    });
+
     // Live updates: the backend pushes the full checks list via `ci-updated`.
     const unlisten = listen<unknown>("ci-updated", (event) => {
       const update = parseCiUpdate(event.payload);
       if (update === null || update.pr !== prRef) return;
       setCiSummary(summarizeChecks(update.checks));
+      setCiChecks(update.checks);
     });
 
     return () => {
@@ -1117,7 +1441,71 @@ export function DiffView({
         f();
       });
     };
-  }, [prRef]);
+  }, [prRef, listCiChecks]);
+
+  // -- B1/B3: fetch the evidence bundle on entry and on each head change. --
+  const reviewHead = review.head_sha;
+  useEffect(() => {
+    let cancelled = false;
+    void fetchEvidence(reviewPr).then((ev) => {
+      if (!cancelled) setEvidence(ev);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reviewPr, reviewHead, fetchEvidence]);
+
+  // -- B4: resolve the full-file pair when Full-file mode is active. The pair is
+  // reset on file/mode switch so stale content never flashes; the store memoizes
+  // by `pr:path:head` so re-entry (and a return to the same file) is cheap. --
+  useEffect(() => {
+    if (viewMode !== "full" || interdiffActive || selectedFile === "") {
+      setFullPair(null);
+      return;
+    }
+    let cancelled = false;
+    setFullPair(null);
+    void fetchFilePair(reviewPr, selectedFile).then((pair) => {
+      if (!cancelled) setFullPair(pair);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    viewMode,
+    interdiffActive,
+    selectedFile,
+    reviewPr,
+    reviewHead,
+    fetchFilePair,
+  ]);
+
+  // -- B3: apply a pending jump-to-line once the target file's editor + line
+  // map are ready (from evidence-strip weakening chips). --
+  useEffect(() => {
+    const jump = pendingJumpRef.current;
+    if (jump === null) return;
+    if (jump.path !== selectedFile) return;
+    if (!editorReady || diffEditorRef.current === null) return;
+    const frag = realToFragment(effectiveFileDiff, jump.side, jump.line);
+    pendingJumpRef.current = null;
+    if (frag === undefined) return;
+    const ed =
+      jump.side === "New"
+        ? diffEditorRef.current.getModifiedEditor()
+        : diffEditorRef.current.getOriginalEditor();
+    ed.revealLineInCenter(frag);
+    ed.setPosition({ lineNumber: frag, column: 1 });
+  }, [selectedFile, effectiveFileDiff, editorReady, jumpNonce]);
+
+  const handleJumpTo = useCallback(
+    (path: string, side: DiffSide, line: number) => {
+      pendingJumpRef.current = { path, side, line };
+      setSelectedFile(path);
+      setJumpNonce((n) => n + 1);
+    },
+    [],
+  );
 
   const ciBadgeState = useMemo(
     () => (ciSummary !== null ? ciState(ciSummary) : "none"),
@@ -1158,6 +1546,18 @@ export function DiffView({
       setApproving(false);
     }
   }, [approveReview, review.pr]);
+
+  // -- B2: run the advisory read-only pre-pass reviewer. Advisory only — never
+  // touches the gate; refuses while another agent is attached (enforced core-
+  // side too). The header's "Agent working" line keys off review.agent. --
+  const handlePreReview = useCallback(async () => {
+    setPreReviewing(true);
+    try {
+      await preReview(review.pr);
+    } finally {
+      setPreReviewing(false);
+    }
+  }, [preReview, review.pr]);
 
   // -- D2: merge is a guarded, confirmed side effect (Invariant 5 / §9). --
   const handleMerge = useCallback(async () => {
@@ -1376,6 +1776,45 @@ export function DiffView({
             </button>
           </div>
 
+          {/* Hunks / Full-file toggle (B4). The interdiff is exempt, so the
+              toggle hides while the interdiff is the active view. */}
+          {!interdiffActive && (
+            <div className="flex overflow-hidden rounded-md border border-border">
+              <button
+                type="button"
+                onClick={() => {
+                  setViewMode("hunks");
+                }}
+                aria-pressed={viewMode === "hunks"}
+                className={cn(
+                  "cursor-pointer border-none px-3 py-1 text-xs font-medium transition-colors",
+                  viewMode === "hunks"
+                    ? "bg-accent text-accent-foreground"
+                    : "bg-transparent text-muted-foreground hover:bg-accent/50",
+                )}
+                title="Show only the changed hunks"
+              >
+                Hunks
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setViewMode("full");
+                }}
+                aria-pressed={viewMode === "full"}
+                className={cn(
+                  "cursor-pointer border-none px-3 py-1 text-xs font-medium transition-colors",
+                  viewMode === "full"
+                    ? "bg-accent text-accent-foreground"
+                    : "bg-transparent text-muted-foreground hover:bg-accent/50",
+                )}
+                title="Show the full file with changes in context"
+              >
+                Full file
+              </button>
+            </div>
+          )}
+
           {/* Diff-source toggle: interdiff vs full diff (D10). */}
           {hasInterdiff && (
             <div className="flex overflow-hidden rounded-md border border-border">
@@ -1476,6 +1915,22 @@ export function DiffView({
               <Bot className="h-3.5 w-3.5" />
               Agent
             </Button>
+
+            {/* Pre-review (B2) — advisory read-only pre-pass; any source while
+                InReview. Disabled while an agent is attached (the header's
+                "Agent working" line reflects the running Review agent). */}
+            {review.gate_state === "InReview" && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handlePreReview()}
+                disabled={preReviewing || review.agent != null}
+                title="Run the advisory read-only pre-pass reviewer"
+              >
+                <BotMessageSquare className="h-3.5 w-3.5" />
+                Pre-review
+              </Button>
+            )}
 
             {/* Restack — explicit user action; only when the review is stale.
                 Operates only on the review's own branch (Invariant 5 / §9). */}
@@ -1611,6 +2066,15 @@ export function DiffView({
           }}
         />
       )}
+
+      {/* ----------------------------------------------------------------- */}
+      {/* Evidence strip — deterministic review signals (B3)                */}
+      {/* ----------------------------------------------------------------- */}
+      <EvidenceStrip
+        evidence={evidence}
+        ciChecks={ciChecks}
+        onJumpTo={handleJumpTo}
+      />
 
       {/* ----------------------------------------------------------------- */}
       {/* Addressed requests — read-only interdiff history (D10)            */}
@@ -1881,10 +2345,20 @@ export function DiffView({
 
         {/* Monaco Diff Editor */}
         <div className="relative min-h-0 flex-1">
+          {/* B4: full-file was requested but could not be resolved — fall back
+              to the changed hunks with a subtle note. */}
+          {viewMode === "full" &&
+            !interdiffActive &&
+            fullPair !== null &&
+            !fullPair.full && (
+              <div className="border-b border-border bg-muted/40 px-4 py-1 text-[10px] text-muted-foreground">
+                Full file unavailable — showing changed hunks
+              </div>
+            )}
           {selectedFile !== "" ? (
             <DiffEditor
-              original={currentFileDiff.original}
-              modified={currentFileDiff.modified}
+              original={effectiveFileDiff.original}
+              modified={effectiveFileDiff.modified}
               language={detectLanguage(selectedFile)}
               theme={editorTheme}
               options={{
@@ -1916,6 +2390,24 @@ export function DiffView({
                 }}
                 onCancel={() => {
                   setActiveComment(null);
+                }}
+              />,
+              entry.domNode,
+              entry.key,
+            ),
+          )}
+
+          {/* Advisory finding pins (B2) — rendered into their own view zones. */}
+          {findingPortals.map((entry) =>
+            createPortal(
+              <FindingPin
+                finding={entry.finding}
+                onDismiss={() => {
+                  setDismissedFindings((prev) => {
+                    const next = new Set(prev);
+                    next.add(entry.finding.id);
+                    return next;
+                  });
                 }}
               />,
               entry.domNode,

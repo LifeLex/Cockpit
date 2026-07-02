@@ -19,7 +19,7 @@ function assertNever(x: never): never {
 }
 
 /** The agent modes, in display order, as an exhaustive literal table. */
-const AGENT_MODES = ["Implement", "Plan", "Fix", "Restack"] as const;
+const AGENT_MODES = ["Implement", "Plan", "Fix", "Restack", "Review"] as const;
 
 /** Human-facing label for an agent mode. */
 function modeLabel(mode: AgentMode): string {
@@ -32,6 +32,8 @@ function modeLabel(mode: AgentMode): string {
       return "Fix";
     case "Restack":
       return "Restack";
+    case "Review":
+      return "Pre-review";
     default:
       return assertNever(mode);
   }
@@ -48,6 +50,8 @@ function modeDescription(mode: AgentMode): string {
       return "Applies your diff-gate comments and pushes the rework.";
     case "Restack":
       return "Rebases a descendant PR after its base branch changed.";
+    case "Review":
+      return "Runs a read-only pre-pass that annotates the diff with advisory findings.";
     default:
       return assertNever(mode);
   }
@@ -60,6 +64,7 @@ function toAgentMode(value: unknown): AgentMode | null {
     case "Plan":
     case "Fix":
     case "Restack":
+    case "Review":
       return value;
     default:
       return null;

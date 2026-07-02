@@ -25,4 +25,8 @@ fix: string | null,
 /**
  * Override for [`AgentMode::Restack`].
  */
-restack: string | null, };
+restack: string | null, 
+/**
+ * Override for [`AgentMode::Review`].
+ */
+review: string | null, };

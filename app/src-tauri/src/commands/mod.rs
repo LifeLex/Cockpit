@@ -15,11 +15,13 @@ use cockpit_core::adapters::agent::SpawnConfig;
 use cockpit_core::adapters::github::{self, MirrorResult, ReviewEvent, SubmitReviewResult};
 use cockpit_core::adapters::linear;
 use cockpit_core::config::Config;
+use cockpit_core::diff_signals::{EvidenceSummary, compute_diff_signals};
 use cockpit_core::gate::Gated;
 use cockpit_core::kickoff::{self, KickoffResult};
 use cockpit_core::model::{
-    AgentMode, Anchor, Artifact, Comment, CommentId, CommentOrigin, DiffData, DiffSide, GateState,
-    PlanDoc, PrRef, Project, ProjectId, ProjectPlan, ProjectRef, Review, ReviewSource,
+    AgentMode, Anchor, Artifact, CiSummary, Comment, CommentId, CommentOrigin, DiffData, DiffSide,
+    FilePair, GateState, PlanDoc, PrRef, Project, ProjectId, ProjectPlan, ProjectRef, Review,
+    ReviewSource,
 };
 use cockpit_core::plan_parser;
 use cockpit_core::restack;
@@ -144,6 +146,171 @@ pub async fn get_interdiff(
     })?;
     let raw = github::compare(&repo_slug, &snapshot.reviewed_sha, &review.head_sha).await?;
     Ok(DiffData { raw })
+}
+
+/// Return the review-time evidence bundle for a PR (B1).
+///
+/// Bundles the deterministic diff signals, the review's CI rollup, and the
+/// commands the agent ran into one [`EvidenceSummary`] so the diff gate can show
+/// what changed, whether CI is green, and what the agent executed without three
+/// separate round-trips.
+///
+/// The diff can be large, so [`compute_diff_signals`] runs on the blocking pool
+/// via [`tokio::task::spawn_blocking`] (only the owned diff string — `Send` —
+/// crosses the boundary). `agent_ran` is empty for now; Phase D fills it from the
+/// agent trajectory.
+#[tauri::command]
+pub async fn get_evidence(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+) -> Result<EvidenceSummary, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    let ci = review.ci_summary;
+    let raw = review.diff.raw;
+    let signals = tokio::task::spawn_blocking(move || compute_diff_signals(&raw))
+        .await
+        .map_err(|e| CommandError {
+            message: format!("diff signal task panicked: {e}"),
+        })?;
+
+    Ok(EvidenceSummary {
+        signals,
+        ci,
+        // Phase D fills this from the agent trajectory; empty for now.
+        agent_ran: vec![],
+    })
+}
+
+/// Return the full text of a single file on both sides of a review's diff (B4).
+///
+/// Feeds the diff gate's optional full-file view. The two revisions are resolved
+/// preferring pinned SHAs (truthful across force-pushes): the base is
+/// `base_sha` when set, else the base branch name; the head is `head_sha` when
+/// set, else `HEAD` for a local read or the head branch name for a GitHub read.
+///
+/// Content is read locally with
+/// [`git::file_at_rev`](cockpit_core::adapters::git::file_at_rev) (off the async
+/// runtime, since `git2` is blocking) when a usable local repo dir exists — a
+/// cockpit-managed worktree present on disk, or the shared checkout for a
+/// same-repo PR (`repo_slug` absent). Otherwise, for an imported PR with a
+/// `repo_slug`, it falls back to
+/// [`github::contents_at`](cockpit_core::adapters::github::contents_at).
+///
+/// See [`combine_file_pair`] for how the two per-side results become the
+/// returned [`FilePair`] and when `full` is `false`.
+#[tauri::command]
+pub async fn get_file_pair(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+    path: String,
+) -> Result<FilePair, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    let config = Config::load()?;
+    let repo_path = config
+        .repo_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Resolve the base revision: a pinned SHA when known, else the base branch.
+    let base_rev = if review.base_sha.is_empty() {
+        review.base.clone()
+    } else {
+        review.base_sha.clone()
+    };
+
+    // A usable local repo dir: a managed worktree present on disk, or — only for
+    // a same-repo PR (`repo_slug` absent) — the shared checkout. A cross-repo PR
+    // (`repo_slug` set) whose worktree still points at `repo_path` is the wrong
+    // repo, so it routes to the GitHub fallback instead.
+    let local_dir: Option<PathBuf> = if is_managed_worktree(&review.worktree, &repo_path) {
+        review.worktree.exists().then(|| review.worktree.clone())
+    } else if review.repo_slug.is_none() && repo_path.exists() {
+        Some(repo_path.clone())
+    } else {
+        None
+    };
+
+    if let Some(dir) = local_dir {
+        // Head revision for a local read: a pinned SHA when known, else `HEAD`
+        // (the worktree branch tip).
+        let head_rev = if review.head_sha.is_empty() {
+            "HEAD".to_string()
+        } else {
+            review.head_sha.clone()
+        };
+        let pair = tokio::task::spawn_blocking(move || {
+            let original = cockpit_core::adapters::git::file_at_rev(&dir, &base_rev, &path);
+            let modified = cockpit_core::adapters::git::file_at_rev(&dir, &head_rev, &path);
+            combine_file_pair(original, modified)
+        })
+        .await
+        .map_err(|e| CommandError {
+            message: format!("file-pair task panicked: {e}"),
+        })?;
+        return Ok(pair);
+    }
+
+    // Imported PR with no usable local dir: read via GitHub contents.
+    if let Some(repo_slug) = review.repo_slug.as_deref() {
+        // Head ref for a GitHub read: a pinned SHA when known, else the head
+        // branch name.
+        let head_ref = if review.head_sha.is_empty() {
+            review.branch.clone()
+        } else {
+            review.head_sha.clone()
+        };
+        let original = github::contents_at(repo_slug, &base_rev, &path).await;
+        let modified = github::contents_at(repo_slug, &head_ref, &path).await;
+        return Ok(combine_file_pair(original, modified));
+    }
+
+    // Neither a local dir nor a repo slug: nothing to read — fall back.
+    Ok(FilePair {
+        original: String::new(),
+        modified: String::new(),
+        full: false,
+    })
+}
+
+/// Combine the two per-side file-content reads into a [`FilePair`].
+///
+/// `Err` on either side means the content could not be determined, so the pair
+/// is reported as not-full (`full: false`) and the frontend falls back to the
+/// diff fragments. `Ok(None)` on a side means the file is legitimately absent
+/// there — an added or deleted file, or (indistinguishably) a blob past the
+/// adapter's size cap — and maps to an empty string; but when BOTH sides are
+/// absent there is nothing to show, so the pair is not-full. Any side that
+/// loaded makes the pair `full`.
+fn combine_file_pair<E>(
+    original: Result<Option<String>, E>,
+    modified: Result<Option<String>, E>,
+) -> FilePair {
+    let not_full = FilePair {
+        original: String::new(),
+        modified: String::new(),
+        full: false,
+    };
+    match (original, modified) {
+        (Ok(orig), Ok(modi)) => match (orig, modi) {
+            // Both sides legitimately absent: nothing to render.
+            (None, None) => not_full,
+            (orig, modi) => FilePair {
+                original: orig.unwrap_or_default(),
+                modified: modi.unwrap_or_default(),
+                full: true,
+            },
+        },
+        // Could not determine one or both sides.
+        _ => not_full,
+    }
 }
 
 /// Add an anchored comment to a review at the diff gate.
@@ -417,6 +584,137 @@ async fn try_spawn_agent(
     ))
 }
 
+/// Run the advisory read-only pre-pass reviewer over a PR's diff (B2).
+///
+/// This is an explicit user action. It spawns an [`AgentMode::Review`] agent
+/// that inspects the diff against the PR intent and writes a JSON findings array
+/// to [`config::findings_file_path`](cockpit_core::config::findings_file_path);
+/// the Stop-hook completion handler ingests that file onto the review (see
+/// `ingest_review_findings` in `lib.rs`).
+///
+/// The pre-pass is advisory: it NEVER touches the gate state (Review mode never
+/// transitions). It refuses to start when an agent is already attached so a
+/// reviewer cannot race an in-flight fix/restack/implement agent. An imported
+/// PR's worktree is materialized first via [`ensure_worktree_for_review`]. On a
+/// successful spawn the running agent is attached and any stale findings from a
+/// previous pre-pass are cleared so the UI shows "agent working" cleanly.
+#[tauri::command]
+pub async fn pre_review(
+    state: State<'_, Arc<AppState>>,
+    app_handle: tauri::AppHandle,
+    pr: String,
+) -> Result<Review, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    // Refuse to start a second agent for this review: the advisory reviewer must
+    // not race an in-flight fix/restack/implement agent.
+    if review.agent.is_some() {
+        return Err(CommandError {
+            message: format!("Review {pr} already has a running agent; wait for it to finish"),
+        });
+    }
+
+    // Materialize a usable worktree for imported PRs (a no-op for managed ones).
+    let worktree = ensure_worktree_for_review(&state, &pr_ref).await?;
+
+    // Re-read after materialization, which may have updated the worktree path.
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    // Resolve (and ensure the parent dir of) the findings output path so the
+    // reviewer's write succeeds; the completion handler reads it back.
+    let findings_path = cockpit_core::config::findings_file_path(&pr)?;
+    if let Some(parent) = findings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Assemble the review prompt: intent from the PR title/body/issue, the
+    // Review-mode custom preamble, and skills relevant to the diff — mirroring
+    // dispatch_fix_agent's structure. A config load failure falls back to no
+    // preamble (builtin instruction).
+    let preamble = Config::load().ok().and_then(|c| {
+        c.agent_prompts
+            .for_mode(AgentMode::Review)
+            .map(str::to_owned)
+    });
+    let skills = cockpit_core::skills::relevant_for_diff(&review.diff.raw);
+    let review_input = cockpit_core::prompt::ReviewInput {
+        title: &review.title,
+        body: &review.body,
+        issue: review.issue.as_str(),
+        custom_preamble: preamble.as_deref(),
+        diff: &review.diff,
+        output_path: Some(&findings_path),
+        skills: &skills,
+    };
+    let assembled = cockpit_core::prompt::assemble_review_prompt(&review_input);
+
+    // Spawn the reviewer (keyed by PR ref so completion ingests the right
+    // review). On success, attach the agent and clear any stale findings from a
+    // previous pre-pass — atomically, so the UI never shows old findings under a
+    // running agent. The gate state is left UNTOUCHED (Invariant 5).
+    let agent_run =
+        try_spawn_review_agent(&state, &app_handle, &pr, &pr_ref, &worktree, &assembled)
+            .await
+            .map_err(|e| CommandError {
+                message: format!("failed to spawn reviewer agent: {e}"),
+            })?;
+    state.reviews.update(&pr_ref, |r| {
+        r.review_findings.clear();
+        r.agent = Some(agent_run);
+    });
+
+    state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })
+}
+
+/// Attempt to spawn the advisory pre-pass reviewer ([`AgentMode::Review`]).
+///
+/// Mirrors [`try_spawn_agent`] but in Review mode: spawns the agent in the
+/// review's worktree, keyed by the PR ref, and wires stdout streaming to the
+/// frontend. Factored out so the caller can map a spawn failure to a
+/// [`CommandError`].
+async fn try_spawn_review_agent(
+    state: &AppState,
+    app_handle: &tauri::AppHandle,
+    pr: &str,
+    pr_ref: &PrRef,
+    worktree: &std::path::Path,
+    prompt: &cockpit_core::prompt::AssembledPrompt,
+) -> Result<cockpit_core::model::AgentRun, String> {
+    let config = Config::load().map_err(|e| format!("config: {e}"))?;
+    let spawn_config = SpawnConfig::from_config(&config);
+    let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
+
+    let spawn_result = cockpit_core::adapters::agent::spawn_agent(
+        worktree,
+        prompt,
+        AgentMode::Review,
+        pr_ref.as_str(),
+        &state.sessions,
+        &hook_url,
+        &spawn_config,
+    )
+    .await
+    .map_err(|e| format!("spawn: {e}"))?;
+
+    let stream_ctx = crate::streaming::StreamContext {
+        object_id: pr.to_string(),
+        mode: AgentMode::Review,
+        completion_tx: state.completion_tx.clone(),
+    };
+    Ok(crate::streaming::start_stream_forwarding(
+        spawn_result,
+        app_handle.clone(),
+        stream_ctx,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Worktree materialization
 // ---------------------------------------------------------------------------
@@ -647,13 +945,13 @@ pub async fn fetch_ci_checks(
     state: State<'_, Arc<AppState>>,
     app_handle: tauri::AppHandle,
     pr: String,
-) -> Result<github::CiSummary, CommandError> {
+) -> Result<CiSummary, CommandError> {
     use tauri::Emitter;
 
     let pr_ref = PrRef::new(&pr);
     let repo_slug = state.reviews.get(&pr_ref).and_then(|r| r.repo_slug.clone());
 
-    let empty = github::CiSummary {
+    let empty = CiSummary {
         passed: 0,
         total: 0,
         failed: 0,

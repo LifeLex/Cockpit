@@ -3,4 +3,4 @@
 /**
  * Which mode the spawned agent runs in.
  */
-export type AgentMode = "Plan" | "Implement" | "Fix" | "Restack";
+export type AgentMode = "Plan" | "Implement" | "Fix" | "Restack" | "Review";

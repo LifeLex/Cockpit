@@ -1,11 +1,22 @@
+import { useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { Layers } from "lucide-react";
+import { Layers, ShieldAlert } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Review } from "../bindings/Review";
 import type { GateState } from "../bindings/GateState";
+import type { SizeClass } from "../bindings/SizeClass";
+import type { RiskFlag } from "../bindings/RiskFlag";
+import type { CiSummary } from "../bindings/CiSummary";
 import { cardSignal } from "../lib/card-signal";
 import type { SignalTone } from "../lib/card-signal";
 import { diffStats } from "../diff-parser";
+import { ciState } from "../lib/ci";
+import {
+  diffTotals,
+  sizeClass,
+  sensitiveFlags,
+  touchesTests,
+} from "../lib/diff-signals";
 
 /** Presentation density for the board. */
 export type CardDensity = "cards" | "compact";
@@ -189,6 +200,173 @@ function TelemetryChips({ review }: { readonly review: Review }) {
   );
 }
 
+/** Semantic tone for a risk chip's status dot. */
+type ChipTone = "pass" | "fail" | "pending" | "warning" | "neutral";
+
+/** Dot color for a risk chip, using the semantic `--color-*` tokens. */
+function chipDotClass(tone: ChipTone): string {
+  switch (tone) {
+    case "pass":
+      return "bg-success";
+    case "fail":
+      return "bg-danger";
+    case "pending":
+      return "bg-warning";
+    case "warning":
+      return "bg-warning";
+    case "neutral":
+      return "bg-muted-foreground";
+    default:
+      return assertNever(tone);
+  }
+}
+
+/** Overall CI tone for the x/y chip, from the rolled-up summary. */
+function ciSummaryTone(ci: CiSummary): ChipTone {
+  const state = ciState(ci);
+  switch (state) {
+    case "pass":
+      return "pass";
+    case "fail":
+      return "fail";
+    case "pending":
+      return "pending";
+    case "none":
+      return "neutral";
+    default:
+      return assertNever(state);
+  }
+}
+
+/** Short label for a diff size bucket (`Xl` renders as `XL`). */
+function sizeLabel(size: SizeClass): string {
+  switch (size) {
+    case "S":
+      return "S";
+    case "M":
+      return "M";
+    case "L":
+      return "L";
+    case "Xl":
+      return "XL";
+    default:
+      return assertNever(size);
+  }
+}
+
+/** Short label for a sensitive-path risk flag. */
+function riskLabel(flag: RiskFlag): string {
+  switch (flag) {
+    case "Migration":
+      return "migrations";
+    case "Lockfile":
+      return "lockfile";
+    case "CiConfig":
+      return "CI config";
+    case "Auth":
+      return "auth";
+    case "GithubDir":
+      return ".github";
+    case "Dependency":
+      return "deps";
+    default:
+      return assertNever(flag);
+  }
+}
+
+/** A small, calm status chip: a semantic dot plus a mono label. */
+function RiskChip({
+  tone,
+  title,
+  children,
+}: {
+  readonly tone: ChipTone;
+  readonly title?: string | undefined;
+  readonly children: React.ReactNode;
+}) {
+  return (
+    <span
+      title={title}
+      className="inline-flex items-center gap-1 font-mono tabular-nums text-muted-foreground"
+    >
+      <span
+        className={cn("h-1.5 w-1.5 shrink-0 rounded-full", chipDotClass(tone))}
+        aria-hidden="true"
+      />
+      {children}
+    </span>
+  );
+}
+
+/**
+ * Deterministic diff-derived risk chips shared by both densities: CI x/y, diff
+ * size class, a sensitive-path flag, and a test-touch marker. The four signals
+ * the research says carry most of the routing value (C3). All are parsed from
+ * `review.diff.raw` once per render (memoized on the raw diff). The size chip
+ * carries the F6 ">400 changed lines" splitting nudge as a warning tone.
+ */
+function RiskChips({ review }: { readonly review: Review }) {
+  const signals = useMemo(() => {
+    const totals = diffTotals(review.diff.raw);
+    const flags = sensitiveFlags(review.diff.raw);
+    return {
+      total: totals.additions + totals.deletions,
+      size: sizeClass(totals.additions, totals.deletions),
+      firstFlag: flags[0] ?? null,
+      hasTests: touchesTests(review.diff.raw),
+    };
+  }, [review.diff.raw]);
+
+  const ci = review.ci_summary;
+  // F6: nudge splitting once a diff crosses 400 changed lines.
+  const oversized = signals.total > 400;
+
+  return (
+    <>
+      {ci !== undefined && ci.total > 0 && (
+        <RiskChip
+          tone={ciSummaryTone(ci)}
+          title={`CI: ${String(ci.passed)} passed, ${String(ci.failed)} failed, ${String(ci.pending)} pending`}
+        >
+          <span className="text-muted-foreground">CI</span>
+          <span>
+            {String(ci.passed)}/{String(ci.total)}
+          </span>
+        </RiskChip>
+      )}
+
+      {signals.total > 0 && (
+        <RiskChip
+          tone={oversized ? "warning" : "neutral"}
+          title={
+            oversized ? "Consider splitting (>400 changed lines)" : undefined
+          }
+        >
+          <span className="font-semibold text-foreground">
+            {sizeLabel(signals.size)}
+          </span>
+        </RiskChip>
+      )}
+
+      {signals.firstFlag !== null && (
+        <span
+          title={`Touches ${riskLabel(signals.firstFlag)}`}
+          className="inline-flex items-center gap-1 font-mono text-xs text-warning"
+        >
+          <ShieldAlert className="h-3 w-3 shrink-0" aria-hidden="true" />
+          {riskLabel(signals.firstFlag)}
+        </span>
+      )}
+
+      {signals.hasTests && (
+        <RiskChip tone="neutral">
+          <span className="text-muted-foreground">tests</span>
+        </RiskChip>
+      )}
+    </>
+  );
+}
+
 /** Restack button; only meaningful for stale reviews. */
 function RestackButton({
   review,
@@ -251,8 +429,14 @@ export function ReviewCard({
         <span className={cn("shrink-0 text-xs font-medium", toneTextClass(signal.tone))}>
           {signal.reason}
         </span>
+        {signal.note !== undefined && (
+          <span className="hidden shrink-0 text-xs text-muted-foreground lg:inline">
+            · {signal.note}
+          </span>
+        )}
         <span className="hidden shrink-0 items-center gap-3 text-xs sm:flex">
           <TelemetryChips review={review} />
+          <RiskChips review={review} />
         </span>
         {repo !== "" && (
           <span className="hidden shrink-0 font-mono text-xs text-muted-foreground md:inline">
@@ -289,14 +473,15 @@ export function ReviewCard({
         </span>
 
         <div className="min-w-0 flex-1">
-          {/* Reason line — the card's headline signal. */}
-          <div
-            className={cn(
-              "text-xs font-semibold uppercase tracking-wide",
-              toneTextClass(signal.tone),
+          {/* Reason line — the card's headline signal, with an optional risk
+              note layered under the gate reason on the same line. */}
+          <div className="flex flex-wrap items-baseline gap-x-1.5 text-xs font-semibold uppercase tracking-wide">
+            <span className={toneTextClass(signal.tone)}>{signal.reason}</span>
+            {signal.note !== undefined && (
+              <span className="font-normal normal-case tracking-normal text-muted-foreground">
+                · {signal.note}
+              </span>
             )}
-          >
-            {signal.reason}
           </div>
 
           {/* Title = the branch/PR subject. */}
@@ -320,9 +505,10 @@ export function ReviewCard({
             )}
           </div>
 
-          {/* Telemetry chips. */}
+          {/* Telemetry + risk chips. */}
           <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
             <TelemetryChips review={review} />
+            <RiskChips review={review} />
           </div>
         </div>
 

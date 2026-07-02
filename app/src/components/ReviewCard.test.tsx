@@ -4,6 +4,15 @@ import userEvent from "@testing-library/user-event";
 import { ReviewCard } from "./ReviewCard";
 import { makeReview, makeAgentRun, ALL_GATE_STATES } from "../test/fixtures";
 
+/** A diff adding `n` lines to `path`, for exercising the risk chips. */
+function addLines(path: string, n: number): string {
+  let s = `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -0,0 +1,${String(n)} @@\n`;
+  for (let i = 0; i < n; i++) {
+    s += `+row ${String(i)}\n`;
+  }
+  return s;
+}
+
 describe("ReviewCard", () => {
   it("shows the Restack button only when the review is stale", () => {
     const fresh = makeReview({ stale: false });
@@ -118,5 +127,72 @@ describe("ReviewCard", () => {
     expect(
       screen.getByRole("button", { name: "Review" }),
     ).toBeInTheDocument();
+  });
+
+  it("renders a CI x/y chip from the review's ci_summary", () => {
+    render(
+      <ReviewCard
+        review={makeReview({
+          ci_summary: { passed: 2, total: 3, failed: 1, pending: 0 },
+          diff: { raw: addLines("data.txt", 10) },
+        })}
+        onAction={vi.fn()}
+        onRestack={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("2/3")).toBeInTheDocument();
+  });
+
+  it("adds the F6 splitting nudge to the size chip past 400 changed lines", () => {
+    render(
+      <ReviewCard
+        review={makeReview({ diff: { raw: addLines("data.txt", 500) } })}
+        onAction={vi.fn()}
+        onRestack={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByTitle("Consider splitting (>400 changed lines)"),
+    ).toBeInTheDocument();
+  });
+
+  it("surfaces a sensitive-path chip for a risky file", () => {
+    render(
+      <ReviewCard
+        review={makeReview({
+          diff: { raw: addLines("migrations/001_init.sql", 5) },
+        })}
+        onAction={vi.fn()}
+        onRestack={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("migrations")).toBeInTheDocument();
+  });
+
+  it("surfaces a test-touch chip when the diff touches tests", () => {
+    render(
+      <ReviewCard
+        review={makeReview({ diff: { raw: addLines("src/foo.test.ts", 5) } })}
+        onAction={vi.fn()}
+        onRestack={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("tests")).toBeInTheDocument();
+  });
+
+  it("layers a risk note under the gate reason", () => {
+    render(
+      <ReviewCard
+        review={makeReview({
+          gate_state: "Pending",
+          ci_summary: { passed: 1, total: 2, failed: 1, pending: 0 },
+          diff: { raw: addLines("data.txt", 10) },
+        })}
+        onAction={vi.fn()}
+        onRestack={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/needs your review/i)).toBeInTheDocument();
+    expect(screen.getByText(/CI failing/)).toBeInTheDocument();
   });
 });

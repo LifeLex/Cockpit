@@ -2398,10 +2398,13 @@ pub async fn fetch_review_requests(
 
 /// Shared implementation for fetching PRs by filter.
 ///
-/// When a review already exists in the store (matched by PR URL), only the
-/// diff, branch, and base are refreshed — comments, gate state, agent run,
-/// and stale flag are preserved. This prevents re-fetching from GitHub from
-/// blowing away in-progress review work.
+/// When a review already exists in the store (matched by PR URL), the diff,
+/// branch, base, CI summary, and pinned base/head SHAs are refreshed from
+/// GitHub — comments, gate state, agent run, and stale flag are preserved so a
+/// re-fetch never blows away in-progress review work. The head SHA is held back
+/// while a rework is in flight (an attached agent or `Dispatched` state): the
+/// local worktree HEAD leads GitHub's last-reported OID then, so adopting the
+/// fetched head would point the diff/full-file view at a stale revision.
 async fn fetch_prs_by_filter(
     state: State<'_, Arc<AppState>>,
     filter: github::PrFilter,
@@ -2437,10 +2440,34 @@ async fn fetch_prs_by_filter(
         if state.reviews.get(&pr_ref).is_some() {
             let branch = pr.head_ref_name.clone();
             let base = pr.base_ref_name.clone();
+            let head_sha = pr.head_ref_oid.clone();
+            let base_sha = pr.base_ref_oid.clone();
+            let ci_summary = github::rollup_to_summary(&pr.status_check_rollup);
             state.reviews.update(&pr_ref, |r| {
                 r.diff = cockpit_core::model::DiffData { raw: diff };
                 r.branch = branch;
                 r.base = base;
+
+                // Refresh CI + pinned SHAs from GitHub. A failed per-PR
+                // enrichment falls back to empty OIDs / an empty rollup; treat
+                // those as "no fresh data" and keep what we already have rather
+                // than degrading the diff resolution to a branch-name lookup.
+                if let Some(ci) = ci_summary {
+                    r.ci_summary = Some(ci);
+                }
+                if !base_sha.is_empty() {
+                    r.base_sha = base_sha;
+                }
+                // The head SHA is authoritative locally while a rework is in
+                // flight: a review with an attached agent or in `Dispatched` has
+                // a worktree HEAD that leads what GitHub last reported, so
+                // adopting the fetched head here would point the diff/full-file
+                // view at a stale revision. Only take GitHub's head OID when no
+                // rework owns the branch.
+                let rework_in_flight = r.agent.is_some() || r.gate_state == GateState::Dispatched;
+                if !rework_in_flight && !head_sha.is_empty() {
+                    r.head_sha = head_sha;
+                }
             });
             if let Some(updated) = state.reviews.get(&pr_ref) {
                 reviews.push(updated);

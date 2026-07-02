@@ -73,6 +73,20 @@ pub struct PrData {
     /// Repository slug (e.g. "Nexcade/garage"). Present for cross-repo searches.
     #[serde(default)]
     pub repo_slug: String,
+    /// The PR's `statusCheckRollup` entries. Empty for legacy field sets (which
+    /// did not request the rollup), so defaulted; rolled up via
+    /// [`rollup_to_summary`].
+    #[serde(default)]
+    pub status_check_rollup: Vec<StatusCheckNode>,
+    /// Head commit SHA (`headRefOid`), pinned at fetch so the diff/full-file
+    /// fallback resolves the exact revision instead of a drifting branch lookup.
+    /// Empty for legacy field sets, so defaulted.
+    #[serde(default)]
+    pub head_ref_oid: String,
+    /// Base commit SHA (`baseRefOid`), pinned at fetch (see `head_ref_oid`).
+    /// Empty for legacy field sets, so defaulted.
+    #[serde(default)]
+    pub base_ref_oid: String,
 }
 
 /// CI check status from `gh pr checks`.
@@ -110,7 +124,8 @@ pub struct CiCheck {
 
 /// Classification of a single check's outcome, derived from its bucket/state.
 ///
-/// Kept private: the public surface is [`CiSummary`] via [`summarize`].
+/// Kept private: the public surface is [`CiSummary`] via [`summarize`] and
+/// [`rollup_to_summary`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckOutcome {
     /// Passed, or a non-blocking outcome (neutral, skipped, cancelled).
@@ -121,35 +136,50 @@ enum CheckOutcome {
     Pending,
 }
 
+/// Classify a single raw check signal into a [`CheckOutcome`].
+///
+/// The signal is a `gh` bucket (`pass`/`fail`/`pending`/…), a raw GitHub check
+/// state/conclusion (`SUCCESS`/`FAILURE`/…), or a legacy commit-status state
+/// (`ERROR`/`EXPECTED`/…) — the match is case-insensitive and covers all three.
+/// Both the `gh pr checks` path ([`CiCheck::outcome`]) and the
+/// `statusCheckRollup` path ([`rollup_to_summary`]) route through here so their
+/// pass/fail/pending semantics can never drift apart.
+///
+/// Neutral, skipped, and cancelled map to [`CheckOutcome::Pass`] (they are not
+/// failures); an unknown signal maps conservatively to [`CheckOutcome::Pending`]
+/// so it is neither a false pass nor a false failure.
+fn classify_check_signal(signal: &str) -> CheckOutcome {
+    match signal.to_ascii_lowercase().as_str() {
+        // gh buckets.
+        "pass" | "skipping" | "cancel" => CheckOutcome::Pass,
+        "fail" => CheckOutcome::Fail,
+        "pending" => CheckOutcome::Pending,
+        // Raw GitHub check states / conclusions and commit-status states.
+        "success" | "neutral" | "skipped" | "cancelled" | "canceled" => CheckOutcome::Pass,
+        "failure" | "timed_out" | "action_required" | "startup_failure" | "stale" | "error" => {
+            CheckOutcome::Fail
+        }
+        "queued" | "in_progress" | "waiting" | "requested" | "expected" => CheckOutcome::Pending,
+        // Unknown signal: treat conservatively as pending so it is neither a
+        // false pass nor a false failure.
+        _ => CheckOutcome::Pending,
+    }
+}
+
 impl CiCheck {
     /// Classify this check's outcome from its `bucket` (falling back to `state`).
     ///
     /// `gh`'s `bucket` field is the normalized signal; when a fixture or older
-    /// `gh` omits it, the raw `state` is used. Neutral/skipped/cancelled all map
-    /// to [`CheckOutcome::Pass`] — they do not represent a failure.
+    /// `gh` omits it, the raw `state` is used. Delegates to
+    /// [`classify_check_signal`] so `gh pr checks` and the rollup share one
+    /// classification.
     fn outcome(&self) -> CheckOutcome {
         let signal = if self.bucket.is_empty() {
             self.state.as_str()
         } else {
             self.bucket.as_str()
         };
-        match signal.to_ascii_lowercase().as_str() {
-            // gh buckets.
-            "pass" | "skipping" | "cancel" => CheckOutcome::Pass,
-            "fail" => CheckOutcome::Fail,
-            "pending" => CheckOutcome::Pending,
-            // Raw GitHub states (used when bucket is absent).
-            "success" | "neutral" | "skipped" | "cancelled" | "canceled" => CheckOutcome::Pass,
-            "failure" | "timed_out" | "action_required" | "startup_failure" | "stale" => {
-                CheckOutcome::Fail
-            }
-            "queued" | "in_progress" | "waiting" | "requested" | "expected" => {
-                CheckOutcome::Pending
-            }
-            // Unknown signal: treat conservatively as pending so it is neither a
-            // false pass nor a false failure.
-            _ => CheckOutcome::Pending,
-        }
+        classify_check_signal(signal)
     }
 }
 
@@ -172,6 +202,101 @@ pub fn summarize(checks: &[CiCheck]) -> CiSummary {
         }
     }
     summary
+}
+
+/// Deserialize a possibly-null JSON string as the empty string when null.
+///
+/// `gh` emits `"conclusion": null` for an in-flight CheckRun, and plain
+/// `#[serde(default)]` only covers an *absent* field, not an explicit `null`.
+/// Applied to every string field of [`StatusCheckNode`] so a null anywhere in
+/// the heterogeneous rollup coalesces to empty rather than failing the parse.
+fn null_as_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// A single entry in a PR's `statusCheckRollup` (from `gh pr view --json`).
+///
+/// The rollup is a heterogeneous array: GitHub Actions/checks appear as
+/// `CheckRun` nodes (carrying `status`/`conclusion`/`name`) while legacy commit
+/// statuses appear as `StatusContext` nodes (carrying `state`/`context`). Every
+/// field is optional and defaulted because each node only populates the subset
+/// belonging to its own type, and a present-but-null value coalesces to empty.
+/// Not TS-exported: this is an adapter-internal shape that is rolled up into the
+/// domain [`CiSummary`] via [`rollup_to_summary`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusCheckNode {
+    /// GraphQL type discriminator: `"CheckRun"` or `"StatusContext"`.
+    #[serde(
+        default,
+        rename = "__typename",
+        deserialize_with = "null_as_empty_string"
+    )]
+    pub typename: String,
+    /// CheckRun: the check's name (e.g. `"build"`). Empty for a StatusContext.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    pub name: String,
+    /// CheckRun: run status (e.g. `"COMPLETED"`, `"IN_PROGRESS"`). Empty for a StatusContext.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    pub status: String,
+    /// CheckRun: conclusion once completed (e.g. `"SUCCESS"`, `"FAILURE"`).
+    /// Empty while a run is in flight (`gh` reports `null`), and for a StatusContext.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    pub conclusion: String,
+    /// StatusContext: the status name (e.g. `"ci/circleci"`). Empty for a CheckRun.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    pub context: String,
+    /// StatusContext: raw state (e.g. `"SUCCESS"`, `"FAILURE"`, `"ERROR"`, `"PENDING"`).
+    /// Empty for a CheckRun.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
+    pub state: String,
+}
+
+impl StatusCheckNode {
+    /// The raw signal fed to [`classify_check_signal`] for this node.
+    ///
+    /// A StatusContext carries its outcome in `state`; a CheckRun carries it in
+    /// `conclusion` once completed, or in `status` while still in flight. `state`
+    /// is only non-empty for a StatusContext, so it is checked first.
+    fn signal(&self) -> &str {
+        if !self.state.is_empty() {
+            &self.state
+        } else if !self.conclusion.is_empty() {
+            &self.conclusion
+        } else {
+            &self.status
+        }
+    }
+}
+
+/// Roll up a PR's `statusCheckRollup` nodes into a [`CiSummary`].
+///
+/// Returns `None` for an empty slice: a PR with **no** checks is not the same as
+/// a PR whose checks are all green, and the CI badge must be able to tell them
+/// apart. Classification routes through [`classify_check_signal`] — the same
+/// function [`summarize`] uses — so the rollup and `gh pr checks` paths agree on
+/// every equivalent state. `passed + failed + pending == total`.
+pub fn rollup_to_summary(nodes: &[StatusCheckNode]) -> Option<CiSummary> {
+    if nodes.is_empty() {
+        return None;
+    }
+    let mut summary = CiSummary {
+        passed: 0,
+        total: nodes.len() as u32,
+        failed: 0,
+        pending: 0,
+    };
+    for node in nodes {
+        match classify_check_signal(node.signal()) {
+            CheckOutcome::Pass => summary.passed += 1,
+            CheckOutcome::Fail => summary.failed += 1,
+            CheckOutcome::Pending => summary.pending += 1,
+        }
+    }
+    Some(summary)
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +732,9 @@ async fn enrich_task(index: usize, sr: SearchPrResult) -> (usize, PrData) {
                 state: sr.state,
                 url: sr.url,
                 repo_slug: slug,
+                status_check_rollup: Vec::new(),
+                head_ref_oid: String::new(),
+                base_ref_oid: String::new(),
             },
         ),
     }
@@ -704,7 +832,7 @@ async fn enrich_pr(repo_slug: &str, pr_number: u64) -> Result<PrData, Error> {
             "--repo",
             repo_slug,
             "--json",
-            "number,headRefName,baseRefName,title,body,state,url",
+            "number,headRefName,baseRefName,title,body,state,url,statusCheckRollup,headRefOid,baseRefOid",
         ])
         .output()
         .await?;
@@ -789,12 +917,15 @@ pub fn build_review_from_pr(
         body: pr.body.clone(),
         branch: pr.head_ref_name.clone(),
         base: pr.base_ref_name.clone(),
-        base_sha: String::new(),
+        // Pin the base/head SHAs from the fetch so the diff and full-file
+        // fallback resolve the exact revisions rather than re-resolving the base
+        // by branch name (which drifts as the base branch advances).
+        base_sha: pr.base_ref_oid.clone(),
         source,
         worktree: repo_path.to_path_buf(),
         gate_state: GateState::Pending,
         diff: DiffData { raw: diff },
-        head_sha: String::new(),
+        head_sha: pr.head_ref_oid.clone(),
         comments: vec![],
         parents: vec![],
         children: vec![],
@@ -803,7 +934,7 @@ pub fn build_review_from_pr(
         repo_slug: slug,
         project: None,
         dispatch_snapshot: None,
-        ci_summary: None,
+        ci_summary: rollup_to_summary(&pr.status_check_rollup),
         review_findings: vec![],
         conversation: vec![],
         last_reviewed_sha: None,
@@ -1631,6 +1762,52 @@ mod tests {
         assert_eq!(prs[0].base_ref_name, "main");
         assert_eq!(prs[1].number, 43);
         assert_eq!(prs[1].state, "OPEN");
+
+        // Legacy JSON omits the rollup + OID fields; they default cleanly.
+        assert!(prs[0].status_check_rollup.is_empty());
+        assert_eq!(prs[0].head_ref_oid, "");
+        assert_eq!(prs[0].base_ref_oid, "");
+    }
+
+    #[test]
+    fn deserialize_pr_data_with_rollup_and_oids() {
+        // The enriched field set: the rollup array plus pinned head/base OIDs.
+        let json = r#"[
+            {
+                "number": 7,
+                "headRefName": "alejandro/NEX-7-thing",
+                "baseRefName": "main",
+                "title": "Thing",
+                "state": "OPEN",
+                "url": "https://github.com/owner/repo/pull/7",
+                "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "baseRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "statusCheckRollup": [
+                    {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"},
+                    {"__typename":"CheckRun","name":"lint","status":"IN_PROGRESS","conclusion":null},
+                    {"__typename":"StatusContext","context":"ci/circleci","state":"FAILURE"}
+                ]
+            }
+        ]"#;
+
+        let prs: Vec<PrData> = serde_json::from_str(json).expect("enriched JSON parses");
+
+        assert_eq!(prs.len(), 1);
+        assert_eq!(
+            prs[0].head_ref_oid,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            prs[0].base_ref_oid,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(prs[0].status_check_rollup.len(), 3);
+        // A CheckRun's completed conclusion, an in-flight null conclusion, and a
+        // StatusContext state all parse (null coalesces to empty).
+        assert_eq!(prs[0].status_check_rollup[0].conclusion, "SUCCESS");
+        assert_eq!(prs[0].status_check_rollup[1].conclusion, "");
+        assert_eq!(prs[0].status_check_rollup[1].status, "IN_PROGRESS");
+        assert_eq!(prs[0].status_check_rollup[2].state, "FAILURE");
     }
 
     // -- link_prs_to_issues --
@@ -1647,6 +1824,9 @@ mod tests {
                 state: "OPEN".into(),
                 url: "https://github.com/o/r/pull/1".into(),
                 repo_slug: String::new(),
+                status_check_rollup: Vec::new(),
+                head_ref_oid: String::new(),
+                base_ref_oid: String::new(),
             },
             PrData {
                 number: 2,
@@ -1657,6 +1837,9 @@ mod tests {
                 state: "OPEN".into(),
                 url: "https://github.com/o/r/pull/2".into(),
                 repo_slug: String::new(),
+                status_check_rollup: Vec::new(),
+                head_ref_oid: String::new(),
+                base_ref_oid: String::new(),
             },
             PrData {
                 number: 3,
@@ -1667,6 +1850,9 @@ mod tests {
                 state: "MERGED".into(),
                 url: "https://github.com/o/r/pull/3".into(),
                 repo_slug: String::new(),
+                status_check_rollup: Vec::new(),
+                head_ref_oid: String::new(),
+                base_ref_oid: String::new(),
             },
         ];
 
@@ -1893,6 +2079,122 @@ mod tests {
         assert_eq!(s.passed, 0);
         assert_eq!(s.failed, 0);
         assert_eq!(s.pending, 0);
+    }
+
+    // -- rollup_to_summary --
+
+    /// A mixed rollup: CheckRun (with an in-flight null conclusion) plus legacy
+    /// StatusContext nodes, covering pass/fail/pending on both node kinds.
+    const ROLLUP_MIXED: &str = r#"[
+        {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"},
+        {"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"FAILURE"},
+        {"__typename":"CheckRun","name":"deploy","status":"COMPLETED","conclusion":"CANCELLED"},
+        {"__typename":"CheckRun","name":"lint","status":"IN_PROGRESS","conclusion":null},
+        {"__typename":"StatusContext","context":"ci/circleci","state":"SUCCESS"},
+        {"__typename":"StatusContext","context":"legacy/errored","state":"ERROR"},
+        {"__typename":"StatusContext","context":"legacy/queued","state":"PENDING"}
+    ]"#;
+
+    #[test]
+    fn rollup_mixed_checkrun_and_statuscontext() {
+        let nodes: Vec<StatusCheckNode> =
+            serde_json::from_str(ROLLUP_MIXED).expect("mixed rollup parses");
+        let s = rollup_to_summary(&nodes).expect("non-empty rollup yields Some");
+        assert_eq!(s.total, 7);
+        // pass: SUCCESS + CANCELLED (CheckRun) + SUCCESS (StatusContext) = 3
+        assert_eq!(s.passed, 3, "success + cancelled + statuscontext success");
+        // fail: FAILURE (CheckRun) + ERROR (StatusContext) = 2
+        assert_eq!(s.failed, 2, "checkrun failure + statuscontext error");
+        // pending: in-flight IN_PROGRESS + StatusContext PENDING = 2
+        assert_eq!(s.pending, 2, "in_progress + statuscontext pending");
+        assert_eq!(s.passed + s.failed + s.pending, s.total);
+    }
+
+    #[test]
+    fn rollup_all_success() {
+        let json = r#"[
+            {"__typename":"CheckRun","name":"a","status":"COMPLETED","conclusion":"SUCCESS"},
+            {"__typename":"CheckRun","name":"b","status":"COMPLETED","conclusion":"SUCCESS"}
+        ]"#;
+        let nodes: Vec<StatusCheckNode> = serde_json::from_str(json).expect("parses");
+        let s = rollup_to_summary(&nodes).expect("Some");
+        assert_eq!((s.passed, s.failed, s.pending, s.total), (2, 0, 0, 2));
+    }
+
+    #[test]
+    fn rollup_with_pending() {
+        let json = r#"[
+            {"__typename":"CheckRun","name":"a","status":"COMPLETED","conclusion":"SUCCESS"},
+            {"__typename":"CheckRun","name":"b","status":"QUEUED","conclusion":null}
+        ]"#;
+        let nodes: Vec<StatusCheckNode> = serde_json::from_str(json).expect("parses");
+        let s = rollup_to_summary(&nodes).expect("Some");
+        assert_eq!((s.passed, s.failed, s.pending, s.total), (1, 0, 1, 2));
+    }
+
+    #[test]
+    fn rollup_with_failure() {
+        let json = r#"[
+            {"__typename":"CheckRun","name":"a","status":"COMPLETED","conclusion":"SUCCESS"},
+            {"__typename":"CheckRun","name":"b","status":"COMPLETED","conclusion":"FAILURE"}
+        ]"#;
+        let nodes: Vec<StatusCheckNode> = serde_json::from_str(json).expect("parses");
+        let s = rollup_to_summary(&nodes).expect("Some");
+        assert_eq!((s.passed, s.failed, s.pending, s.total), (1, 1, 0, 2));
+    }
+
+    #[test]
+    fn rollup_empty_is_none() {
+        // No checks is NOT the same as all-green: the badge must distinguish them.
+        assert_eq!(rollup_to_summary(&[]), None);
+    }
+
+    #[test]
+    fn rollup_classification_matches_summarize() {
+        // Every state a CiCheck (`gh pr checks`) and a StatusCheckNode (rollup)
+        // can both carry must classify identically. Both paths route through
+        // `classify_check_signal`; this test fails loudly if they ever diverge.
+        let states = [
+            "SUCCESS",
+            "NEUTRAL",
+            "SKIPPED",
+            "CANCELLED",
+            "FAILURE",
+            "TIMED_OUT",
+            "ACTION_REQUIRED",
+            "ERROR",
+            "STALE",
+            "PENDING",
+            "IN_PROGRESS",
+            "QUEUED",
+            "EXPECTED",
+            "WAITING",
+        ];
+        for state in states {
+            let check = CiCheck {
+                name: "c".into(),
+                state: state.into(),
+                bucket: String::new(),
+                link: String::new(),
+                workflow: String::new(),
+            };
+            let node = StatusCheckNode {
+                state: state.into(),
+                ..StatusCheckNode::default()
+            };
+            let via_summarize = summarize(std::slice::from_ref(&check));
+            let via_rollup =
+                rollup_to_summary(std::slice::from_ref(&node)).expect("non-empty yields Some");
+            assert_eq!(
+                (
+                    via_summarize.passed,
+                    via_summarize.failed,
+                    via_summarize.pending
+                ),
+                (via_rollup.passed, via_rollup.failed, via_rollup.pending),
+                "classification drift for state {state}"
+            );
+        }
     }
 
     #[test]
@@ -2190,6 +2492,75 @@ index 1111111..2222222 100644
         // frontier review was NOT added as its child.
         assert!(reviews[1].parents.is_empty());
         assert!(reviews[1].children.is_empty());
+    }
+
+    // -- build_review_from_pr --
+
+    #[test]
+    fn build_review_pins_shas_and_ci_summary() {
+        let pr = PrData {
+            number: 7,
+            head_ref_name: "alejandro/NEX-7-thing".into(),
+            base_ref_name: "main".into(),
+            title: "Thing".into(),
+            body: "desc".into(),
+            state: "OPEN".into(),
+            url: "https://github.com/o/r/pull/7".into(),
+            repo_slug: "o/r".into(),
+            status_check_rollup: serde_json::from_str(
+                r#"[
+                    {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"},
+                    {"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"FAILURE"}
+                ]"#,
+            )
+            .expect("rollup parses"),
+            head_ref_oid: "aaa111".into(),
+            base_ref_oid: "bbb222".into(),
+        };
+
+        let review = build_review_from_pr(
+            &pr,
+            "diff".to_string(),
+            std::path::Path::new("/tmp/wt"),
+            ReviewSource::Authored,
+        );
+
+        // SHAs are pinned from the fetched OIDs, not left empty (the drift fix).
+        assert_eq!(review.head_sha, "aaa111");
+        assert_eq!(review.base_sha, "bbb222");
+        // The rollup is summarized into ci_summary (1 pass, 1 fail).
+        let ci = review.ci_summary.expect("rollup yields a summary");
+        assert_eq!((ci.passed, ci.failed, ci.pending, ci.total), (1, 1, 0, 2));
+        assert_eq!(review.issue, IssueRef::new("NEX-7"));
+    }
+
+    #[test]
+    fn build_review_without_rollup_has_no_ci_summary() {
+        let pr = PrData {
+            number: 8,
+            head_ref_name: "feature/no-id".into(),
+            base_ref_name: "main".into(),
+            title: "No checks".into(),
+            body: String::new(),
+            state: "OPEN".into(),
+            url: "https://github.com/o/r/pull/8".into(),
+            repo_slug: String::new(),
+            status_check_rollup: Vec::new(),
+            head_ref_oid: String::new(),
+            base_ref_oid: String::new(),
+        };
+
+        let review = build_review_from_pr(
+            &pr,
+            String::new(),
+            std::path::Path::new("/tmp/wt"),
+            ReviewSource::Authored,
+        );
+
+        // No checks -> no summary (distinct from an all-green summary).
+        assert_eq!(review.ci_summary, None);
+        assert_eq!(review.head_sha, "");
+        assert_eq!(review.base_sha, "");
     }
 
     // -- decode_base64_content --

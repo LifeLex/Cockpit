@@ -14,7 +14,7 @@ use tauri::State;
 use cockpit_core::adapters::agent::SpawnConfig;
 use cockpit_core::adapters::github::{self, MirrorResult, ReviewEvent, SubmitReviewResult};
 use cockpit_core::adapters::linear;
-use cockpit_core::config::Config;
+use cockpit_core::config::{AgentPermissionMode, Config};
 use cockpit_core::diff_signals::{EvidenceSummary, compute_diff_signals};
 use cockpit_core::gate::Gated;
 use cockpit_core::kickoff::{self, KickoffResult};
@@ -29,6 +29,150 @@ use cockpit_core::trajectory::{self, TrajectorySummary};
 
 use crate::error::CommandError;
 use crate::state::AppState;
+
+// ---------------------------------------------------------------------------
+// Agent permission requests
+// ---------------------------------------------------------------------------
+
+/// Hand-typed payload describing a pending tool-permission request.
+///
+/// Emitted on the `"permission-request"` Tauri event by the broker forwarder
+/// (see `lib.rs`) and returned by [`list_pending_permissions`]. Both paths build
+/// it from a core
+/// [`PermissionRequest`](cockpit_core::hook_server::PermissionRequest) via
+/// [`PendingPermission::from_request`] so the push and pull shapes never drift.
+/// Hand-typed on the frontend (no `ts-rs`), mirroring
+/// [`AgentCompletedPayload`](crate::AgentCompletedPayload).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PendingPermission {
+    /// Unique id used to resolve the request via [`resolve_permission`].
+    pub id: String,
+    /// UI key of the object the requesting agent is working on (PR ref or
+    /// project id).
+    pub object_id: String,
+    /// The tool the agent is asking to run (e.g. `"Write"`, `"Bash"`).
+    pub tool_name: String,
+    /// One-line, human-glanceable summary derived from the tool input.
+    pub summary: String,
+    /// Wall-clock arrival time in epoch milliseconds.
+    pub requested_at_epoch_ms: u64,
+}
+
+impl PendingPermission {
+    /// Build a [`PendingPermission`] from a core
+    /// [`PermissionRequest`](cockpit_core::hook_server::PermissionRequest),
+    /// deriving the glanceable `summary` from the tool input.
+    pub(crate) fn from_request(req: &cockpit_core::hook_server::PermissionRequest) -> Self {
+        Self {
+            id: req.id.clone(),
+            object_id: req.object_id.clone(),
+            tool_name: req.tool_name.clone(),
+            summary: crate::permission_summary(&req.tool_name, &req.input),
+            requested_at_epoch_ms: req.requested_at_epoch_ms,
+        }
+    }
+}
+
+/// Resolve a pending tool-permission request by id (Invariant 5: an explicit
+/// human decision, never automatic or from agent output).
+///
+/// Delegates to the [`PermissionBroker`](cockpit_core::hook_server::PermissionBroker):
+/// returns whether the decision landed (`false` means the request was already
+/// resolved or timed out). Also emits a `"permission-resolved"` event
+/// `{ id, allow }` — always, even when the decision did not land — so every UI
+/// surface showing the request clears it, not just the one that acted.
+#[tauri::command]
+pub fn resolve_permission(
+    state: State<'_, Arc<AppState>>,
+    app_handle: tauri::AppHandle,
+    id: String,
+    allow: bool,
+) -> Result<bool, CommandError> {
+    use tauri::Emitter;
+
+    let landed = state.permission_broker.resolve(&id, allow);
+
+    // Broadcast the resolution so all surfaces clear the request. Hand-typed
+    // payload (no ts-rs), mirroring the other event payloads in this crate.
+    let _ = app_handle.emit(
+        "permission-resolved",
+        serde_json::json!({ "id": id, "allow": allow }),
+    );
+
+    Ok(landed)
+}
+
+/// List the currently-pending tool-permission requests.
+///
+/// Pull-path companion to the `"permission-request"` event: the frontend calls
+/// this to reconcile its queue on mount or after a `Lagged` broadcast drop.
+/// Maps the broker's snapshot into the same [`PendingPermission`] shape the
+/// event forwarder emits.
+#[tauri::command]
+pub fn list_pending_permissions(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<PendingPermission>, CommandError> {
+    Ok(state
+        .permission_broker
+        .pending()
+        .iter()
+        .map(PendingPermission::from_request)
+        .collect())
+}
+
+/// Build the MCP `approve`-tool URL for `object_id` against the local hook
+/// server.
+///
+/// The URL is baked into a spawned agent's `--mcp-config` so its permission
+/// prompts route to cockpit for a human decision (see
+/// [`SpawnConfig::apply_permission_mode`]). The object id (a PR ref or project
+/// id) is percent-encoded as a single path segment via [`encode_path_segment`]
+/// so it round-trips exactly through the axum `/mcp/{object_id}` route — PR refs
+/// contain `/` and `#`, which must not be read as path separators. The decoded
+/// path param the broker records as `object_id` therefore matches the reviewed
+/// object's key exactly.
+fn mcp_approve_url(hook_port: u16, object_id: &str) -> String {
+    format!(
+        "http://127.0.0.1:{hook_port}/mcp/{}",
+        encode_path_segment(object_id)
+    )
+}
+
+/// Percent-encode `s` as a single URL path segment (RFC 3986).
+///
+/// Encodes every byte outside the *unreserved* set (`A-Z a-z 0-9 - . _ ~`) as
+/// `%XX` with uppercase hex, so reserved characters — notably `/` and `#`, which
+/// appear in PR refs — are escaped rather than treated as path structure. axum
+/// percent-decodes the `{object_id}` path param back to the original bytes, so
+/// the encoded segment round-trips exactly (verified against axum 0.8's
+/// `Path<String>` extractor).
+///
+/// A tiny hand-rolled encoder is used deliberately: the `percent-encoding` crate
+/// is only a transitive dependency, and this avoids adding a direct one.
+fn encode_path_segment(s: &str) -> String {
+    /// Map a nibble (`0..=15`) to its uppercase-hex ASCII byte.
+    fn hex(nibble: u8) -> u8 {
+        match nibble {
+            0..=9 => b'0' + nibble,
+            _ => b'A' + (nibble - 10),
+        }
+    }
+
+    let mut out = String::with_capacity(s.len());
+    for &byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(hex(byte >> 4)));
+                out.push(char::from(hex(byte & 0x0f)));
+            }
+        }
+    }
+    out
+}
 
 /// List all reviews currently in the store.
 #[tauri::command]
@@ -628,7 +772,14 @@ async fn try_spawn_agent(
     prompt: &cockpit_core::prompt::AssembledPrompt,
 ) -> Result<cockpit_core::model::AgentRun, String> {
     let config = Config::load().map_err(|e| format!("config: {e}"))?;
-    let spawn_config = SpawnConfig::from_config(&config);
+    // Apply the configured permission mode, routing prompts to cockpit's MCP
+    // `approve` tool keyed by this review's PR ref. No blanket write allow is
+    // added: the fixer edits inside its own worktree (its cwd), and empirically
+    // those edits pass under the default (Approve) policy without ever routing
+    // through the Approve queue.
+    let approve_url = mcp_approve_url(config.hook_port, pr_ref.as_str());
+    let spawn_config = SpawnConfig::from_config(&config)
+        .apply_permission_mode(config.agent_permission_mode, Some(&approve_url));
     let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
 
     let spawn_result = cockpit_core::adapters::agent::spawn_agent(
@@ -760,10 +911,17 @@ async fn try_spawn_review_agent(
 ) -> Result<cockpit_core::model::AgentRun, String> {
     let config = Config::load().map_err(|e| format!("config: {e}"))?;
     // The findings file lives outside the worktree; a headless session can't
-    // be granted that write interactively, so pre-authorize it at spawn.
+    // be granted that write interactively, so pre-authorize it at spawn — both
+    // as an accessible dir (`with_extra_dir`) and as a scoped write auto-approval
+    // (`allow_write_under`) so the reviewer's findings write never routes through
+    // the Approve queue.
     let findings_dir =
         cockpit_core::config::findings_dir().map_err(|e| format!("findings dir: {e}"))?;
-    let spawn_config = SpawnConfig::from_config(&config).with_extra_dir(&findings_dir);
+    let approve_url = mcp_approve_url(config.hook_port, pr_ref.as_str());
+    let spawn_config = SpawnConfig::from_config(&config)
+        .apply_permission_mode(config.agent_permission_mode, Some(&approve_url))
+        .with_extra_dir(&findings_dir)
+        .allow_write_under(&findings_dir);
     let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
 
     let spawn_result = cockpit_core::adapters::agent::spawn_agent(
@@ -1597,9 +1755,15 @@ async fn spawn_plan_agent(
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
     // The plan document lives outside the worktree; pre-authorize the plans
-    // dir so the headless planner's Write isn't silently blocked.
+    // dir so the headless planner's Write isn't silently blocked — both as an
+    // accessible dir (`with_extra_dir`) and as a scoped write auto-approval
+    // (`allow_write_under`) so the plan write never routes through Approve.
     let plans_dir = cockpit_core::config::plans_dir()?;
-    let spawn_config = SpawnConfig::from_config(&config).with_extra_dir(&plans_dir);
+    let approve_url = mcp_approve_url(config.hook_port, object_id);
+    let spawn_config = SpawnConfig::from_config(&config)
+        .apply_permission_mode(config.agent_permission_mode, Some(&approve_url))
+        .with_extra_dir(&plans_dir)
+        .allow_write_under(&plans_dir);
     let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
 
     let spawn_result = cockpit_core::adapters::agent::spawn_agent(
@@ -1763,8 +1927,13 @@ fn spawn_background_fan_out(
         })
         .collect();
 
+    // Base spawn config without a permission mode: the per-review approve URL
+    // (keyed by each review's PR ref) is applied inside `run_fan_out`, since one
+    // config is reused across reviews with distinct object ids. The Stop-hook
+    // URL is derived from `hook_port` inside `run_fan_out`.
     let spawn_config = SpawnConfig::from_config(&config);
-    let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
+    let hook_port = config.hook_port;
+    let permission_mode = config.agent_permission_mode;
     let max_parallel = config.max_parallel_agents.max(1) as usize;
     let app_handle = app_handle.clone();
 
@@ -1776,7 +1945,8 @@ fn spawn_background_fan_out(
             jobs,
             max_parallel,
             spawn_config,
-            hook_url,
+            hook_port,
+            permission_mode,
         )
         .await;
     });
@@ -1798,9 +1968,12 @@ async fn run_fan_out(
     jobs: Vec<(Review, cockpit_core::prompt::AssembledPrompt)>,
     max_parallel: usize,
     spawn_config: SpawnConfig,
-    hook_url: String,
+    hook_port: u16,
+    permission_mode: AgentPermissionMode,
 ) {
     use tokio::sync::broadcast::error::RecvError;
+
+    let hook_url = format!("http://127.0.0.1:{hook_port}/hook/stop");
 
     // Subscribe before spawning so no completion can be missed.
     let mut completions = state.completion_tx.subscribe();
@@ -1810,6 +1983,15 @@ async fn run_fan_out(
         let mut pending: HashSet<String> = HashSet::new();
 
         for (review, prompt) in wave {
+            // Per-review permission wiring: route this implementer's prompts to
+            // cockpit's MCP `approve` tool keyed by its own PR ref. No blanket
+            // write allow — implementers edit inside their own worktree (cwd),
+            // and those edits empirically pass under the default (Approve)
+            // policy without routing through the Approve queue.
+            let approve_url = mcp_approve_url(hook_port, review.pr.as_str());
+            let review_spawn_config = spawn_config
+                .clone()
+                .apply_permission_mode(permission_mode, Some(&approve_url));
             let spawn_result = cockpit_core::adapters::agent::spawn_agent(
                 &review.worktree,
                 prompt,
@@ -1817,7 +1999,7 @@ async fn run_fan_out(
                 review.pr.as_str(),
                 &state.sessions,
                 &hook_url,
-                &spawn_config,
+                &review_spawn_config,
             )
             .await;
 
@@ -2502,7 +2684,13 @@ async fn restack_one(
 
     // Phase 2: if conflicts, spawn the conflict-resolver agent (async).
     if !clean {
-        let spawn_config = SpawnConfig::from_config(config);
+        // Apply the permission mode, routing prompts to cockpit's MCP `approve`
+        // tool keyed by this review's PR ref. No blanket write allow: the
+        // resolver edits inside its own worktree (cwd), and those edits
+        // empirically pass under the default (Approve) policy.
+        let approve_url = mcp_approve_url(config.hook_port, review.pr.as_str());
+        let spawn_config = SpawnConfig::from_config(config)
+            .apply_permission_mode(config.agent_permission_mode, Some(&approve_url));
         let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
         let worktree_path = review.worktree.clone();
 
@@ -3141,4 +3329,91 @@ pub async fn start_lsp_bridge(
     }
     bridges.insert(language, bridge);
     Ok(Some(url))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Percent-decode a path segment: the inverse of [`encode_path_segment`],
+    /// matching axum's `Path<String>` decoding semantics. Test-only, used to
+    /// prove the encode/decode round-trip stays exact without pulling in the
+    /// `percent-encoding` crate.
+    fn decode_path_segment(s: &str) -> String {
+        fn val(byte: u8) -> Option<u8> {
+            match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            }
+        }
+        let bytes = s.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%'
+                && i + 2 < bytes.len()
+                && let (Some(hi), Some(lo)) = (val(bytes[i + 1]), val(bytes[i + 2]))
+            {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8(out).expect("round-trip produces valid UTF-8")
+    }
+
+    #[test]
+    fn encode_path_segment_escapes_reserved_chars() {
+        assert_eq!(encode_path_segment("owner/repo#42"), "owner%2Frepo%2342");
+        assert_eq!(
+            encode_path_segment("https://github.com/o/r/pull/42"),
+            "https%3A%2F%2Fgithub.com%2Fo%2Fr%2Fpull%2F42"
+        );
+        // A space encodes as %20.
+        assert_eq!(encode_path_segment("a b"), "a%20b");
+    }
+
+    #[test]
+    fn encode_path_segment_preserves_unreserved() {
+        // RFC 3986 unreserved set passes through untouched.
+        let unreserved = "AZaz09-._~";
+        assert_eq!(encode_path_segment(unreserved), unreserved);
+    }
+
+    #[test]
+    fn encode_path_segment_round_trips_through_decode() {
+        // Decoding the encoded segment (as axum does) reproduces the input
+        // exactly, so the broker's recorded object_id matches the reviewed
+        // object's key.
+        for object_id in [
+            "owner/repo#42",
+            "https://github.com/o/r/pull/42",
+            "plain-project-id",
+            "proj:with spaces & symbols/#",
+            "a.b_c~d-e",
+        ] {
+            let encoded = encode_path_segment(object_id);
+            assert_eq!(
+                decode_path_segment(&encoded),
+                object_id,
+                "round-trip failed for {object_id:?} (encoded: {encoded:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_approve_url_composes_encoded_segment() {
+        assert_eq!(
+            mcp_approve_url(19876, "owner/repo#7"),
+            "http://127.0.0.1:19876/mcp/owner%2Frepo%237"
+        );
+    }
 }

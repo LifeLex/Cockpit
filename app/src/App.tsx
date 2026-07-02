@@ -1,9 +1,9 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { sendNotification } from "@tauri-apps/plugin-notification";
 import { useAppStore } from "./store";
-import type { ViewState, RestackProgress } from "./store";
+import type { ViewState, RestackProgress, PendingPermission } from "./store";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import type { ShortcutMap } from "./hooks/useKeyboardShortcuts";
 import { SHORTCUTS } from "./lib/shortcuts";
@@ -19,6 +19,7 @@ import { NewProjectView } from "./components/NewProjectView";
 import { SkillsView } from "./components/SkillsView";
 import { AgentEditor } from "./components/AgentEditor";
 import { SettingsView } from "./components/SettingsView";
+import { PermissionBanner } from "./components/PermissionBanner";
 import { CommandPalette } from "./components/CommandPalette";
 import { SkeletonList } from "./components/SkeletonCard";
 import { EmptyState } from "./components/EmptyState";
@@ -226,12 +227,19 @@ function App() {
   const batchStatus = useAppStore((s) => s.batchStatus);
   const restackPr = useAppStore((s) => s.restackPr);
   const applyRestackProgress = useAppStore((s) => s.applyRestackProgress);
+  const loadPendingPermissions = useAppStore((s) => s.loadPendingPermissions);
+  const applyPermissionRequest = useAppStore((s) => s.applyPermissionRequest);
+  const applyPermissionResolved = useAppStore((s) => s.applyPermissionResolved);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
   });
 
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+
+  // Permission-request ids we have already OS-notified for, so a re-broadcast of
+  // the same pending request never double-notifies (one notification per id).
+  const notifiedPermissionIds = useRef<Set<string>>(new Set<string>());
 
   const [prsDensity, setPrsDensity] = useState<CardDensity>(loadDensity);
 
@@ -322,6 +330,9 @@ function App() {
     void fetchConfig();
     void fetchAuthoredPrs();
     void listProjects();
+    // Recover the pending-permission queue after a reload or a broadcast
+    // `Lagged` drop so blocked agents are not stranded off-screen.
+    void loadPendingPermissions();
 
     const unlisten = listen<CompletionEventPayload>("agent-completed", (event) => {
       const { object_id, mode, outcome } = event.payload;
@@ -379,6 +390,32 @@ function App() {
       },
     );
 
+    // Agent tool-permission gate: a spawned agent in Approve mode BLOCKS while a
+    // request is pending. Enqueue live requests and OS-notify once per id (the
+    // agent is blocked, but the user may be elsewhere). Resolutions from any
+    // surface clear the request everywhere.
+    const unlistenPermReq = listen<PendingPermission>(
+      "permission-request",
+      (event) => {
+        const permission = event.payload;
+        applyPermissionRequest(permission);
+        if (!notifiedPermissionIds.current.has(permission.id)) {
+          notifiedPermissionIds.current.add(permission.id);
+          void sendNotification({
+            title: "Agent waiting for permission",
+            body: permission.summary,
+          });
+        }
+      },
+    );
+
+    const unlistenPermResolved = listen<{ readonly id: string }>(
+      "permission-resolved",
+      (event) => {
+        applyPermissionResolved(event.payload.id);
+      },
+    );
+
     return () => {
       void unlisten.then((f) => {
         f();
@@ -387,6 +424,12 @@ function App() {
         f();
       });
       void unlistenRestack.then((f) => {
+        f();
+      });
+      void unlistenPermReq.then((f) => {
+        f();
+      });
+      void unlistenPermResolved.then((f) => {
         f();
       });
     };
@@ -399,6 +442,9 @@ function App() {
     listProjects,
     refreshActiveReview,
     applyRestackProgress,
+    loadPendingPermissions,
+    applyPermissionRequest,
+    applyPermissionResolved,
   ]);
 
   const filterReviews = useCallback(
@@ -904,7 +950,10 @@ function App() {
           collapsed={sidebarCollapsed}
           onToggleCollapse={toggleSidebar}
         />
-        <main className="flex-1 overflow-y-auto">{renderContent()}</main>
+        <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+          <PermissionBanner />
+          <main className="flex-1 overflow-y-auto">{renderContent()}</main>
+        </div>
       </div>
       <CommandPalette
         open={commandPaletteOpen}

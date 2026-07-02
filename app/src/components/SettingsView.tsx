@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../store";
 import type { Config } from "../bindings/Config";
 import type { SkillsGithub } from "../bindings/SkillsGithub";
+import type { AgentPermissionMode } from "../bindings/AgentPermissionMode";
 import { MONACO_THEMES } from "@/lib/monaco-themes";
 import {
   Card,
@@ -28,6 +29,7 @@ import {
   SlidersHorizontal,
   ChevronDown,
   Bell,
+  ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -42,6 +44,40 @@ const APP_THEME_OPTIONS = [
   { value: "light", label: "Light" },
   { value: "system", label: "System" },
 ] as const;
+
+/**
+ * Agent tool-permission modes, mapping each [`AgentPermissionMode`] to its
+ * user-facing label, helper copy, and tone. `Bypass` is danger-toned and gated
+ * behind a confirm because it disables every permission check (§9).
+ */
+const PERMISSION_MODE_OPTIONS = [
+  {
+    value: "Approve",
+    label: "Approve in cockpit",
+    helper:
+      "Agents pause and ask you here for anything outside their worktree. Requests time out to deny after 5 minutes.",
+    tone: "default",
+  },
+  {
+    value: "AcceptEdits",
+    label: "Auto-accept edits",
+    helper:
+      "File edits are approved automatically; shell commands and anything unusual still ask.",
+    tone: "default",
+  },
+  {
+    value: "Bypass",
+    label: "Bypass (dangerous)",
+    helper:
+      "Agents run with all permission checks disabled. Only for fully trusted repos.",
+    tone: "danger",
+  },
+] as const satisfies readonly {
+  readonly value: AgentPermissionMode;
+  readonly label: string;
+  readonly helper: string;
+  readonly tone: "default" | "danger";
+}[];
 
 /** Shared field styling for the tokened `<select>` control. */
 const SELECT_CLASS =
@@ -103,6 +139,8 @@ export function SettingsView() {
   // --- Agent ---
   const [agentCommand, setAgentCommand] = useState("claude");
   const [maxParallelAgents, setMaxParallelAgents] = useState(3);
+  const [agentPermissionMode, setAgentPermissionMode] =
+    useState<AgentPermissionMode>("Approve");
 
   // --- Skills sync (owner/repo/branch/path/auto_sync) ---
   const [skillsOwner, setSkillsOwner] = useState("");
@@ -137,6 +175,7 @@ export function SettingsView() {
     setLinearProjectId(c.linear_project_id ?? "");
     setAgentCommand(c.agent_command);
     setMaxParallelAgents(c.max_parallel_agents);
+    setAgentPermissionMode(c.agent_permission_mode);
     setSkillsOwner(c.skills_github?.owner ?? "");
     setSkillsRepo(c.skills_github?.repo ?? "");
     setSkillsBranch(c.skills_github?.branch ?? "main");
@@ -204,6 +243,7 @@ export function SettingsView() {
       linear_project_id: linearProjectId !== "" ? linearProjectId : null,
       agent_command: agentCommand !== "" ? agentCommand : "claude",
       max_parallel_agents: maxParallelAgents > 0 ? maxParallelAgents : 1,
+      agent_permission_mode: agentPermissionMode,
       skills_github: skillsGithub,
       app_theme: appTheme !== "" ? appTheme : null,
       editor_theme: editorTheme !== "" ? editorTheme : null,
@@ -224,6 +264,7 @@ export function SettingsView() {
     linearProjectId,
     agentCommand,
     maxParallelAgents,
+    agentPermissionMode,
     skillsOwner,
     skillsRepo,
     skillsBranch,
@@ -235,6 +276,18 @@ export function SettingsView() {
     hookPort,
     saveConfig,
   ]);
+
+  const handleSelectPermissionMode = useCallback((mode: AgentPermissionMode) => {
+    // Bypass disables every permission check for spawned agents; require an
+    // explicit confirmation before arming it (§9 safety guardrails).
+    if (mode === "Bypass") {
+      const confirmed = window.confirm(
+        "Disable all permission checks for spawned agents?",
+      );
+      if (!confirmed) return;
+    }
+    setAgentPermissionMode(mode);
+  }, []);
 
   useEffect(() => {
     if (configError !== null) {
@@ -457,6 +510,65 @@ export function SettingsView() {
                 placeholder="3"
               />
             </SettingsRow>
+          </CardContent>
+        </Card>
+
+        {/* --------------------------------------------------------------- */}
+        {/* Agent permissions                                               */}
+        {/* --------------------------------------------------------------- */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-muted-foreground" />
+              <CardTitle>Agent permissions</CardTitle>
+            </div>
+            <CardDescription>
+              How cockpit handles tool-permission requests from spawned agents.
+              Changes affect future agent spawns only.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div
+              role="radiogroup"
+              aria-label="Agent permission mode"
+              className="flex flex-col gap-2"
+            >
+              {PERMISSION_MODE_OPTIONS.map((opt) => {
+                const selected = agentPermissionMode === opt.value;
+                const danger = opt.tone === "danger";
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    role="radio"
+                    aria-checked={selected}
+                    onClick={() => {
+                      handleSelectPermissionMode(opt.value);
+                    }}
+                    className={cn(
+                      "flex cursor-pointer flex-col gap-1 rounded-lg border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50",
+                      selected
+                        ? danger
+                          ? "border-danger/50 bg-danger/10"
+                          : "border-ring bg-muted"
+                        : "border-border bg-card hover:border-ring/60",
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        "text-sm font-medium",
+                        danger ? "text-danger" : "text-foreground",
+                      )}
+                    >
+                      {opt.label}
+                    </span>
+                    <span className="text-xs leading-relaxed text-muted-foreground">
+                      {opt.helper}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
           </CardContent>
         </Card>
 

@@ -47,6 +47,31 @@ export interface RestackProgress {
 }
 
 /**
+ * A pending tool-permission request from a spawned agent, mirroring the
+ * backend's `"permission-request"` event payload and the shape returned by
+ * `list_pending_permissions` (hand-typed; no ts-rs binding).
+ *
+ * An agent in Approve mode BLOCKS while its request is pending (up to 5 minutes,
+ * then auto-denies), so a request is a live, time-sensitive gate the reviewer
+ * resolves with an explicit deliberate click (Invariant 5 / §9).
+ */
+export interface PendingPermission {
+  /** Unique id used to resolve the request via `resolve_permission`. */
+  readonly id: string;
+  /**
+   * UI key of the object the requesting agent works on: a PR ref for review
+   * agents, or a project id for plan agents.
+   */
+  readonly object_id: string;
+  /** The tool the agent asks to run (e.g. `"Write"`, `"Bash"`). */
+  readonly tool_name: string;
+  /** One-line, human-glanceable summary derived from the tool input. */
+  readonly summary: string;
+  /** Wall-clock arrival time in epoch milliseconds. */
+  readonly requested_at_epoch_ms: number;
+}
+
+/**
  * Navigation state discriminated union.
  *
  * Top-level views mirror the sidebar: PRs (default), Projects, Skills, Agents,
@@ -440,6 +465,43 @@ interface AppStore {
 
   /** Fetch PRs where the current user is requested for review. */
   fetchReviewRequests: () => Promise<void>;
+
+  // -------------------------------------------------------------------------
+  // Agent permissions (tool-approval gate)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Pending tool-permission requests from spawned agents, newest last.
+   *
+   * Fed from the `"permission-request"` / `"permission-resolved"` Tauri
+   * listeners (owned by `App`) and reconciled by {@link loadPendingPermissions};
+   * read by the global `PermissionBanner` and per-review `AgentPanel`.
+   */
+  readonly pendingPermissions: readonly PendingPermission[];
+
+  /**
+   * Reconcile the pending-permission queue from the backend (replace-all).
+   *
+   * Called on mount and after a broadcast `Lagged` drop to recover the exact
+   * server-side set. Non-fatal: a failed reconcile leaves the current queue.
+   */
+  loadPendingPermissions: () => Promise<void>;
+
+  /**
+   * Resolve a pending request by id with an explicit allow/deny decision
+   * (Invariant 5 / §9). Optimistically drops the request from the queue only
+   * when the backend confirms the decision landed; a `false` return (already
+   * resolved / timed out) leaves the queue to be reconciled by
+   * {@link loadPendingPermissions} or the `"permission-resolved"` event.
+   * Non-fatal: a failed resolve never blocks the loop.
+   */
+  resolvePermission: (id: string, allow: boolean) => Promise<void>;
+
+  /** Append a live request to the queue, deduping by id. */
+  applyPermissionRequest: (permission: PendingPermission) => void;
+
+  /** Remove a request from the queue by id (resolved elsewhere). */
+  applyPermissionResolved: (id: string) => void;
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
@@ -468,6 +530,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   prFetchLoading: false,
   filePairCache: new Map<string, FilePair>(),
   restackProgress: {},
+  pendingPermissions: [],
 
   fetchReviews: async () => {
     set({ loading: true, error: null });
@@ -1219,6 +1282,58 @@ export const useAppStore = create<AppStore>((set, get) => ({
     } catch (e: unknown) {
       set({ error: String(e), prFetchLoading: false });
     }
+  },
+
+  // -------------------------------------------------------------------------
+  // Agent permissions (tool-approval gate)
+  // -------------------------------------------------------------------------
+
+  loadPendingPermissions: async () => {
+    try {
+      const pending = await invoke<PendingPermission[]>(
+        "list_pending_permissions",
+      );
+      set({ pendingPermissions: pending });
+    } catch (e: unknown) {
+      // Non-fatal (Invariant 1): a failed reconcile leaves the current queue in
+      // place rather than blocking the loop.
+      console.error("list_pending_permissions failed", e);
+    }
+  },
+
+  resolvePermission: async (id: string, allow: boolean) => {
+    try {
+      const landed = await invoke<boolean>("resolve_permission", { id, allow });
+      // Optimistically drop the request only when the decision actually landed.
+      // A `false` return means it was already resolved / timed out server-side;
+      // leave the queue for loadPendingPermissions / the resolved event to
+      // reconcile so the UI does not disagree with the broker.
+      if (landed) {
+        set({
+          pendingPermissions: get().pendingPermissions.filter(
+            (p) => p.id !== id,
+          ),
+        });
+      }
+    } catch (e: unknown) {
+      // Non-fatal (Invariant 1): a failed resolve must not block the loop; the
+      // request stays pending so the user can retry.
+      console.error("resolve_permission failed", e);
+    }
+  },
+
+  applyPermissionRequest: (permission: PendingPermission) => {
+    const existing = get().pendingPermissions;
+    // Dedup by id: a re-broadcast, or a reconcile racing the live event, must
+    // not enqueue the same request twice.
+    if (existing.some((p) => p.id === permission.id)) return;
+    set({ pendingPermissions: [...existing, permission] });
+  },
+
+  applyPermissionResolved: (id: string) => {
+    set({
+      pendingPermissions: get().pendingPermissions.filter((p) => p.id !== id),
+    });
   },
 }));
 

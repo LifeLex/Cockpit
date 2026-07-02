@@ -238,6 +238,32 @@ impl LspLanguage {
 }
 
 // ---------------------------------------------------------------------------
+// AgentPermissionMode
+// ---------------------------------------------------------------------------
+
+/// How cockpit routes tool-permission requests from a spawned agent.
+///
+/// Claude Code runs headlessly (`--print`), where there is no interactive
+/// permission prompt: a request that falls outside the auto-allowed set is
+/// otherwise denied silently. This setting selects the CLI permission flags
+/// applied at spawn time (see
+/// [`crate::adapters::agent::SpawnConfig::apply_permission_mode`]).
+///
+/// Serializes with PascalCase variant names to match the sibling domain enums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub enum AgentPermissionMode {
+    /// Requests outside the auto-allowed set route to cockpit for an explicit
+    /// human decision (the default). Wired to an MCP permission-prompt tool.
+    #[default]
+    Approve,
+    /// File edits are auto-approved; everything else follows the default policy.
+    AcceptEdits,
+    /// Skip all permission checks. Dangerous — the UI carries the warning.
+    Bypass,
+}
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
@@ -318,6 +344,14 @@ pub struct Config {
     /// `None` or `0` disables background board polling. The UI default is 90.
     #[serde(default)]
     pub notify_poll_secs: Option<u16>,
+
+    // ----- Agent permissions -----
+    /// How cockpit routes tool-permission requests from spawned agents.
+    ///
+    /// Defaults to [`AgentPermissionMode::Approve`]: requests outside the
+    /// auto-allowed set route to cockpit for an explicit human decision.
+    #[serde(default)]
+    pub agent_permission_mode: AgentPermissionMode,
 }
 
 /// Default agent command value for serde deserialization.
@@ -351,6 +385,7 @@ impl Default for Config {
             skills_github: None,
             lsp_servers: LspServers::default(),
             notify_poll_secs: None,
+            agent_permission_mode: AgentPermissionMode::default(),
         }
     }
 }
@@ -522,6 +557,7 @@ mod tests {
         assert!(config.app_theme.is_none());
         assert!(config.editor_theme.is_none());
         assert!(config.notify_poll_secs.is_none());
+        assert_eq!(config.agent_permission_mode, AgentPermissionMode::Approve);
     }
 
     #[test]
@@ -556,6 +592,7 @@ mod tests {
                 typescript_command: None,
             },
             notify_poll_secs: Some(90),
+            agent_permission_mode: AgentPermissionMode::AcceptEdits,
         };
 
         let serialized = toml::to_string_pretty(&config).expect("serialize should succeed");
@@ -587,6 +624,10 @@ mod tests {
         assert_eq!(deserialized.skills_github, config.skills_github);
         assert_eq!(deserialized.lsp_servers, config.lsp_servers);
         assert_eq!(deserialized.notify_poll_secs, config.notify_poll_secs);
+        assert_eq!(
+            deserialized.agent_permission_mode,
+            config.agent_permission_mode
+        );
     }
 
     #[test]
@@ -618,6 +659,7 @@ mod tests {
             skills_github: None,
             lsp_servers: LspServers::default(),
             notify_poll_secs: None,
+            agent_permission_mode: AgentPermissionMode::default(),
         };
 
         // Save to a specific path (test helper).
@@ -974,6 +1016,57 @@ hook_port = 19876
         let serialized = toml::to_string_pretty(&lsp).expect("serialize");
         let deserialized: LspServers = toml::from_str(&serialized).expect("deserialize");
         assert_eq!(deserialized, lsp);
+    }
+
+    #[test]
+    fn agent_permission_mode_defaults_to_approve() {
+        assert_eq!(AgentPermissionMode::default(), AgentPermissionMode::Approve);
+        assert_eq!(
+            Config::default().agent_permission_mode,
+            AgentPermissionMode::Approve
+        );
+    }
+
+    #[test]
+    fn agent_permission_mode_round_trips_toml() {
+        for mode in [
+            AgentPermissionMode::Approve,
+            AgentPermissionMode::AcceptEdits,
+            AgentPermissionMode::Bypass,
+        ] {
+            let config = Config {
+                agent_permission_mode: mode,
+                ..Config::default()
+            };
+            let serialized = toml::to_string_pretty(&config).expect("serialize");
+            let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
+            assert_eq!(deserialized.agent_permission_mode, mode);
+        }
+    }
+
+    #[test]
+    fn agent_permission_mode_serializes_pascal_case() {
+        let serialized = toml::to_string_pretty(&Config {
+            agent_permission_mode: AgentPermissionMode::AcceptEdits,
+            ..Config::default()
+        })
+        .expect("serialize");
+        assert!(
+            serialized.contains("agent_permission_mode = \"AcceptEdits\""),
+            "expected PascalCase variant name, got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn agent_permission_mode_absent_defaults_to_approve() {
+        // A legacy config file without the field must default to Approve so
+        // existing installs keep working (migration).
+        let toml_str = r#"
+agent_command = "claude"
+hook_port = 19876
+"#;
+        let config: Config = toml::from_str(toml_str).expect("should parse");
+        assert_eq!(config.agent_permission_mode, AgentPermissionMode::Approve);
     }
 
     #[test]

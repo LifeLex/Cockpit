@@ -23,6 +23,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Event } from "../bindings/Event";
 import type { TrajectorySummary } from "../bindings/TrajectorySummary";
 import { useAppStore } from "../store";
+import type { PendingPermission } from "../store";
 import { elapsedSince } from "@/lib/relative-time";
 import {
   presentEvent,
@@ -30,7 +31,8 @@ import {
   AgentMark,
   type EventPresentation,
 } from "@/lib/agent-event";
-import { X, Trash2, Square, FileText, History } from "lucide-react";
+import { X, Trash2, Square, FileText, History, ShieldAlert } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 /**
@@ -402,6 +404,60 @@ function EndBanner({
   );
 }
 
+/**
+ * A pending tool-permission request, rendered as the newest (bottom) entry on
+ * the timeline: an amber shield tile, a `Permission — <tool>` title, the
+ * summary in mono, an elapsed-since chip, and explicit Deny / Allow buttons.
+ *
+ * The agent is BLOCKED on this decision (Approve mode, up to 5 minutes), so the
+ * entry is the live gate the reviewer acts on. Resolution is buttons-only — no
+ * keyboard shortcut binds Allow/Deny, so a stray keypress can never approve an
+ * agent action; every approval is an explicit, deliberate click (§9).
+ */
+function PermissionEntry({
+  perm,
+  onResolve,
+}: {
+  readonly perm: PendingPermission;
+  readonly onResolve: (id: string, allow: boolean) => Promise<void>;
+}) {
+  const elapsed = elapsedSince({
+    secs_since_epoch: Math.floor(perm.requested_at_epoch_ms / 1000),
+  });
+  return (
+    <li className="flex gap-3 rounded-md border border-warning/30 bg-warning/10 p-3">
+      <span className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md bg-warning/15 text-warning">
+        <ShieldAlert className="h-3.5 w-3.5" />
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="font-display text-[13px] font-semibold text-foreground">
+            Permission — {perm.tool_name}
+          </span>
+          <span className="ml-auto shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground/70">
+            {elapsed}
+          </span>
+        </div>
+        <p className="mt-0.5 break-words font-mono text-xs text-muted-foreground">
+          {perm.summary}
+        </p>
+        <div className="mt-2 flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void onResolve(perm.id, false)}
+          >
+            Deny
+          </Button>
+          <Button size="sm" onClick={() => void onResolve(perm.id, true)}>
+            Allow
+          </Button>
+        </div>
+      </div>
+    </li>
+  );
+}
+
 export function AgentPanel({ visible, objectId, onClose }: AgentPanelProps) {
   const initial = timelineFor(objectId);
   const [entries, setEntries] = useState<readonly TimelineEntry[]>(
@@ -416,6 +472,13 @@ export function AgentPanel({ visible, objectId, onClose }: AgentPanelProps) {
   const activeReview = useAppStore((s) => s.activeReview);
   const killAgent = useAppStore((s) => s.killAgent);
   const fetchTrajectorySummary = useAppStore((s) => s.fetchTrajectorySummary);
+  const pendingPermissions = useAppStore((s) => s.pendingPermissions);
+  const resolvePermission = useAppStore((s) => s.resolvePermission);
+  // Requests for THIS object render as the newest timeline entries; while any
+  // is pending the agent is blocked, which the header status line reflects.
+  const permsForObject = pendingPermissions.filter(
+    (p) => p.object_id === objectId,
+  );
   const reviewForObject = activeReview?.pr === objectId ? activeReview : null;
   const agentAttached = reviewForObject?.agent != null;
   const logPath = reviewForObject?.agent?.log_path ?? null;
@@ -543,13 +606,16 @@ export function AgentPanel({ visible, objectId, onClose }: AgentPanelProps) {
 
   if (!visible) return null;
 
-  const modeLabel = stopped
-    ? "stopped"
-    : phase === "failed"
-      ? "failed"
-      : isRunning
-        ? "running"
-        : "idle";
+  const modeLabel =
+    permsForObject.length > 0
+      ? "waiting for permission"
+      : stopped
+        ? "stopped"
+        : phase === "failed"
+          ? "failed"
+          : isRunning
+            ? "running"
+            : "idle";
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-card">
@@ -623,31 +689,48 @@ export function AgentPanel({ visible, objectId, onClose }: AgentPanelProps) {
 
       {/* Timeline */}
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-        {entries.length === 0 || anchor === null ? (
-          trajectory !== null ? (
-            <TrajectoryCard summary={trajectory} />
-          ) : (
-            <EmptyState />
-          )
-        ) : (
-          <>
-            <ol className="list-none">
-              {entries.map((entry, idx) => (
-                <TimelineRow
-                  key={entry.seq}
-                  presentation={presentEvent(entry.event)}
-                  elapsedLabel={formatElapsed(
-                    Math.max(0, entry.timestamp - anchor),
-                  )}
-                  isLast={idx === entries.length - 1}
-                  running={isRunning}
-                />
-              ))}
-            </ol>
-            {(phase === "complete" || phase === "failed") && (
-              <EndBanner phase={phase} stopped={stopped} />
-            )}
-          </>
+        {entries.length === 0 || anchor === null
+          ? // No live timeline: fall back to the last-run card / empty state,
+            // unless a permission request is pending (rendered below).
+            permsForObject.length === 0 &&
+            (trajectory !== null ? (
+              <TrajectoryCard summary={trajectory} />
+            ) : (
+              <EmptyState />
+            ))
+          : (
+            <>
+              <ol className="list-none">
+                {entries.map((entry, idx) => (
+                  <TimelineRow
+                    key={entry.seq}
+                    presentation={presentEvent(entry.event)}
+                    elapsedLabel={formatElapsed(
+                      Math.max(0, entry.timestamp - anchor),
+                    )}
+                    isLast={idx === entries.length - 1}
+                    running={isRunning}
+                  />
+                ))}
+              </ol>
+              {(phase === "complete" || phase === "failed") && (
+                <EndBanner phase={phase} stopped={stopped} />
+              )}
+            </>
+          )}
+
+        {/* Pending permission requests: the newest timeline events, at the
+            bottom. Each is an explicit Allow/Deny gate on a blocked agent. */}
+        {permsForObject.length > 0 && (
+          <ul className={cn("list-none space-y-2", entries.length > 0 && "mt-3")}>
+            {permsForObject.map((perm) => (
+              <PermissionEntry
+                key={perm.id}
+                perm={perm}
+                onResolve={resolvePermission}
+              />
+            ))}
+          </ul>
         )}
       </div>
     </div>

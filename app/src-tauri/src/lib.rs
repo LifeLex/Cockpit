@@ -77,13 +77,27 @@ fn set_macos_dock_icon() {
 pub fn run() {
     let (completion_tx, completion_rx) = cockpit_core::hook_server::completion_channel();
 
-    let app_state = Arc::new(AppState::new_with_completion_tx(completion_tx));
+    // One permission broker for the whole app: a clone lives in AppState (so
+    // commands can resolve/enumerate), a clone backs the hook server's MCP
+    // `approve` route, and the setup hook subscribes to forward requests to the
+    // frontend.
+    let permission_broker = cockpit_core::hook_server::PermissionBroker::new();
+
+    let app_state = Arc::new(AppState::new_with_completion_tx(
+        completion_tx,
+        permission_broker.clone(),
+    ));
     let shell_sessions = commands::shell::ShellSessions::default();
 
     // Clone handles needed by the setup hook before app_state is moved
     // into `.manage()` (which takes ownership of the Arc).
     let hook_sessions = app_state.sessions.clone();
     let hook_completion_tx = app_state.completion_tx.clone();
+
+    // Subscribe to the broker before the setup hook so no permission request can
+    // be missed between startup and the forwarder task spawning; the broker
+    // itself moves into the hook-server serve task below.
+    let permission_rx = permission_broker.subscribe();
 
     // Restore persisted session state (D5) before any observer runs, so the
     // flush task's baseline revision reflects the loaded data. A missing or
@@ -195,7 +209,32 @@ pub fn run() {
                 }
             });
 
-            // Start the hook server for agent completion callbacks.
+            // Forward tool-permission requests from the broker to the frontend.
+            // Each request the MCP `approve` endpoint registers is broadcast
+            // here and emitted as a hand-typed `"permission-request"` payload so
+            // the UI can render the pending queue live. A `Lagged` drop is
+            // tolerated (the frontend reconciles via `list_pending_permissions`
+            // on demand); the loop ends only when the broker is gone (shutdown).
+            {
+                let permission_handle = app.handle().clone();
+                let mut permission_rx = permission_rx;
+                tauri::async_runtime::spawn(async move {
+                    use tokio::sync::broadcast::error::RecvError;
+                    loop {
+                        match permission_rx.recv().await {
+                            Ok(req) => {
+                                let payload = commands::PendingPermission::from_request(&req);
+                                let _ = permission_handle.emit("permission-request", &payload);
+                            }
+                            Err(RecvError::Lagged(_)) => continue,
+                            Err(RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+
+            // Start the hook server for agent completion callbacks and the MCP
+            // permission endpoint (`serve_with_broker` mounts both routes).
             {
                 let hook_state = cockpit_core::hook_server::HookState {
                     session_map: hook_sessions,
@@ -203,8 +242,12 @@ pub fn run() {
                 };
                 let config = cockpit_core::config::Config::load().unwrap_or_default();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) =
-                        cockpit_core::hook_server::serve(hook_state, config.hook_port).await
+                    if let Err(e) = cockpit_core::hook_server::serve_with_broker(
+                        hook_state,
+                        permission_broker,
+                        config.hook_port,
+                    )
+                    .await
                     {
                         eprintln!("hook server error: {e}");
                     }
@@ -330,6 +373,8 @@ pub fn run() {
             commands::shell::shell_kill,
             commands::open_in_editor,
             commands::start_lsp_bridge,
+            commands::resolve_permission,
+            commands::list_pending_permissions,
         ])
         .run(tauri::generate_context!())
         // INVARIANT: if Tauri fails to start there is nothing to recover --
@@ -707,6 +752,54 @@ fn extract_pr_number(pr_str: &str) -> Option<u64> {
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------
+// Permission-request summary
+// ---------------------------------------------------------------------------
+
+/// Maximum length, in characters, of a permission-request summary line.
+///
+/// The summary is a one-glance hint for the permission queue, not the full tool
+/// input (which the frontend can expand). Longer values are truncated on a char
+/// boundary and marked with an ellipsis.
+const PERMISSION_SUMMARY_MAX_CHARS: usize = 160;
+
+/// Build a one-line, human-glanceable summary of a tool-permission request's
+/// input for the permission queue UI.
+///
+/// Pure and deterministic (unit-tested): for `Write`/`Edit` it surfaces the
+/// target `file_path`; for `Bash` the `command`; for any other tool a compact
+/// JSON rendering of the whole input. Every branch is truncated to
+/// [`PERMISSION_SUMMARY_MAX_CHARS`]. A `Write`/`Edit` without a string
+/// `file_path`, or a `Bash` without a string `command`, falls back to the
+/// compact-JSON rendering so no request ever shows an empty summary.
+pub(crate) fn permission_summary(tool_name: &str, input: &serde_json::Value) -> String {
+    let field = |key: &str| {
+        input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let raw = match tool_name {
+        "Write" | "Edit" => field("file_path").unwrap_or_else(|| input.to_string()),
+        "Bash" => field("command").unwrap_or_else(|| input.to_string()),
+        _ => input.to_string(),
+    };
+    truncate_summary(&raw)
+}
+
+/// Truncate `s` to [`PERMISSION_SUMMARY_MAX_CHARS`] characters on a char
+/// boundary, appending an ellipsis when truncation occurred.
+fn truncate_summary(s: &str) -> String {
+    match s.char_indices().nth(PERMISSION_SUMMARY_MAX_CHARS) {
+        Some((idx, _)) => {
+            let mut out = s[..idx].to_string();
+            out.push('…');
+            out
+        }
+        None => s.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,5 +1257,71 @@ mod tests {
             Some(NOTIFY_POLL_FLOOR_SECS)
         );
         assert_eq!(notify_interval_secs(&config_with(Some(90))), Some(90));
+    }
+
+    // ----- permission_summary -----
+
+    #[test]
+    fn permission_summary_write_uses_file_path() {
+        let input = serde_json::json!({ "file_path": "/repo/src/main.rs", "content": "x" });
+        assert_eq!(
+            permission_summary("Write", &input),
+            "/repo/src/main.rs".to_string()
+        );
+    }
+
+    #[test]
+    fn permission_summary_edit_uses_file_path() {
+        let input =
+            serde_json::json!({ "file_path": "/repo/a.rs", "old_string": "a", "new_string": "b" });
+        assert_eq!(permission_summary("Edit", &input), "/repo/a.rs".to_string());
+    }
+
+    #[test]
+    fn permission_summary_bash_uses_command() {
+        let input = serde_json::json!({ "command": "cargo test --all" });
+        assert_eq!(
+            permission_summary("Bash", &input),
+            "cargo test --all".to_string()
+        );
+    }
+
+    #[test]
+    fn permission_summary_unknown_tool_uses_compact_json() {
+        let input = serde_json::json!({ "url": "https://example.com", "n": 1 });
+        // Compact JSON: no spaces after `:`/`,`.
+        assert_eq!(
+            permission_summary("WebFetch", &input),
+            r#"{"n":1,"url":"https://example.com"}"#.to_string()
+        );
+    }
+
+    #[test]
+    fn permission_summary_falls_back_to_json_when_field_missing() {
+        // A Write with no string file_path falls back to compact JSON, never
+        // an empty summary.
+        let input = serde_json::json!({ "content": "x" });
+        assert_eq!(
+            permission_summary("Write", &input),
+            r#"{"content":"x"}"#.to_string()
+        );
+    }
+
+    #[test]
+    fn permission_summary_truncates_long_input_with_ellipsis() {
+        let long = "a".repeat(500);
+        let input = serde_json::json!({ "command": long });
+        let summary = permission_summary("Bash", &input);
+        // 160 chars kept plus a single ellipsis marker.
+        assert_eq!(summary.chars().count(), PERMISSION_SUMMARY_MAX_CHARS + 1);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn permission_summary_keeps_short_input_verbatim() {
+        let input = serde_json::json!({ "command": "ls" });
+        let summary = permission_summary("Bash", &input);
+        assert_eq!(summary, "ls");
+        assert!(!summary.ends_with('…'));
     }
 }

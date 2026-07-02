@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 use cockpit_core::adapters::agent::SessionMap;
 use cockpit_core::adapters::lsp::LspBridge;
 use cockpit_core::config::LspLanguage;
-use cockpit_core::hook_server::CompletionEvent;
+use cockpit_core::hook_server::{CompletionEvent, PermissionBroker};
 use cockpit_core::store::{ProjectStore, ReviewStore};
 
 /// Holds core handles shared across the Tauri app.
@@ -35,6 +35,14 @@ pub struct AppState {
     /// them to the frontend via Tauri events.
     pub completion_tx: broadcast::Sender<CompletionEvent>,
 
+    /// Routes headless-agent tool-permission requests to a human decision.
+    ///
+    /// Created once at startup and shared (cloned) with the hook server's MCP
+    /// `approve` endpoint. Commands resolve pending requests and enumerate the
+    /// queue through this handle; the setup hook subscribes to it to forward
+    /// requests to the frontend. Cloneable — all clones share one registry.
+    pub permission_broker: PermissionBroker,
+
     /// Running Monaco LSP bridges, one per language, started lazily.
     ///
     /// Held here so their lifetime is tied to the app: dropping `AppState`
@@ -46,13 +54,18 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Create a new `AppState` with the given completion channel sender.
-    pub fn new_with_completion_tx(completion_tx: broadcast::Sender<CompletionEvent>) -> Self {
+    /// Create a new `AppState` with the given completion channel sender and
+    /// permission broker.
+    pub fn new_with_completion_tx(
+        completion_tx: broadcast::Sender<CompletionEvent>,
+        permission_broker: PermissionBroker,
+    ) -> Self {
         Self {
             reviews: ReviewStore::new(),
             projects: ProjectStore::new(),
             sessions: SessionMap::new(),
             completion_tx,
+            permission_broker,
             lsp_bridges: Mutex::new(HashMap::new()),
         }
     }

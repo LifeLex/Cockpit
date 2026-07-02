@@ -71,7 +71,6 @@ export function CommandPalette({
   const navigateToSettings = useAppStore((s) => s.navigateToSettings);
   const navigateToDiff = useAppStore((s) => s.navigateToDiff);
   const fetchReviews = useAppStore((s) => s.fetchReviews);
-  const fetchFrontier = useAppStore((s) => s.fetchFrontier);
   const fetchAuthoredPrs = useAppStore((s) => s.fetchAuthoredPrs);
 
   const close = useCallback(() => {
@@ -181,7 +180,6 @@ export function CommandPalette({
               onSelect={() => {
                 handleSelect(() => {
                   void fetchReviews();
-                  void fetchFrontier();
                   void fetchAuthoredPrs();
                 });
               }}

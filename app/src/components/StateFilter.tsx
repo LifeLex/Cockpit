@@ -22,6 +22,7 @@ const GATE_STATES = [
   "Dispatched",
   "Reworked",
   "Approved",
+  "Merged",
 ] as const satisfies readonly GateState[];
 
 /** Tailwind classes for an active (selected) chip of the given state. */

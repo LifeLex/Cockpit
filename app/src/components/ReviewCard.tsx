@@ -20,6 +20,12 @@ interface ReviewCardProps {
   readonly onRestack: (pr: string) => void;
   /** Presentation density; defaults to the roomy card layout. */
   readonly density?: CardDensity;
+  /**
+   * Whether the card is rendered inside a stack container. When true the text
+   * stack-relation hint is suppressed, since the container already shows the
+   * relationship visually via its rail and indentation.
+   */
+  readonly inStack?: boolean;
 }
 
 function assertNever(x: never): never {
@@ -220,11 +226,14 @@ export function ReviewCard({
   onAction,
   onRestack,
   density = "cards",
+  inStack = false,
 }: ReviewCardProps) {
   const { repo, number: prNumber } = parsePrDisplay(review.pr);
   const action = actionConfigForState(review.gate_state);
   const signal = cardSignal(review);
-  const relation = stackRelation(review);
+  // Inside a stack container the relationship is shown by the rail/indent, so
+  // the redundant text hint is suppressed there but kept in flat lists.
+  const relation = inStack ? null : stackRelation(review);
   const dimmed = isDimmed(review);
 
   if (density === "compact") {

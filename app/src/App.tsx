@@ -10,6 +10,7 @@ import { SHORTCUTS } from "./lib/shortcuts";
 import type { ShortcutId } from "./lib/shortcuts";
 import { Sidebar } from "./components/Sidebar";
 import { ReviewCard } from "./components/ReviewCard";
+import { StackContainer } from "./components/StackContainer";
 import { ProjectCard } from "./components/ProjectCard";
 import { ReviewWorkspace } from "./components/ReviewWorkspace";
 import { PlanView } from "./components/PlanView";
@@ -36,7 +37,7 @@ import {
   FolderOpen,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { sortByAttention } from "./lib/attention";
+import { buildBoardItems } from "./lib/stack-tree";
 import type { CardDensity } from "./components/ReviewCard";
 import type { GateState } from "./bindings/GateState";
 import type { Review } from "./bindings/Review";
@@ -184,7 +185,6 @@ function App() {
   const fetchAuthoredPrs = useAppStore((s) => s.fetchAuthoredPrs);
   const fetchReviewRequests = useAppStore((s) => s.fetchReviewRequests);
   const fetchReviews = useAppStore((s) => s.fetchReviews);
-  const fetchFrontier = useAppStore((s) => s.fetchFrontier);
   const fetchPlan = useAppStore((s) => s.fetchPlan);
   const fetchConfig = useAppStore((s) => s.fetchConfig);
   const listProjects = useAppStore((s) => s.listProjects);
@@ -259,7 +259,6 @@ function App() {
       },
       refresh: () => {
         void fetchReviews();
-        void fetchFrontier();
         void fetchAuthoredPrs();
       },
       "toggle-sidebar": () => {
@@ -288,7 +287,6 @@ function App() {
       navigateToAgents,
       navigateToSettings,
       fetchReviews,
-      fetchFrontier,
       fetchAuthoredPrs,
       toggleSidebar,
       view.kind,
@@ -308,7 +306,6 @@ function App() {
 
   useEffect(() => {
     void fetchReviews();
-    void fetchFrontier();
     void fetchConfig();
     void fetchAuthoredPrs();
     void listProjects();
@@ -323,7 +320,6 @@ function App() {
         isReviewMode(mode) && alreadySettledLocally(object_id);
 
       void fetchReviews();
-      void fetchFrontier();
       void listProjects();
       // Refresh the open plan (if any) so a completed Plan agent updates it.
       const currentView = useAppStore.getState().view;
@@ -351,7 +347,6 @@ function App() {
     };
   }, [
     fetchReviews,
-    fetchFrontier,
     fetchPlan,
     fetchConfig,
     fetchAuthoredPrs,
@@ -524,15 +519,26 @@ function App() {
           </span>
         </h2>
         <div className={prsDensity === "compact" ? "space-y-1.5" : "space-y-3"}>
-          {sortByAttention(group.reviews).map((review) => (
-            <ReviewCard
-              key={review.id}
-              review={review}
-              density={prsDensity}
-              onAction={handleReviewAction}
-              onRestack={handleRestack}
-            />
-          ))}
+          {buildBoardItems(group.reviews).map((item) =>
+            item.kind === "single" ? (
+              <ReviewCard
+                key={item.review.id}
+                review={item.review}
+                density={prsDensity}
+                onAction={handleReviewAction}
+                onRestack={handleRestack}
+              />
+            ) : (
+              <StackContainer
+                key={item.root.review.id}
+                root={item.root}
+                nodes={item.nodes}
+                density={prsDensity}
+                onAction={handleReviewAction}
+                onRestack={handleRestack}
+              />
+            ),
+          )}
         </div>
       </section>
     ));

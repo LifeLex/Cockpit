@@ -76,6 +76,26 @@ describe("StateFilter", () => {
     expect(onToggleStale).toHaveBeenCalledOnce();
   });
 
+  it("exposes Merged as a filterable chip so it is never hidden silently", async () => {
+    const user = userEvent.setup();
+    const onFilterChange = vi.fn<(s: GateState | null) => void>();
+    const withMerged = [...reviews, makeReview({ pr: "e", gate_state: "Merged" })];
+    render(
+      <StateFilter
+        reviews={withMerged}
+        activeFilter={null}
+        showStale={false}
+        onFilterChange={onFilterChange}
+        onToggleStale={vi.fn()}
+      />,
+    );
+
+    const chip = screen.getByRole("button", { name: "Merged (1)" });
+    expect(chip).toBeInTheDocument();
+    await user.click(chip);
+    expect(onFilterChange).toHaveBeenCalledWith("Merged");
+  });
+
   it("renders zero counts for an empty review list", () => {
     render(
       <StateFilter

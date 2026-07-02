@@ -63,7 +63,6 @@ describe("restackPr", () => {
     const restacked = makeReview({ pr: "pr-1", stale: false });
     useAppStore.setState({
       reviews: [stale],
-      frontier: [stale],
       authoredPrs: [stale],
       reviewRequests: [],
       activeReview: stale,
@@ -77,7 +76,6 @@ describe("restackPr", () => {
 
     const state = useAppStore.getState();
     expect(state.reviews[0]?.stale).toBe(false);
-    expect(state.frontier[0]?.stale).toBe(false);
     expect(state.authoredPrs[0]?.stale).toBe(false);
     expect(state.activeReview?.stale).toBe(false);
     expect(state.error).toBeNull();
@@ -151,7 +149,6 @@ describe("fixCi", () => {
     useAppStore.setState({
       activeReview: before,
       reviews: [before],
-      frontier: [before],
     });
     mockInvoke("fix_ci", (args) => {
       expect(args.pr).toBe("pr-1");
@@ -163,7 +160,6 @@ describe("fixCi", () => {
     const state = useAppStore.getState();
     expect(state.activeReview?.gate_state).toBe("Dispatched");
     expect(state.reviews[0]?.gate_state).toBe("Dispatched");
-    expect(state.frontier[0]?.gate_state).toBe("Dispatched");
     expect(state.error).toBeNull();
   });
 
@@ -214,7 +210,6 @@ describe("approveReview", () => {
     useAppStore.setState({
       activeReview: before,
       reviews: [before],
-      frontier: [before],
     });
     mockInvoke("approve_review", (args) => {
       expect(args.pr).toBe("pr-1");
@@ -226,7 +221,6 @@ describe("approveReview", () => {
     const state = useAppStore.getState();
     expect(state.activeReview?.gate_state).toBe("Approved");
     expect(state.reviews[0]?.gate_state).toBe("Approved");
-    expect(state.frontier[0]?.gate_state).toBe("Approved");
     expect(state.error).toBeNull();
   });
 
@@ -249,7 +243,6 @@ describe("mergeReview", () => {
     useAppStore.setState({
       activeReview: before,
       reviews: [before],
-      frontier: [before],
     });
     mockInvoke("merge_review", (args) => {
       expect(args.pr).toBe("pr-1");
@@ -376,7 +369,6 @@ describe("killAgent", () => {
     useAppStore.setState({
       activeReview: running,
       reviews: [running],
-      frontier: [running],
       authoredPrs: [running],
     });
     mockInvoke("kill_agent", (args) => {
@@ -390,7 +382,6 @@ describe("killAgent", () => {
     expect(state.activeReview?.gate_state).toBe("InReview");
     expect(state.activeReview?.agent).toBeNull();
     expect(state.reviews[0]?.agent).toBeNull();
-    expect(state.frontier[0]?.agent).toBeNull();
     expect(state.authoredPrs[0]?.agent).toBeNull();
     expect(state.error).toBeNull();
   });

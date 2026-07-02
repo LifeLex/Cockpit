@@ -36,7 +36,6 @@ type ViewState =
 
 interface AppStore {
   readonly reviews: readonly Review[];
-  readonly frontier: readonly Review[];
   readonly plan: ProjectPlan | null;
   readonly loading: boolean;
   readonly error: string | null;
@@ -54,7 +53,6 @@ interface AppStore {
   readonly activeDiff: DiffData | null;
 
   fetchReviews: () => Promise<void>;
-  fetchFrontier: () => Promise<void>;
   openReview: (pr: string) => Promise<void>;
 
   /** Navigate to the diff view for a specific PR. */
@@ -323,7 +321,6 @@ interface AppStore {
 
 export const useAppStore = create<AppStore>((set, get) => ({
   reviews: [],
-  frontier: [],
   plan: null,
   loading: false,
   error: null,
@@ -357,15 +354,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  fetchFrontier: async () => {
-    try {
-      const frontier = await invoke<Review[]>("get_frontier");
-      set({ frontier });
-    } catch (e: unknown) {
-      set({ error: String(e) });
-    }
-  },
-
   openReview: async (pr: string) => {
     set({ loading: true, error: null });
     try {
@@ -379,7 +367,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
         loading: false,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -402,7 +389,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
         loading: false,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -422,7 +408,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
       activeDiff: null,
     });
     void get().fetchReviews();
-    void get().fetchFrontier();
     void get().fetchAuthoredPrs();
   },
 
@@ -472,7 +457,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
       activeReview: review,
       authoredPrs: get().authoredPrs.map(replace),
       reviewRequests: get().reviewRequests.map(replace),
-      frontier: get().frontier.map(replace),
       reviews: get().reviews.map(replace),
     });
   },
@@ -490,7 +474,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
         activeReview: review,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -526,7 +509,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
         activeDiff: diff,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -606,7 +588,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
           get().activeReview?.pr === review.pr ? review : get().activeReview,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -623,7 +604,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
           get().activeReview?.pr === review.pr ? review : get().activeReview,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -682,7 +662,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
           get().activeReview?.pr === review.pr ? review : get().activeReview,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -699,7 +678,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
           get().activeReview?.pr === review.pr ? review : get().activeReview,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -790,7 +768,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
       });
       set({ kickoffLoading: false, kickoffResult: result });
       void get().fetchReviews();
-      void get().fetchFrontier();
       void get().listProjects();
     } catch (e: unknown) {
       set({ error: String(e), kickoffLoading: false });
@@ -807,7 +784,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
       set({
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -938,7 +914,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
         activeReview: review,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {

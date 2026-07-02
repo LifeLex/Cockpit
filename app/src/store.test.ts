@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import type { PendingPermission } from "./store";
 import type { Review } from "./bindings/Review";
 import type { CiCheck } from "./bindings/CiCheck";
 import type { SubmitReviewResult } from "./bindings/SubmitReviewResult";
@@ -722,6 +723,100 @@ describe("restackStack", () => {
     await useAppStore.getState().restackStack("pr-root");
 
     expect(useAppStore.getState().error).toContain("nothing to restack");
+  });
+});
+
+/** A minimal pending tool-permission request for the store-action tests. */
+function makePermission(
+  overrides: Partial<PendingPermission> = {},
+): PendingPermission {
+  return {
+    id: "perm-1",
+    object_id: "https://github.com/o/r/pull/1",
+    tool_name: "Write",
+    summary: "Write src/x.ts",
+    requested_at_epoch_ms: 1_700_000_000_000,
+    ...overrides,
+  };
+}
+
+describe("pending permissions", () => {
+  it("applyPermissionRequest enqueues and applyPermissionResolved removes (lifecycle)", () => {
+    const perm = makePermission({ id: "p-1" });
+
+    useAppStore.getState().applyPermissionRequest(perm);
+    expect(useAppStore.getState().pendingPermissions).toEqual([perm]);
+
+    useAppStore.getState().applyPermissionResolved("p-1");
+    expect(useAppStore.getState().pendingPermissions).toEqual([]);
+  });
+
+  it("applyPermissionRequest dedups by id (first-seen wins)", () => {
+    const perm = makePermission({ id: "p-1", summary: "original" });
+
+    useAppStore.getState().applyPermissionRequest(perm);
+    useAppStore
+      .getState()
+      .applyPermissionRequest({ ...perm, summary: "re-broadcast" });
+
+    const state = useAppStore.getState();
+    expect(state.pendingPermissions).toHaveLength(1);
+    expect(state.pendingPermissions[0]?.summary).toBe("original");
+  });
+
+  it("loadPendingPermissions replaces the queue from the backend", async () => {
+    useAppStore.setState({
+      pendingPermissions: [makePermission({ id: "stale" })],
+    });
+    const fresh = [makePermission({ id: "p-2" })];
+    mockInvoke("list_pending_permissions", () => fresh);
+
+    await useAppStore.getState().loadPendingPermissions();
+
+    expect(useAppStore.getState().pendingPermissions).toEqual(fresh);
+  });
+
+  it("resolvePermission drops the request when the decision lands (true)", async () => {
+    const perm = makePermission({ id: "p-1" });
+    useAppStore.setState({ pendingPermissions: [perm] });
+    mockInvoke("resolve_permission", (args) => {
+      expect(args.id).toBe("p-1");
+      expect(args.allow).toBe(true);
+      return true;
+    });
+
+    await useAppStore.getState().resolvePermission("p-1", true);
+
+    expect(useAppStore.getState().pendingPermissions).toEqual([]);
+  });
+
+  it("resolvePermission keeps the request when the decision did not land (false), reconciled by loadPendingPermissions", async () => {
+    const perm = makePermission({ id: "p-1" });
+    useAppStore.setState({ pendingPermissions: [perm] });
+    mockInvoke("resolve_permission", () => false);
+
+    await useAppStore.getState().resolvePermission("p-1", false);
+
+    // A `false` return (already resolved / timed out) leaves the queue as-is;
+    // the UI does not disagree with the broker until a reconcile happens.
+    expect(useAppStore.getState().pendingPermissions).toEqual([perm]);
+
+    mockInvoke("list_pending_permissions", () => []);
+    await useAppStore.getState().loadPendingPermissions();
+    expect(useAppStore.getState().pendingPermissions).toEqual([]);
+  });
+
+  it("resolvePermission is non-fatal on rejection (queue untouched, no blocking error)", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const perm = makePermission({ id: "p-1" });
+    useAppStore.setState({ pendingPermissions: [perm] });
+    mockInvokeReject("resolve_permission", "broker gone");
+
+    await useAppStore.getState().resolvePermission("p-1", true);
+
+    expect(useAppStore.getState().pendingPermissions).toEqual([perm]);
+    expect(useAppStore.getState().error).toBeNull();
+    spy.mockRestore();
   });
 });
 

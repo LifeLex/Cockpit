@@ -108,7 +108,16 @@ export function ReviewWorkspace({
   onRequestChanges,
   onMirrorComments,
 }: ReviewWorkspaceProps) {
-  const [activeTab, setActiveTab] = useState<WorkspaceTab>("diff");
+  // Land on the Agent tab when a spawned agent for this review is blocked on a
+  // permission decision, so the reviewer arriving from the PermissionBanner sees
+  // the Allow/Deny gate immediately rather than the diff.
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>(() =>
+    useAppStore
+      .getState()
+      .pendingPermissions.some((p) => p.object_id === review.pr)
+      ? "agent"
+      : "diff",
+  );
   const error = useAppStore((s) => s.error);
   const clearError = useAppStore((s) => s.clearError);
   const ensureReviewWorktree = useAppStore((s) => s.ensureReviewWorktree);

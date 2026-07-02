@@ -8,7 +8,7 @@ use std::fmt::Write;
 
 use sha2::{Digest, Sha256};
 
-use crate::model::{AgentMode, Anchor, Artifact, Comment, PlanDoc};
+use crate::model::{AgentMode, Anchor, Artifact, Comment, DiffData, PlanDoc};
 use crate::skills::Skill;
 
 /// The scope-guard text, verbatim from `SPEC.md` §9.
@@ -338,6 +338,97 @@ const PLAN_FORMAT: &str = "\
 ## Risks
 
 - <risk>";
+
+/// Input bundle for advisory-review prompt assembly.
+///
+/// Collects the data the read-only pre-pass reviewer ([`AgentMode::Review`])
+/// needs: the PR intent, the diff to inspect, and where to write its findings.
+/// This mirrors [`PlanInput`]'s shape — there are no comments, because the
+/// reviewer produces findings rather than addressing them.
+pub struct ReviewInput<'a> {
+    /// PR title, rendered first in the Intent section.
+    pub title: &'a str,
+    /// PR description / body, rendered after the title when non-empty.
+    pub body: &'a str,
+    /// The issue reference this review implements (e.g. `NEX-123`).
+    pub issue: &'a str,
+    /// Optional user-authored preamble, injected **verbatim** right after the
+    /// Intent section. `None` or empty is omitted (identical to builtin-only).
+    /// This is the [`AgentMode::Review`] override seam.
+    pub custom_preamble: Option<&'a str>,
+    /// The diff the reviewer inspects.
+    pub diff: &'a DiffData,
+    /// Absolute path the reviewer must write its findings JSON to.
+    ///
+    /// When set, an explicit "Output" section instructs the agent to write the
+    /// findings array to this exact path so cockpit can read and parse it back
+    /// with [`crate::findings::parse_findings`]. `None` omits the section (e.g.
+    /// for tests that only check the instruction shape).
+    pub output_path: Option<&'a std::path::Path>,
+    /// Pre-filtered project skills to inject as conventions.
+    ///
+    /// Pass an empty slice to omit the conventions section.
+    pub skills: &'a [Skill],
+}
+
+/// Assemble a deterministic advisory-review prompt per `SPEC.md` §9.
+///
+/// Sections appear in fixed order:
+/// 1. Intent (title, then body when non-empty, then issue)
+///    (then the custom preamble, verbatim; omitted when None/empty)
+/// 2. Current artifact (the diff)
+/// 3. Instruction (the read-only reviewer contract, [`REVIEW_INSTRUCTION`])
+/// 4. Output (the findings file path; omitted when no path is supplied)
+/// 5. Project conventions (skills)
+///
+/// Same inputs always produce the same output. This is the read-only
+/// counterpart of [`assemble_plan_prompt`]: it carries no comments because the
+/// reviewer emits findings rather than reworking against them.
+pub fn assemble_review_prompt(input: &ReviewInput<'_>) -> AssembledPrompt {
+    // INVARIANT: all writeln!/write! calls target a String, whose fmt::Write
+    // impl is infallible — unwrap() cannot panic.
+    let mut text = String::new();
+
+    // §1 — Intent (title, body, issue)
+    writeln!(text, "## Intent\n").unwrap();
+    writeln!(text, "{}\n", input.title).unwrap();
+    if !input.body.trim().is_empty() {
+        writeln!(text, "{}\n", input.body).unwrap();
+    }
+    writeln!(text, "Issue: {}\n", input.issue).unwrap();
+
+    // §1b — Custom preamble (verbatim override), fixed position after Intent.
+    write_custom_preamble(&mut text, input.custom_preamble);
+
+    // §2 — Current artifact (the diff)
+    writeln!(text, "## Current Artifact\n").unwrap();
+    writeln!(text, "{}\n", input.diff.raw).unwrap();
+
+    // §3 — Instruction
+    writeln!(text, "## Instruction\n").unwrap();
+    writeln!(text, "{REVIEW_INSTRUCTION}\n").unwrap();
+
+    // §4 — Output (only when a destination path is supplied)
+    if let Some(path) = input.output_path {
+        writeln!(text, "## Output\n").unwrap();
+        writeln!(
+            text,
+            "Write ONLY the JSON array of findings to `{}`. Output nothing else to that file.\n",
+            path.display()
+        )
+        .unwrap();
+    }
+
+    // §5 — Project conventions (skills)
+    let conventions = crate::skills::format_for_prompt(input.skills);
+    if !conventions.is_empty() {
+        text.push_str(&conventions);
+    }
+
+    let hash = sha256_hex(&text);
+
+    AssembledPrompt { text, hash }
+}
 
 /// Render an anchor as a human-readable location string.
 ///
@@ -1083,5 +1174,157 @@ mod tests {
             );
             assert_eq!(result.hash, base.hash);
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Advisory-review prompt tests
+    // ---------------------------------------------------------------
+
+    /// A helper diff artifact shared by the review-prompt tests.
+    fn review_diff() -> DiffData {
+        DiffData {
+            raw: "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,4 @@\n+fn added() {}".into(),
+        }
+    }
+
+    #[test]
+    fn review_prompt_golden() {
+        let diff = review_diff();
+        let output = std::path::Path::new("/tmp/cockpit-test/findings/owner-repo-42.json");
+        let input = ReviewInput {
+            title: "Add the widget system",
+            body: "Implements the base widget trait and a button widget.",
+            issue: "NEX-123",
+            custom_preamble: None,
+            diff: &diff,
+            output_path: Some(output),
+            skills: &[],
+        };
+
+        let result = assemble_review_prompt(&input);
+        let expected = include_str!("../tests/golden/review_prompt.txt");
+        assert_eq!(result.text, expected, "review-prompt golden file mismatch");
+    }
+
+    #[test]
+    fn review_prompt_deterministic() {
+        let diff = review_diff();
+        let input = ReviewInput {
+            title: "t",
+            body: "b",
+            issue: "NEX-1",
+            custom_preamble: None,
+            diff: &diff,
+            output_path: None,
+            skills: &[],
+        };
+        let a = assemble_review_prompt(&input);
+        let b = assemble_review_prompt(&input);
+        assert_eq!(a.hash, b.hash, "same inputs must produce same hash");
+        assert_eq!(a.hash.len(), 64, "SHA-256 hex digest is 64 chars");
+        assert!(
+            a.hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be hex"
+        );
+    }
+
+    #[test]
+    fn review_prompt_omits_output_when_no_path() {
+        let diff = review_diff();
+        let input = ReviewInput {
+            title: "t",
+            body: "b",
+            issue: "NEX-1",
+            custom_preamble: None,
+            diff: &diff,
+            output_path: None,
+            skills: &[],
+        };
+        let result = assemble_review_prompt(&input);
+        assert!(
+            !result.text.contains("## Output"),
+            "no output path should omit the Output section"
+        );
+    }
+
+    #[test]
+    fn review_prompt_omits_empty_body_line() {
+        let diff = review_diff();
+        let with_body = assemble_review_prompt(&ReviewInput {
+            title: "t",
+            body: "some body",
+            issue: "NEX-1",
+            custom_preamble: None,
+            diff: &diff,
+            output_path: None,
+            skills: &[],
+        });
+        let no_body = assemble_review_prompt(&ReviewInput {
+            title: "t",
+            body: "   ",
+            issue: "NEX-1",
+            custom_preamble: None,
+            diff: &diff,
+            output_path: None,
+            skills: &[],
+        });
+        assert!(with_body.text.contains("some body"));
+        assert!(!no_body.text.contains("some body"));
+        // A blank/whitespace body must not add stray content around the issue.
+        assert!(no_body.text.contains("## Intent\n\nt\n\nIssue: NEX-1\n"));
+    }
+
+    #[test]
+    fn review_prompt_sections_in_fixed_order() {
+        let diff = review_diff();
+        let output = std::path::Path::new("/tmp/findings/x.json");
+        let verbatim = "Focus on error handling paths.";
+        let skills = vec![Skill {
+            name: "error-handling".into(),
+            description: "Error conventions".into(),
+            tags: vec![],
+            body: "Use thiserror in core crates.".into(),
+            path: PathBuf::from("error-handling/SKILL.md"),
+            source: crate::skills::SkillSource::Local,
+        }];
+        let input = ReviewInput {
+            title: "Add widgets",
+            body: "Body text",
+            issue: "NEX-9",
+            custom_preamble: Some(verbatim),
+            diff: &diff,
+            output_path: Some(output),
+            skills: &skills,
+        };
+        let result = assemble_review_prompt(&input);
+
+        let intent = result.text.find("## Intent").expect("intent missing");
+        let custom = result
+            .text
+            .find("## Custom Instructions")
+            .expect("custom missing");
+        let artifact = result
+            .text
+            .find("## Current Artifact")
+            .expect("artifact missing");
+        let instruction = result
+            .text
+            .find("## Instruction")
+            .expect("instruction missing");
+        let output_pos = result.text.find("## Output").expect("output missing");
+        let conventions = result
+            .text
+            .find("## Project Conventions")
+            .expect("conventions missing");
+
+        assert!(
+            intent < custom
+                && custom < artifact
+                && artifact < instruction
+                && instruction < output_pos
+                && output_pos < conventions,
+            "review sections must appear in the fixed order"
+        );
+        assert!(result.text.contains(verbatim), "preamble injected verbatim");
     }
 }

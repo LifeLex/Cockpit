@@ -4,6 +4,7 @@
 //! identifier in generated branch names (e.g. `alejandro/nex-123-add-feature`),
 //! so cockpit links PR to issue by parsing the head branch. See `SPEC.md` S16.
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -1064,6 +1065,114 @@ pub async fn compare(repo_slug: &str, base_sha: &str, head_sha: &str) -> Result<
 }
 
 // ---------------------------------------------------------------------------
+// Contents API (full-file fallback)
+// ---------------------------------------------------------------------------
+
+/// Maximum file size served by [`contents_at`], in bytes.
+///
+/// Mirrors [`crate::adapters::git::MAX_FULL_FILE_BYTES`]: the full-file view
+/// feeds Monaco, so a blob past this cap yields `Ok(None)` and the UI stays on
+/// the diff view. GitHub independently omits the body for blobs over 1 MiB.
+pub const MAX_CONTENTS_BYTES: usize = 512 * 1024;
+
+/// Decode GitHub's base64 `content` field into UTF-8 text.
+///
+/// GitHub wraps the base64 payload across lines, so all ASCII whitespace is
+/// stripped before decoding. Returns `None` when the base64 is malformed or the
+/// decoded bytes are not valid UTF-8 (the full-file view is text-only).
+fn decode_base64_content(content: &str) -> Option<String> {
+    let stripped: String = content
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(stripped)
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Parse a GitHub contents-API response body into optional file text.
+///
+/// The response carries the file's bytes as base64 in `content` with an
+/// `encoding` field. Pure and independently testable; [`contents_at`] wraps it
+/// around the `gh` call. Returns:
+/// - `Ok(None)` when `size` exceeds [`MAX_CONTENTS_BYTES`], when GitHub omits
+///   the body for a large file (`content` empty with a non-zero `size`, as it
+///   does for blobs over 1 MiB), when `encoding` is not `base64`, or when the
+///   decoded bytes are not valid UTF-8 (the full-file view is text-only).
+/// - `Ok(Some(text))` otherwise (an empty file with `size` 0 decodes to `""`).
+fn parse_contents_response(json: &str) -> Result<Option<String>, Error> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| Error::ParseOutput(e.to_string()))?;
+
+    let size = value
+        .get("size")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    // Convert to usize for the cap comparison; a value too large for usize is,
+    // by definition, over the cap.
+    let size_bytes = usize::try_from(size).unwrap_or(usize::MAX);
+    if size_bytes > MAX_CONTENTS_BYTES {
+        return Ok(None);
+    }
+
+    // GitHub sets `encoding` to "none" (with an empty body) for oversize blobs.
+    let encoding = value
+        .get("encoding")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if encoding != "base64" {
+        return Ok(None);
+    }
+
+    let content = value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if content.is_empty() {
+        // An empty body with a non-zero size is GitHub omitting the content for
+        // a large file; an empty body with size 0 is a genuinely empty file.
+        if size > 0 {
+            return Ok(None);
+        }
+        return Ok(Some(String::new()));
+    }
+
+    Ok(decode_base64_content(content))
+}
+
+/// Fetch a file's text at a git ref via the GitHub contents API (fallback).
+///
+/// Runs `gh api repos/<slug>/contents/<path>?ref=<ref>` and decodes the base64
+/// body via [`parse_contents_response`]. This is the cross-repo fallback for the
+/// full-file view when no local checkout is available.
+///
+/// Returns `Ok(None)` when the file is absent at `ref_` (HTTP 404), too large
+/// (over [`MAX_CONTENTS_BYTES`], or omitted by GitHub for blobs over 1 MiB), or
+/// not UTF-8 text. Any other `gh` failure is an [`Error::GhCommand`].
+pub async fn contents_at(repo_slug: &str, ref_: &str, path: &str) -> Result<Option<String>, Error> {
+    let endpoint = format!("repos/{repo_slug}/contents/{path}?ref={ref_}");
+    let output = Command::new("gh").args(["api", &endpoint]).output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // A 404 means the path does not exist at this ref (an added/deleted file
+        // viewed from the wrong side) — a normal outcome, not an error. `gh api`
+        // exposes no structured status code on failure, and this adapter has no
+        // status-code discrimination precedent, so we match the "HTTP 404" text
+        // gh prints to stderr. This is fragile: a change to gh's error wording
+        // would break the discrimination.
+        if stderr.contains("HTTP 404") {
+            return Ok(None);
+        }
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_contents_response(&stdout)
+}
+
+// ---------------------------------------------------------------------------
 // Reviews (inline review comments)
 // ---------------------------------------------------------------------------
 
@@ -2081,5 +2190,98 @@ index 1111111..2222222 100644
         // frontier review was NOT added as its child.
         assert!(reviews[1].parents.is_empty());
         assert!(reviews[1].children.is_empty());
+    }
+
+    // -- decode_base64_content --
+
+    #[test]
+    fn decode_base64_strips_embedded_whitespace() {
+        // "hello world" is "aGVsbG8gd29ybGQ="; GitHub wraps the payload across
+        // lines, so an embedded newline must be stripped before decoding.
+        let wrapped = "aGVsbG8g\nd29ybGQ=\n";
+        assert_eq!(
+            decode_base64_content(wrapped).as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn decode_base64_invalid_utf8_is_none() {
+        // "//4=" decodes to bytes [0xFF, 0xFE], which are not valid UTF-8.
+        assert_eq!(decode_base64_content("//4="), None);
+    }
+
+    #[test]
+    fn decode_base64_malformed_is_none() {
+        assert_eq!(decode_base64_content("not valid base64 @@@"), None);
+    }
+
+    // -- parse_contents_response --
+
+    #[test]
+    fn parse_contents_decodes_body() {
+        let json = r#"{"encoding":"base64","size":11,"content":"aGVsbG8gd29ybGQ="}"#;
+        assert_eq!(
+            parse_contents_response(json).unwrap().as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn parse_contents_wrapped_base64() {
+        // Mirrors GitHub's actual wire format, where `content` carries embedded
+        // newlines inside the JSON string.
+        let json = "{\"encoding\":\"base64\",\"size\":11,\"content\":\"aGVsbG8g\\nd29ybGQ=\\n\"}";
+        assert_eq!(
+            parse_contents_response(json).unwrap().as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn parse_contents_empty_file_is_empty_string() {
+        let json = r#"{"encoding":"base64","size":0,"content":""}"#;
+        assert_eq!(parse_contents_response(json).unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn parse_contents_oversize_is_none() {
+        let json = format!(
+            r#"{{"encoding":"base64","size":{},"content":"aGk="}}"#,
+            MAX_CONTENTS_BYTES + 1
+        );
+        assert_eq!(parse_contents_response(&json).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_contents_omitted_large_body_is_none() {
+        // GitHub omits the body for blobs over 1 MiB: encoding "none", empty
+        // content, non-zero size.
+        let json = r#"{"encoding":"none","size":2000000,"content":""}"#;
+        assert_eq!(parse_contents_response(json).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_contents_empty_body_nonzero_size_is_none() {
+        // A within-cap size but empty base64 body still maps to None: GitHub only
+        // sends an empty body when it has withheld the content.
+        let json = r#"{"encoding":"base64","size":42,"content":""}"#;
+        assert_eq!(parse_contents_response(json).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_contents_binary_is_none() {
+        // base64 "//4=" decodes to non-UTF-8 bytes; the text-only view returns None.
+        let json = r#"{"encoding":"base64","size":2,"content":"//4="}"#;
+        assert_eq!(parse_contents_response(json).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_contents_malformed_json_errors() {
+        let result = parse_contents_response("not json at all");
+        assert!(
+            matches!(result, Err(Error::ParseOutput(_))),
+            "malformed JSON must be a ParseOutput error, got {result:?}"
+        );
     }
 }

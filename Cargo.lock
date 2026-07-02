@@ -572,6 +572,7 @@ name = "cockpit-core"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "dirs",
  "futures-util",
  "git2",

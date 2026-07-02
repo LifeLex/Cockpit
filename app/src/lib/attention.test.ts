@@ -259,3 +259,36 @@ describe("isFastLane", () => {
     expect(isFastLane(root)).toBe(true);
   });
 });
+
+describe("null ci_summary (wire shape regression)", () => {
+  // Serde serializes Option::None as `null` with the key present. The board
+  // crashed white when attentionRank dereferenced a null summary (the old
+  // guard only handled `undefined`). These lock the null path.
+  it("ranks a review whose ci_summary is null without throwing", () => {
+    const review = makeReview({ ci_summary: null });
+    expect(() => attentionRank(review)).not.toThrow();
+    // Null CI must rank identically to "no checks loaded" — no adjustment.
+    const withCi = makeReview({
+      id: "rev-ci",
+      ci_summary: { passed: 1, failed: 0, pending: 0, total: 1 },
+    });
+    expect(attentionRank(review)).toBeGreaterThan(attentionRank(withCi));
+  });
+
+  it("excludes a null-CI review from the fast lane (absent CI never qualifies)", () => {
+    const review = makeReview({ ci_summary: null, parents: [] });
+    expect(isFastLane(review)).toBe(false);
+  });
+
+  it("sorts a mixed board of null and populated summaries without throwing", () => {
+    const reviews = [
+      makeReview({ id: "a", ci_summary: null }),
+      makeReview({
+        id: "b",
+        ci_summary: { passed: 2, failed: 1, pending: 0, total: 3 },
+      }),
+      makeReview({ id: "c", ci_summary: null, stale: true }),
+    ];
+    expect(() => sortByAttention(reviews)).not.toThrow();
+  });
+});

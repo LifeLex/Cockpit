@@ -112,12 +112,12 @@ project: ProjectId | null,
  * Overwritten on each dispatch (see [`DispatchSnapshot`]). `None` before
  * the first dispatch and for legacy data.
  */
-dispatch_snapshot?: DispatchSnapshot, 
+dispatch_snapshot: DispatchSnapshot | null, 
 /**
  * Rolled-up CI status for this review's PR, when fetched. `None` until a
  * CI check read populates it, and for legacy data that predates the field.
  */
-ci_summary?: CiSummary, 
+ci_summary: CiSummary | null, 
 /**
  * Advisory findings from the read-only pre-pass reviewer, if it has run.
  *
@@ -135,4 +135,4 @@ conversation: Array<ConversationItem>,
  *
  * `None` before the first pre-pass and for legacy data.
  */
-last_reviewed_sha?: string, };
+last_reviewed_sha: string | null, };

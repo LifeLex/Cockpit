@@ -351,7 +351,6 @@ pub struct ProjectPlan {
     /// file is read back and parsed into [`Self::doc`]. `None` for plans that
     /// were loaded directly from a document rather than produced by an agent.
     #[serde(default)]
-    #[ts(optional)]
     pub plan_path: Option<PathBuf>,
 }
 
@@ -524,12 +523,10 @@ pub struct Review {
     /// Overwritten on each dispatch (see [`DispatchSnapshot`]). `None` before
     /// the first dispatch and for legacy data.
     #[serde(default)]
-    #[ts(optional)]
     pub dispatch_snapshot: Option<DispatchSnapshot>,
     /// Rolled-up CI status for this review's PR, when fetched. `None` until a
     /// CI check read populates it, and for legacy data that predates the field.
     #[serde(default)]
-    #[ts(optional)]
     pub ci_summary: Option<CiSummary>,
     /// Advisory findings from the read-only pre-pass reviewer, if it has run.
     ///
@@ -545,7 +542,6 @@ pub struct Review {
     ///
     /// `None` before the first pre-pass and for legacy data.
     #[serde(default)]
-    #[ts(optional)]
     pub last_reviewed_sha: Option<String>,
 }
 

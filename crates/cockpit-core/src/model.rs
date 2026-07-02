@@ -96,6 +96,8 @@ pub enum GateState {
     Reworked,
     /// Human approved — terminal for the loop.
     Approved,
+    /// PR merged — terminal. Only reviews reach this; plans never merge.
+    Merged,
 }
 
 /// Which mode the spawned agent runs in.
@@ -150,6 +152,21 @@ pub enum ProjectSource {
     AdHoc,
 }
 
+/// Which side of a diff an [`Anchor::DiffLine`] range refers to.
+///
+/// A comment can anchor to the old (pre-change) side or the new (post-change)
+/// side of the diff. Defaults to [`DiffSide::New`], matching the common case of
+/// commenting on added or changed lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub enum DiffSide {
+    /// The old (pre-change) side of the diff.
+    Old,
+    /// The new (post-change) side of the diff.
+    #[default]
+    New,
+}
+
 /// A location inside the current artifact that a [`Comment`] points to.
 ///
 /// Anchors are ephemeral — they reference the *current* artifact version only
@@ -167,6 +184,10 @@ pub enum Anchor {
         path: PathBuf,
         /// Inclusive start and end line in the current head.
         range: (u32, u32),
+        /// Which side of the diff the range refers to. Defaults to
+        /// [`DiffSide::New`] for legacy data that predates this field.
+        #[serde(default)]
+        side: DiffSide,
     },
 }
 
@@ -245,6 +266,22 @@ pub struct Comment {
     pub origin: CommentOrigin,
 }
 
+/// A read-only, single-cycle audit record of what the reviewer asked for at the
+/// moment comments were dispatched to an agent.
+///
+/// Captured by [`crate::model::Review::snapshot_dispatch`] and overwritten on
+/// the next dispatch. This is **not** a durable comment store: comments remain
+/// ephemeral and are cleared on `Reworked` (Invariant §0.4). The snapshot exists
+/// only so the UI can show "what was asked for" during the in-flight cycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct DispatchSnapshot {
+    /// The review's HEAD SHA at the moment of dispatch.
+    pub reviewed_sha: String,
+    /// The comments dispatched to the agent this cycle.
+    pub comments: Vec<Comment>,
+}
+
 /// A running or completed agent process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../app/src/bindings/")]
@@ -321,6 +358,12 @@ pub struct Review {
     pub issue: IssueRef,
     /// The GitHub PR opened for this review.
     pub pr: PrRef,
+    /// PR title. Empty for legacy data that predates this field.
+    #[serde(default)]
+    pub title: String,
+    /// PR description / body. Empty for legacy data that predates this field.
+    #[serde(default)]
+    pub body: String,
     /// Git branch name (e.g. `alejandro/nex-123-do-thing`).
     pub branch: String,
     /// Base branch — either `main` or a parent review's branch (stacked).
@@ -357,6 +400,13 @@ pub struct Review {
     /// The first-class [`Project`] this review belongs to, if any. `None` for
     /// ungrouped reviews (e.g. GitHub-imported PRs with no project attached).
     pub project: Option<ProjectId>,
+    /// Read-only audit record of the most recent dispatch cycle, if any.
+    ///
+    /// Overwritten on each dispatch (see [`DispatchSnapshot`]). `None` before
+    /// the first dispatch and for legacy data.
+    #[serde(default)]
+    #[ts(optional)]
+    pub dispatch_snapshot: Option<DispatchSnapshot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +423,8 @@ mod tests {
             id: ReviewId::new(id),
             issue: IssueRef::new(format!("ISSUE-{id}")),
             pr: PrRef::new(format!("owner/repo#{id}")),
+            title: String::new(),
+            body: String::new(),
             branch: format!("alejandro/{id}"),
             base: "main".into(),
             base_sha: "000".into(),
@@ -388,6 +440,7 @@ mod tests {
             agent: None,
             repo_slug: None,
             project: None,
+            dispatch_snapshot: None,
         }
     }
 
@@ -442,6 +495,7 @@ mod tests {
             anchor: Anchor::DiffLine {
                 path: PathBuf::from("src/main.rs"),
                 range: (10, 15),
+                side: DiffSide::New,
             },
             body: "fix this".into(),
             origin: CommentOrigin::Local,
@@ -502,5 +556,55 @@ mod tests {
             Artifact::Diff(data) => assert!(data.raw.starts_with("diff")),
             Artifact::Plan(_) => panic!("expected Diff"),
         }
+    }
+
+    #[test]
+    fn review_deserializes_without_new_intent_fields() {
+        // Legacy payloads predate `title`, `body`, and `dispatch_snapshot`; they
+        // must deserialize via `#[serde(default)]` rather than erroring.
+        let json = r#"{
+            "id": "r-1",
+            "issue": "ISSUE-1",
+            "pr": "owner/repo#1",
+            "branch": "alejandro/legacy",
+            "base": "main",
+            "base_sha": "000",
+            "source": "Frontier",
+            "worktree": "/tmp/wt",
+            "gate_state": "Pending",
+            "diff": { "raw": "" },
+            "head_sha": "abc",
+            "comments": [],
+            "parents": [],
+            "children": [],
+            "stale": false,
+            "agent": null,
+            "repo_slug": null,
+            "project": null
+        }"#;
+
+        let review: Review = serde_json::from_str(json).expect("legacy Review should deserialize");
+        assert_eq!(review.title, "");
+        assert_eq!(review.body, "");
+        assert_eq!(review.dispatch_snapshot, None);
+    }
+
+    #[test]
+    fn diff_line_anchor_deserializes_without_side() {
+        // Anchors persisted before the `side` field default to `New`.
+        let json = r#"{ "DiffLine": { "path": "src/main.rs", "range": [10, 15] } }"#;
+        let anchor: Anchor = serde_json::from_str(json).expect("legacy Anchor should deserialize");
+        match anchor {
+            Anchor::DiffLine { side, range, .. } => {
+                assert_eq!(side, DiffSide::New);
+                assert_eq!(range, (10, 15));
+            }
+            other => panic!("expected DiffLine, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_side_defaults_to_new() {
+        assert_eq!(DiffSide::default(), DiffSide::New);
     }
 }

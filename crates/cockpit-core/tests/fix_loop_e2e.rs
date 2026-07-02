@@ -151,6 +151,8 @@ fn make_review(worktree: PathBuf, branch: &str, head_sha: &str) -> Review {
         id: ReviewId::new("fix-loop-review-1"),
         issue: IssueRef::new("TEST-42"),
         pr: PrRef::new("owner/repo#7"),
+        title: String::new(),
+        body: String::new(),
         branch: branch.into(),
         base: "main".into(),
         base_sha: "000".into(),
@@ -168,6 +170,7 @@ fn make_review(worktree: PathBuf, branch: &str, head_sha: &str) -> Review {
         agent: None,
         repo_slug: None,
         project: None,
+        dispatch_snapshot: None,
     }
 }
 
@@ -211,6 +214,7 @@ async fn diff_gate_fix_loop_round_trip() {
             anchor: Anchor::DiffLine {
                 path: PathBuf::from("app.rs"),
                 range: (1, 1),
+                side: DiffSide::New,
             },
             body: "Add a fixed() function".into(),
             origin: CommentOrigin::Local,
@@ -420,6 +424,7 @@ async fn agent_failed_edge_preserves_comments_for_redispatch() {
             anchor: Anchor::DiffLine {
                 path: PathBuf::from("app.rs"),
                 range: (1, 1),
+                side: DiffSide::New,
             },
             body: "Fix the off-by-one".into(),
             origin: CommentOrigin::Local,

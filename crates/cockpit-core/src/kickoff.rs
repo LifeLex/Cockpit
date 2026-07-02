@@ -17,7 +17,7 @@ use crate::adapters::{agent, git, linear};
 use crate::config;
 use crate::dag;
 use crate::model::{
-    DiffData, GateState, IssueRef, PrRef, Project, ProjectId, ProjectPlan, ProjectRef,
+    DiffData, GateState, IssueRef, PlanDoc, PrRef, Project, ProjectId, ProjectPlan, ProjectRef,
     ProjectSource, Review, ReviewId, ReviewSource,
 };
 use crate::plan_parser;
@@ -180,6 +180,8 @@ fn build_review(
         id: ReviewId::new(format!("r-{}", issue.as_str())),
         issue: issue.clone(),
         pr: PrRef::new(format!("pending-{}", issue.as_str())),
+        title: String::new(),
+        body: String::new(),
         branch,
         base,
         base_sha: String::new(),
@@ -195,6 +197,7 @@ fn build_review(
         agent: None,
         repo_slug: None,
         project: project.cloned(),
+        dispatch_snapshot: None,
     }
 }
 
@@ -341,7 +344,7 @@ pub fn prepare_batch_worktrees(
     for (index, review) in reviews.iter_mut().enumerate() {
         let base_oid = git::ensure_worktree(repo, &review.worktree, &review.branch, &review.base)?;
         review.base_sha = base_oid.to_string();
-        let prompt = assemble_implement_prompt(review, project, custom_preamble);
+        let prompt = assemble_implement_prompt(review, project, None, custom_preamble);
         prepared.push(PreparedReview { index, prompt });
     }
     Ok(prepared)
@@ -398,11 +401,18 @@ pub async fn spawn_batch(
 
 /// Assemble a minimal implementation prompt for an issue.
 ///
-/// The implementer uses the issue reference and project context to build
-/// the initial PR from scratch.
-fn assemble_implement_prompt(
+/// The implementer uses the issue reference and project context to build the
+/// initial PR from scratch. When `approved_plan` is `Some`, the plan's raw
+/// markdown is threaded into the prompt as the contract the implementer must
+/// follow (`SPEC.md` §9); `None` omits the plan section (byte-identical to the
+/// no-plan prompt).
+///
+/// Exposed so the plan-approval fan-out can build the exact same implementer
+/// prompt without duplicating the intent text, while carrying the approved plan.
+pub fn assemble_implement_prompt(
     review: &Review,
     project: &ProjectRef,
+    approved_plan: Option<&PlanDoc>,
     custom_preamble: Option<&str>,
 ) -> prompt::AssembledPrompt {
     let intent = format!(
@@ -418,7 +428,7 @@ fn assemble_implement_prompt(
     let input = ReworkInput {
         intent: &intent,
         custom_preamble,
-        approved_plan: None,
+        approved_plan,
         artifact: &crate::model::Artifact::Diff(review.diff.clone()),
         comments: &[],
         ci_failures: None,
@@ -751,6 +761,8 @@ mod tests {
             id: ReviewId::new("r-1"),
             issue: IssueRef::new("ISS-1"),
             pr: PrRef::new("p-1"),
+            title: String::new(),
+            body: String::new(),
             branch: "b-1".into(),
             base: "main".into(),
             base_sha: String::new(),
@@ -766,6 +778,7 @@ mod tests {
             agent: None,
             repo_slug: None,
             project: None,
+            dispatch_snapshot: None,
         }];
 
         wire_children(&mut reviews);
@@ -778,6 +791,8 @@ mod tests {
             id: ReviewId::new("r-NEX-1"),
             issue: IssueRef::new("NEX-1"),
             pr: PrRef::new("pending-NEX-1"),
+            title: String::new(),
+            body: String::new(),
             branch: "alejandro/nex-1-thing".into(),
             base: "main".into(),
             base_sha: String::new(),
@@ -793,9 +808,10 @@ mod tests {
             agent: None,
             repo_slug: None,
             project: None,
+            dispatch_snapshot: None,
         };
 
-        let prompt = assemble_implement_prompt(&review, &ProjectRef::new("proj-1"), None);
+        let prompt = assemble_implement_prompt(&review, &ProjectRef::new("proj-1"), None, None);
         assert!(
             prompt.text.contains("NEX-1"),
             "prompt should mention the issue"

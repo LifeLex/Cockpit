@@ -6,8 +6,7 @@
 //! `SPEC.md` §7's transition table. Implementors supply only the accessor
 //! plumbing and the effectful `dispatch`/`reconcile`.
 
-use crate::model::{AgentRun, Comment, GateState, ProjectPlan, Review};
-use crate::workflow::TransitionEvent;
+use crate::model::{AgentRun, Comment, DispatchSnapshot, GateState, ProjectPlan, Review};
 
 /// Errors from gate state transitions.
 #[derive(Debug, thiserror::Error)]
@@ -30,13 +29,16 @@ pub enum Error {
     NotImplemented,
 }
 
-/// Record a transition for workflow automation.
+/// The outcome of applying an agent's completion to a [`Review`].
 ///
-/// Constructs a [`TransitionEvent`] from the object ID and the before/after
-/// states. Callers use this after a successful transition to feed into
-/// [`crate::workflow::evaluate_rules`].
-pub fn transition_event(object_id: &str, from: GateState, to: GateState) -> TransitionEvent {
-    crate::workflow::transition_event(object_id, from, to)
+/// Distinct from a raw `bool` so callers branch on intent, not truthiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentOutcome {
+    /// The agent advanced HEAD; the review moved `Dispatched → Reworked`.
+    Reworked,
+    /// The agent produced no new commit; the review returned `Dispatched →
+    /// InReview` with its comments preserved for re-dispatch.
+    Failed,
 }
 
 /// The shared review loop, implemented by both [`ProjectPlan`] and [`Review`].
@@ -223,6 +225,75 @@ impl Review {
     pub fn clear_stale(&mut self) {
         self.stale = false;
     }
+
+    /// `Approved → Merged`. Terminal.
+    ///
+    /// Inherent to [`Review`] rather than part of [`Gated`]: only reviews merge,
+    /// plans never do. Every other transition out of `Merged` is rejected by the
+    /// `Gated` methods, so `Merged` is a true sink.
+    pub fn mark_merged(&mut self) -> Result<(), Error> {
+        if self.gate_state != GateState::Approved {
+            return Err(Error::IllegalTransition {
+                from: self.gate_state,
+                event: "mark_merged",
+            });
+        }
+        self.gate_state = GateState::Merged;
+        Ok(())
+    }
+
+    /// Apply an agent's completion, using git HEAD — not agent output — as the
+    /// source of truth for whether work landed.
+    ///
+    /// Agent stdout can claim success while committing nothing; the only trusted
+    /// signal is whether the branch HEAD actually advanced. When `new_head` is
+    /// `Some(h)` and differs from the current [`Review::head_sha`], the rework
+    /// landed a commit: adopt the new HEAD, clear the agent handle, and move
+    /// `Dispatched → Reworked` (which clears comments). Otherwise the agent made
+    /// no progress: clear the agent handle and move `Dispatched → InReview`,
+    /// preserving comments for re-dispatch.
+    pub fn apply_agent_completion(
+        &mut self,
+        new_head: Option<String>,
+    ) -> Result<AgentOutcome, Error> {
+        // Validate the transition is legal before mutating any state: an illegal
+        // call (state != Dispatched) must leave head_sha and the agent handle
+        // untouched, not partially applied. Both downstream transitions
+        // (`mark_reworked` / `mark_agent_failed`) also require `Dispatched`, so
+        // this is the single precondition for either branch.
+        if self.gate_state != GateState::Dispatched {
+            return Err(Error::IllegalTransition {
+                from: self.gate_state,
+                event: "apply_agent_completion",
+            });
+        }
+        match new_head {
+            Some(h) if h != self.head_sha => {
+                self.head_sha = h;
+                self.agent = None;
+                self.mark_reworked()?;
+                Ok(AgentOutcome::Reworked)
+            }
+            _ => {
+                self.agent = None;
+                self.mark_agent_failed()?;
+                Ok(AgentOutcome::Failed)
+            }
+        }
+    }
+
+    /// Capture a [`DispatchSnapshot`] of the current HEAD and comments,
+    /// overwriting any previous snapshot.
+    ///
+    /// Records what the reviewer asked for at dispatch time for the current cycle
+    /// only. It is not a durable comment store (Invariant §0.4): comments stay
+    /// ephemeral and are cleared on `Reworked`.
+    pub fn snapshot_dispatch(&mut self) {
+        self.dispatch_snapshot = Some(DispatchSnapshot {
+            reviewed_sha: self.head_sha.clone(),
+            comments: self.comments.clone(),
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,9 +306,10 @@ mod tests {
 
     use super::*;
     use crate::model::{
-        Anchor, CommentId, CommentOrigin, DiffData, IssueRef, PlanDoc, PrRef, ProjectRef, ReviewId,
-        ReviewSource,
+        AgentMode, AgentRun, Anchor, CommentId, CommentOrigin, DiffData, DiffSide, IssueRef,
+        PlanDoc, PrRef, ProjectRef, ReviewId, ReviewSource,
     };
+    use std::time::SystemTime;
 
     /// Build a minimal `Review` starting at the given `GateState`.
     fn review_in(state: GateState) -> Review {
@@ -245,6 +317,8 @@ mod tests {
             id: ReviewId::new("r-1"),
             issue: IssueRef::new("ISSUE-1"),
             pr: PrRef::new("owner/repo#1"),
+            title: String::new(),
+            body: String::new(),
             branch: "alejandro/test".into(),
             base: "main".into(),
             base_sha: "000".into(),
@@ -260,6 +334,7 @@ mod tests {
             agent: None,
             repo_slug: None,
             project: None,
+            dispatch_snapshot: None,
         }
     }
 
@@ -288,6 +363,7 @@ mod tests {
             anchor: Anchor::DiffLine {
                 path: PathBuf::from("src/main.rs"),
                 range: (1, 5),
+                side: DiffSide::New,
             },
             body: "fix this".into(),
             origin: CommentOrigin::Local,
@@ -699,5 +775,173 @@ mod tests {
         let mut in_review = plan_in(GateState::InReview);
         in_review.approve().unwrap();
         assert_eq!(in_review.gate_state(), GateState::Approved);
+    }
+
+    // ---------------------------------------------------------------
+    // Merged (terminal) — Review-only
+    // ---------------------------------------------------------------
+
+    /// Build a minimal running agent handle for tests that need one attached.
+    fn dummy_agent() -> AgentRun {
+        AgentRun {
+            pid: 1234,
+            mode: AgentMode::Fix,
+            started_at: SystemTime::UNIX_EPOCH,
+            prompt_hash: "hash".into(),
+            log_path: PathBuf::from("/tmp/agent.log"),
+        }
+    }
+
+    #[test]
+    fn approved_to_merged() {
+        let mut r = review_in(GateState::Approved);
+        r.mark_merged().unwrap();
+        assert_eq!(r.gate_state(), GateState::Merged);
+    }
+
+    #[test]
+    fn mark_merged_only_from_approved() {
+        for state in [
+            GateState::Pending,
+            GateState::InReview,
+            GateState::Dispatched,
+            GateState::Reworked,
+            GateState::Merged,
+        ] {
+            let mut r = review_in(state);
+            assert!(
+                r.mark_merged().is_err(),
+                "mark_merged from {state:?} must be illegal"
+            );
+        }
+    }
+
+    #[test]
+    fn merged_is_terminal() {
+        // Every other transition out of Merged is rejected — it is a true sink.
+        let mut r = review_in(GateState::Merged);
+        assert!(r.open().is_err(), "open from Merged");
+
+        let mut r = review_in(GateState::Merged);
+        add_comment(&mut r);
+        assert!(r.request_changes().is_err(), "request_changes from Merged");
+
+        let mut r = review_in(GateState::Merged);
+        assert!(r.approve().is_err(), "approve from Merged");
+
+        let mut r = review_in(GateState::Merged);
+        assert!(r.mark_reworked().is_err(), "mark_reworked from Merged");
+
+        let mut r = review_in(GateState::Merged);
+        assert!(
+            r.mark_agent_failed().is_err(),
+            "mark_agent_failed from Merged"
+        );
+
+        let mut r = review_in(GateState::Merged);
+        assert!(r.mark_merged().is_err(), "mark_merged from Merged");
+    }
+
+    // ---------------------------------------------------------------
+    // apply_agent_completion — HEAD is authoritative
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn apply_agent_completion_advanced_head_reworks() {
+        let mut r = review_in(GateState::Dispatched);
+        add_comment(&mut r);
+        r.agent = Some(dummy_agent());
+
+        let outcome = r
+            .apply_agent_completion(Some("newsha".into()))
+            .expect("advancing HEAD should succeed");
+
+        assert_eq!(outcome, AgentOutcome::Reworked);
+        assert_eq!(r.gate_state(), GateState::Reworked);
+        assert_eq!(r.head_sha, "newsha", "HEAD updated to the new commit");
+        assert!(r.agent.is_none(), "agent handle cleared");
+        assert!(r.comments().is_empty(), "comments cleared on rework");
+    }
+
+    #[test]
+    fn apply_agent_completion_same_head_fails() {
+        let mut r = review_in(GateState::Dispatched);
+        add_comment(&mut r);
+        r.agent = Some(dummy_agent());
+        let head_before = r.head_sha.clone();
+
+        let outcome = r
+            .apply_agent_completion(Some(head_before.clone()))
+            .expect("unchanged HEAD should still return Ok(Failed)");
+
+        assert_eq!(outcome, AgentOutcome::Failed);
+        assert_eq!(r.gate_state(), GateState::InReview);
+        assert_eq!(r.head_sha, head_before, "HEAD unchanged");
+        assert!(r.agent.is_none(), "agent handle cleared");
+        assert_eq!(r.comments().len(), 1, "comments preserved on failure");
+    }
+
+    #[test]
+    fn apply_agent_completion_none_head_fails() {
+        let mut r = review_in(GateState::Dispatched);
+        add_comment(&mut r);
+        r.agent = Some(dummy_agent());
+        let head_before = r.head_sha.clone();
+
+        let outcome = r
+            .apply_agent_completion(None)
+            .expect("missing HEAD should return Ok(Failed)");
+
+        assert_eq!(outcome, AgentOutcome::Failed);
+        assert_eq!(r.gate_state(), GateState::InReview);
+        assert_eq!(r.head_sha, head_before, "HEAD unchanged");
+        assert!(r.agent.is_none(), "agent handle cleared");
+        assert_eq!(r.comments().len(), 1, "comments preserved on failure");
+    }
+
+    // ---------------------------------------------------------------
+    // snapshot_dispatch
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn snapshot_dispatch_captures_sha_and_comments() {
+        let mut r = review_in(GateState::InReview);
+        add_comment(&mut r);
+
+        r.snapshot_dispatch();
+
+        let snap = r
+            .dispatch_snapshot
+            .as_ref()
+            .expect("snapshot should be set");
+        assert_eq!(snap.reviewed_sha, r.head_sha);
+        assert_eq!(snap.comments.len(), 1);
+        assert_eq!(snap.comments, r.comments);
+    }
+
+    #[test]
+    fn snapshot_dispatch_overwrites_previous() {
+        let mut r = review_in(GateState::InReview);
+        add_comment(&mut r);
+        r.snapshot_dispatch();
+        assert_eq!(
+            r.dispatch_snapshot.as_ref().map(|s| s.comments.len()),
+            Some(1)
+        );
+
+        // A second cycle with a different HEAD and no comments overwrites it.
+        r.head_sha = "later-sha".into();
+        r.comments_mut().clear();
+        r.snapshot_dispatch();
+
+        let snap = r
+            .dispatch_snapshot
+            .as_ref()
+            .expect("snapshot should still be set");
+        assert_eq!(snap.reviewed_sha, "later-sha");
+        assert!(
+            snap.comments.is_empty(),
+            "snapshot reflects the latest dispatch, not the previous one"
+        );
     }
 }

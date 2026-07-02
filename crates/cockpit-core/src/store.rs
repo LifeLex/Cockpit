@@ -6,12 +6,21 @@
 //!
 //! These back [`AppState`](../../app/src-tauri) and are driven by the Tauri
 //! commands. Thread-safe in-memory access via `Arc<Mutex<…>>`; the app owns
-//! the lifetime, so there is no on-disk persistence layer here.
+//! the lifetime. Each store carries a monotonic revision counter so the
+//! persistence layer ([`crate::persist`]) can cheaply detect changes and
+//! re-save without diffing the whole map.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::model::{GateState, PrRef, Project, ProjectId, ProjectPlan, Review};
+use crate::model::{GateState, PrRef, Project, ProjectId, ProjectPlan, Review, ReviewId};
+
+// INVARIANT: every `.lock().expect("... lock poisoned")` below deliberately
+// propagates a poisoned-lock panic (CLAUDE.md §2). A `Mutex` becomes poisoned
+// only when another thread panicked while holding it, leaving the map in an
+// unknown, unrecoverable state; continuing on that state would be worse than
+// crashing, so re-panicking via `expect` is the correct response.
 
 // ---------------------------------------------------------------------------
 // ReviewStore (in-memory)
@@ -20,10 +29,13 @@ use crate::model::{GateState, PrRef, Project, ProjectId, ProjectPlan, Review};
 /// Thread-safe in-memory store for active reviews.
 ///
 /// Keyed by [`PrRef`]. Uses `std::sync::Mutex` because the lock is held only
-/// for trivial `HashMap` operations (no `.await` while locked).
+/// for trivial `HashMap` operations (no `.await` while locked). A shared
+/// [`AtomicU64`] revision counter bumps on every mutation so the persistence
+/// layer can detect changes without diffing the map.
 #[derive(Debug, Clone, Default)]
 pub struct ReviewStore {
     inner: Arc<Mutex<HashMap<PrRef, Review>>>,
+    revision: Arc<AtomicU64>,
 }
 
 impl ReviewStore {
@@ -32,11 +44,31 @@ impl ReviewStore {
         Self::default()
     }
 
+    /// Current revision of the store.
+    ///
+    /// A monotonic generation counter that increments on every mutating call.
+    /// Callers snapshot it and compare later to decide whether a re-save is
+    /// needed; the absolute value carries no meaning beyond "changed since".
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
+    }
+
+    /// Increment the revision counter.
+    ///
+    /// `Relaxed` is sufficient: the counter is a coarse change signal, not a
+    /// synchronization primitive for the map contents (that is the `Mutex`'s
+    /// job), so it needs only atomicity, not ordering.
+    fn bump(&self) {
+        self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Insert a review, keyed by its `pr` field.
     pub fn insert(&self, review: Review) {
         // INVARIANT: lock held only for a HashMap insert — no .await, no blocking.
         let mut map = self.inner.lock().expect("review store lock poisoned");
         map.insert(review.pr.clone(), review);
+        drop(map);
+        self.bump();
     }
 
     /// Get a clone of the review for the given PR reference.
@@ -52,19 +84,29 @@ impl ReviewStore {
     pub fn update(&self, pr: &PrRef, f: impl FnOnce(&mut Review)) -> bool {
         // INVARIANT: lock held only for a HashMap op, no .await, no blocking.
         let mut map = self.inner.lock().expect("review store lock poisoned");
-        if let Some(review) = map.get_mut(pr) {
+        let found = if let Some(review) = map.get_mut(pr) {
             f(review);
             true
         } else {
             false
+        };
+        drop(map);
+        // Only bump when the closure actually ran on an existing entry: a
+        // missing-key update mutates nothing and must not trigger a re-save.
+        if found {
+            self.bump();
         }
+        found
     }
 
     /// Remove the review for the given PR reference, returning it if present.
     pub fn remove(&self, pr: &PrRef) -> Option<Review> {
         // INVARIANT: lock held only for a HashMap op, no .await, no blocking.
         let mut map = self.inner.lock().expect("review store lock poisoned");
-        map.remove(pr)
+        let removed = map.remove(pr);
+        drop(map);
+        self.bump();
+        removed
     }
 
     /// Clone all reviews as a `Vec`.
@@ -72,6 +114,65 @@ impl ReviewStore {
         // INVARIANT: lock held only for a HashMap op, no .await, no blocking.
         let map = self.inner.lock().expect("review store lock poisoned");
         map.values().cloned().collect()
+    }
+
+    /// Bulk-replace the store's contents with `reviews` and bump the revision.
+    ///
+    /// Used at startup to hydrate the store from persisted state: every existing
+    /// entry is dropped and each review is re-keyed by its `pr` field.
+    pub fn hydrate(&self, reviews: Vec<Review>) {
+        // INVARIANT: lock held only for HashMap ops, no .await, no blocking.
+        let mut map = self.inner.lock().expect("review store lock poisoned");
+        map.clear();
+        for review in reviews {
+            map.insert(review.pr.clone(), review);
+        }
+        drop(map);
+        self.bump();
+    }
+
+    /// Mark every descendant of `parent` as [`stale`](Review::stale).
+    ///
+    /// Performs a breadth-first walk over `children` edges starting from
+    /// `parent`'s direct children and sets `stale = true` on each review it
+    /// reaches. The `parent` itself is never marked (it is not its own
+    /// descendant), and an unknown `parent` is a no-op that leaves the revision
+    /// untouched.
+    ///
+    /// `children` edges hold [`ReviewId`]s while the map is keyed by [`PrRef`],
+    /// so each hop resolves a review by scanning on id (the graph is small). A
+    /// `visited` set makes the walk terminate even if the edges form a cycle.
+    pub fn mark_descendants_stale(&self, parent: &ReviewId) {
+        // INVARIANT: lock held only for in-memory graph work, no .await, no blocking.
+        let mut map = self.inner.lock().expect("review store lock poisoned");
+
+        let mut visited: HashSet<ReviewId> = HashSet::new();
+        // Pre-mark the parent visited: it is not a descendant, and this also
+        // guards against a cycle whose back-edge points at the parent.
+        visited.insert(parent.clone());
+
+        let mut queue: VecDeque<ReviewId> = VecDeque::new();
+        // Seed with the parent's direct children. Unknown parent -> no seeds.
+        if let Some(parent_review) = map.values().find(|r| &r.id == parent) {
+            queue.extend(parent_review.children.iter().cloned());
+        }
+
+        let mut changed = false;
+        while let Some(id) = queue.pop_front() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            if let Some(review) = map.values_mut().find(|r| r.id == id) {
+                review.stale = true;
+                changed = true;
+                queue.extend(review.children.iter().cloned());
+            }
+        }
+
+        drop(map);
+        if changed {
+            self.bump();
+        }
     }
 }
 
@@ -147,10 +248,13 @@ pub fn batch_status(store: &ReviewStore, project: Option<&ProjectId>) -> BatchSt
 /// Thread-safe in-memory store for first-class projects.
 ///
 /// Keyed by [`ProjectId`]. Mirrors [`ReviewStore`]: the lock is held only for
-/// trivial `HashMap` operations (no `.await` while locked).
+/// trivial `HashMap` operations (no `.await` while locked), and a shared
+/// [`AtomicU64`] revision counter bumps on every mutation so the persistence
+/// layer can detect changes without diffing the map.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectStore {
     inner: Arc<Mutex<HashMap<ProjectId, Project>>>,
+    revision: Arc<AtomicU64>,
 }
 
 impl ProjectStore {
@@ -159,11 +263,29 @@ impl ProjectStore {
         Self::default()
     }
 
+    /// Current revision of the store.
+    ///
+    /// A monotonic generation counter that increments on every mutating call;
+    /// see [`ReviewStore::revision`] for the same contract.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
+    }
+
+    /// Increment the revision counter.
+    ///
+    /// `Relaxed` is sufficient: the counter is a coarse change signal, not a
+    /// synchronization primitive for the map contents.
+    fn bump(&self) {
+        self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Insert a project, keyed by its `id` field.
     pub fn insert(&self, project: Project) {
         // INVARIANT: lock held only for a HashMap insert — no .await, no blocking.
         let mut map = self.inner.lock().expect("project store lock poisoned");
         map.insert(project.id.clone(), project);
+        drop(map);
+        self.bump();
     }
 
     /// Get a clone of the project for the given id.
@@ -179,19 +301,29 @@ impl ProjectStore {
     pub fn update(&self, id: &ProjectId, f: impl FnOnce(&mut Project)) -> bool {
         // INVARIANT: lock held only for a HashMap op, no .await, no blocking.
         let mut map = self.inner.lock().expect("project store lock poisoned");
-        if let Some(project) = map.get_mut(id) {
+        let found = if let Some(project) = map.get_mut(id) {
             f(project);
             true
         } else {
             false
+        };
+        drop(map);
+        // Only bump when the closure actually ran on an existing entry: a
+        // missing-key update mutates nothing and must not trigger a re-save.
+        if found {
+            self.bump();
         }
+        found
     }
 
     /// Remove the project for the given id, returning it if present.
     pub fn remove(&self, id: &ProjectId) -> Option<Project> {
         // INVARIANT: lock held only for a HashMap op, no .await, no blocking.
         let mut map = self.inner.lock().expect("project store lock poisoned");
-        map.remove(id)
+        let removed = map.remove(id);
+        drop(map);
+        self.bump();
+        removed
     }
 
     /// Clone all projects as a `Vec`.
@@ -199,6 +331,21 @@ impl ProjectStore {
         // INVARIANT: lock held only for a HashMap op, no .await, no blocking.
         let map = self.inner.lock().expect("project store lock poisoned");
         map.values().cloned().collect()
+    }
+
+    /// Bulk-replace the store's contents with `projects` and bump the revision.
+    ///
+    /// Used at startup to hydrate the store from persisted state: every existing
+    /// entry is dropped and each project is re-keyed by its `id` field.
+    pub fn hydrate(&self, projects: Vec<Project>) {
+        // INVARIANT: lock held only for HashMap ops, no .await, no blocking.
+        let mut map = self.inner.lock().expect("project store lock poisoned");
+        map.clear();
+        for project in projects {
+            map.insert(project.id.clone(), project);
+        }
+        drop(map);
+        self.bump();
     }
 
     /// Get a clone of the plan owned by the given project, if any.
@@ -218,12 +365,19 @@ impl ProjectStore {
     pub fn update_plan(&self, id: &ProjectId, f: impl FnOnce(&mut Option<ProjectPlan>)) -> bool {
         // INVARIANT: lock held only for a HashMap op, no .await, no blocking.
         let mut map = self.inner.lock().expect("project store lock poisoned");
-        if let Some(project) = map.get_mut(id) {
+        let found = if let Some(project) = map.get_mut(id) {
             f(&mut project.plan);
             true
         } else {
             false
+        };
+        drop(map);
+        // Only bump when the closure actually ran on an existing entry: a
+        // missing-key update mutates nothing and must not trigger a re-save.
+        if found {
+            self.bump();
         }
+        found
     }
 }
 
@@ -244,6 +398,8 @@ mod tests {
             id: ReviewId::new(format!("r-{pr_num}")),
             issue: IssueRef::new(format!("ISSUE-{pr_num}")),
             pr: PrRef::new(format!("owner/repo#{pr_num}")),
+            title: String::new(),
+            body: String::new(),
             branch: format!("alejandro/test-{pr_num}"),
             base: "main".into(),
             base_sha: "000".into(),
@@ -259,6 +415,7 @@ mod tests {
             agent: None,
             repo_slug: None,
             project: None,
+            dispatch_snapshot: None,
         }
     }
 
@@ -515,5 +672,210 @@ mod tests {
         assert_eq!(status.building, 0);
         assert_eq!(status.ready, 0);
         assert_eq!(status.approved, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Revision counter + hydrate
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn review_store_revision_bumps_on_mutators() {
+        let store = ReviewStore::new();
+        assert_eq!(store.revision(), 0, "fresh store starts at revision 0");
+
+        store.insert(make_review(1));
+        let after_insert = store.revision();
+        assert!(after_insert > 0, "insert bumps the revision");
+
+        store.update(&PrRef::new("owner/repo#1"), |r| r.stale = true);
+        let after_update = store.revision();
+        assert!(after_update > after_insert, "update bumps the revision");
+
+        store.remove(&PrRef::new("owner/repo#1"));
+        let after_remove = store.revision();
+        assert!(after_remove > after_update, "remove bumps the revision");
+
+        // A missing-key update mutates nothing and must not bump the revision.
+        let missing = store.update(&PrRef::new("owner/repo#404"), |r| r.stale = true);
+        assert!(!missing, "update on a missing key returns false");
+        assert_eq!(
+            store.revision(),
+            after_remove,
+            "a missing-key update must not bump the revision"
+        );
+    }
+
+    #[test]
+    fn review_store_hydrate_replaces_and_bumps() {
+        let store = ReviewStore::new();
+        store.insert(make_review(1));
+        let before = store.revision();
+
+        store.hydrate(vec![make_review(2), make_review(3)]);
+        assert!(store.revision() > before, "hydrate bumps the revision");
+
+        // Old contents are gone; only the hydrated reviews remain.
+        assert!(store.get(&PrRef::new("owner/repo#1")).is_none());
+        assert_eq!(store.list().len(), 2);
+    }
+
+    #[test]
+    fn project_store_revision_bumps_on_mutators() {
+        let store = ProjectStore::new();
+        assert_eq!(store.revision(), 0, "fresh store starts at revision 0");
+
+        store.insert(make_project("p-1", ProjectSource::AdHoc));
+        let after_insert = store.revision();
+        assert!(after_insert > 0, "insert bumps the revision");
+
+        store.update(&ProjectId::new("p-1"), |p| p.name = "renamed".into());
+        let after_update = store.revision();
+        assert!(after_update > after_insert, "update bumps the revision");
+
+        store.update_plan(&ProjectId::new("p-1"), |slot| *slot = Some(make_plan()));
+        let after_plan = store.revision();
+        assert!(after_plan > after_update, "update_plan bumps the revision");
+
+        store.remove(&ProjectId::new("p-1"));
+        let after_remove = store.revision();
+        assert!(after_remove > after_plan, "remove bumps the revision");
+
+        // Missing-key mutators (`update` / `update_plan`) change nothing and
+        // must not bump the revision.
+        let missing = store.update(&ProjectId::new("absent"), |p| p.name = "x".into());
+        assert!(!missing, "update on a missing key returns false");
+        assert_eq!(
+            store.revision(),
+            after_remove,
+            "a missing-key update must not bump the revision"
+        );
+
+        let missing_plan =
+            store.update_plan(&ProjectId::new("absent"), |slot| *slot = Some(make_plan()));
+        assert!(!missing_plan, "update_plan on a missing key returns false");
+        assert_eq!(
+            store.revision(),
+            after_remove,
+            "a missing-key update_plan must not bump the revision"
+        );
+    }
+
+    #[test]
+    fn project_store_hydrate_replaces_and_bumps() {
+        let store = ProjectStore::new();
+        store.insert(make_project("p-1", ProjectSource::AdHoc));
+        let before = store.revision();
+
+        store.hydrate(vec![
+            make_project("p-2", ProjectSource::AdHoc),
+            make_project("p-3", ProjectSource::AdHoc),
+        ]);
+        assert!(store.revision() > before, "hydrate bumps the revision");
+
+        assert!(store.get(&ProjectId::new("p-1")).is_none());
+        assert_eq!(store.list().len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // mark_descendants_stale
+    // ---------------------------------------------------------------
+
+    /// Build a review numbered `num` whose `children` edges point at `children`.
+    fn make_linked(num: u64, children: &[u64]) -> Review {
+        let mut review = make_review(num);
+        review.children = children
+            .iter()
+            .map(|c| ReviewId::new(format!("r-{c}")))
+            .collect();
+        review
+    }
+
+    /// Read the `stale` flag of the review numbered `num`.
+    fn is_stale(store: &ReviewStore, num: u64) -> bool {
+        store
+            .get(&PrRef::new(format!("owner/repo#{num}")))
+            .expect("review should be present")
+            .stale
+    }
+
+    #[test]
+    fn mark_descendants_stale_linear_chain() {
+        // A → B → C
+        let store = ReviewStore::new();
+        store.insert(make_linked(1, &[2]));
+        store.insert(make_linked(2, &[3]));
+        store.insert(make_linked(3, &[]));
+        let before = store.revision();
+
+        store.mark_descendants_stale(&ReviewId::new("r-1"));
+
+        assert!(!is_stale(&store, 1), "parent is not its own descendant");
+        assert!(is_stale(&store, 2));
+        assert!(is_stale(&store, 3));
+        assert!(store.revision() > before, "marking bumps the revision");
+    }
+
+    #[test]
+    fn mark_descendants_stale_from_middle() {
+        // A → B → C, staling from B.
+        let store = ReviewStore::new();
+        store.insert(make_linked(1, &[2]));
+        store.insert(make_linked(2, &[3]));
+        store.insert(make_linked(3, &[]));
+
+        store.mark_descendants_stale(&ReviewId::new("r-2"));
+
+        assert!(!is_stale(&store, 1), "ancestor is untouched");
+        assert!(!is_stale(&store, 2), "starting node is not a descendant");
+        assert!(is_stale(&store, 3), "only descendants are staled");
+    }
+
+    #[test]
+    fn mark_descendants_stale_diamond() {
+        // A → B, A → C, B → D, C → D
+        let store = ReviewStore::new();
+        store.insert(make_linked(1, &[2, 3]));
+        store.insert(make_linked(2, &[4]));
+        store.insert(make_linked(3, &[4]));
+        store.insert(make_linked(4, &[]));
+
+        store.mark_descendants_stale(&ReviewId::new("r-1"));
+
+        assert!(!is_stale(&store, 1));
+        assert!(is_stale(&store, 2));
+        assert!(is_stale(&store, 3));
+        assert!(is_stale(&store, 4), "converging descendant marked once");
+    }
+
+    #[test]
+    fn mark_descendants_stale_unknown_parent_is_noop() {
+        let store = ReviewStore::new();
+        store.insert(make_linked(1, &[2]));
+        store.insert(make_linked(2, &[]));
+        let before = store.revision();
+
+        store.mark_descendants_stale(&ReviewId::new("r-999"));
+
+        assert!(!is_stale(&store, 1));
+        assert!(!is_stale(&store, 2));
+        assert_eq!(store.revision(), before, "a no-op must not bump");
+    }
+
+    #[test]
+    fn mark_descendants_stale_handles_cycles() {
+        // Pathological cycle A → B → C → A: the walk must terminate.
+        let store = ReviewStore::new();
+        store.insert(make_linked(1, &[2]));
+        store.insert(make_linked(2, &[3]));
+        store.insert(make_linked(3, &[1]));
+
+        store.mark_descendants_stale(&ReviewId::new("r-1"));
+
+        assert!(
+            !is_stale(&store, 1),
+            "back-edge to parent leaves it unmarked"
+        );
+        assert!(is_stale(&store, 2));
+        assert!(is_stale(&store, 3));
     }
 }

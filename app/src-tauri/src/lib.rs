@@ -12,10 +12,30 @@ use std::sync::Arc;
 
 use tauri::{Emitter, Manager};
 
-use cockpit_core::gate::Gated;
-use cockpit_core::model::{AgentMode, PrRef, ProjectId};
+use cockpit_core::gate::{AgentOutcome, Gated};
+use cockpit_core::model::{AgentMode, GateState, PrRef, Project, ProjectId, Review};
 
 use state::AppState;
+
+/// Payload emitted on the `"agent-completed"` Tauri event after a completion is
+/// reconciled against git HEAD.
+///
+/// Extends the raw [`CompletionEvent`](cockpit_core::hook_server::CompletionEvent)
+/// fields the frontend already listens for with a git-HEAD-authoritative
+/// `outcome` label, so the UI can tell rework that actually landed a commit
+/// (`"reworked"`) from a failed/no-op run (`"failed"`) or a non-gate-advancing
+/// artifact fill (`"completed"`). Hand-typed on the frontend (no `ts-rs`).
+#[derive(Debug, Clone, serde::Serialize)]
+struct AgentCompletedPayload {
+    /// The session id that completed.
+    session_id: String,
+    /// UI key of the reviewed object (PR ref for reviews, project id for plans).
+    object_id: String,
+    /// Which agent mode ran.
+    mode: AgentMode,
+    /// Outcome label: `"reworked"`, `"failed"`, or `"completed"`.
+    outcome: &'static str,
+}
 
 /// Set the macOS dock icon from an embedded PNG.
 ///
@@ -62,6 +82,26 @@ pub fn run() {
     let hook_sessions = app_state.sessions.clone();
     let hook_completion_tx = app_state.completion_tx.clone();
 
+    // Restore persisted session state (D5) before any observer runs, so the
+    // flush task's baseline revision reflects the loaded data. A missing or
+    // corrupt file yields `None` (persist::load never panics — Invariant 1), so
+    // a fresh start is the normal first-launch path.
+    if let Ok(home) = cockpit_core::config::cockpit_home()
+        && let Some(persisted) = cockpit_core::persist::load(&home)
+    {
+        app_state
+            .reviews
+            .hydrate(sanitize_loaded_reviews(persisted.reviews));
+        app_state
+            .projects
+            .hydrate(sanitize_loaded_projects(persisted.projects));
+    }
+
+    // Clone the (Arc-backed) store handles for the background flush task before
+    // app_state is moved into `.manage()`.
+    let flush_reviews = app_state.reviews.clone();
+    let flush_projects = app_state.projects.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -82,38 +122,29 @@ pub fn run() {
                 while let Ok(event) = rx.recv().await {
                     let app_state_ref: tauri::State<'_, Arc<AppState>> = app_handle.state();
 
-                    match event.mode {
+                    let outcome: &'static str = match event.mode {
                         AgentMode::Fix | AgentMode::Restack => {
-                            // Look up the review by PrRef (stored as
-                            // object_id), clear the agent run, transition
-                            // to Reworked, and re-fetch the diff.
-                            let pr_ref = PrRef::new(&event.object_id);
-                            app_state_ref.reviews.update(&pr_ref, |review| {
-                                review.agent = None;
-                                let _ = review.mark_reworked();
-                            });
-
-                            // Best-effort: re-fetch the diff so users
-                            // review fresh code, not stale diffs.
-                            refresh_review_diff(&app_state_ref, &pr_ref).await;
+                            // Reconcile the review against git HEAD, which — not
+                            // agent stdout — decides whether rework landed.
+                            reconcile_fix_completion(&app_state_ref, &event.object_id).await
                         }
                         AgentMode::Plan => {
                             // Two planner spawns land here (both AgentMode::Plan):
                             //   * initial generation — the plan is still
                             //     `Pending`; leave it `Pending` (artifact-fill)
-                            //     so the user opens it when ready.
-                            //   * rework — the plan is `Dispatched`; transition
-                            //     to `Reworked` (clears ephemeral comments).
-                            // In both cases, if the planner wrote its output to
-                            // the recorded `plan_path`, ingest it: read + parse
-                            // the markdown into `doc`. Read/parse failure is
-                            // non-fatal (Invariant 1) — we log and keep the
-                            // prior doc rather than block the loop.
+                            //     so the user opens it when ready ("completed").
+                            //   * rework — the plan is `Dispatched`; ingest the
+                            //     planner's output and settle the gate: parsed
+                            //     output → `Reworked` (clears comments), missing
+                            //     or unparseable output → `InReview` (comments
+                            //     preserved, "failed").
+                            // Read/parse failure is non-fatal (Invariant 1) — we
+                            // log and keep the prior doc rather than block.
                             //
                             // The session object_id is the project id (set at
                             // spawn), so this routes to the right project's plan.
                             let project_id = cockpit_core::model::ProjectId::new(&event.object_id);
-                            ingest_plan_output(&app_state_ref, &project_id);
+                            ingest_plan_output(&app_state_ref, &project_id)
                         }
                         AgentMode::Implement => {
                             // An implementer finished building a review's
@@ -134,12 +165,19 @@ pub fn run() {
                                 });
                                 refresh_review_diff(&app_state_ref, &pr_ref).await;
                             }
+                            "completed"
                         }
-                    }
+                    };
 
                     // Best-effort: if no frontend window is listening, the
                     // event is simply dropped.
-                    let _ = app_handle.emit("agent-completed", &event);
+                    let payload = AgentCompletedPayload {
+                        session_id: event.session_id.clone(),
+                        object_id: event.object_id.clone(),
+                        mode: event.mode,
+                        outcome,
+                    };
+                    let _ = app_handle.emit("agent-completed", &payload);
                 }
             });
 
@@ -159,18 +197,68 @@ pub fn run() {
                 });
             }
 
+            // Background persistence flush (D5). Once per ~second, snapshot the
+            // store revisions; when either changed since the last save, persist
+            // the whole session to disk. `save_atomic` is blocking file IO, so
+            // it runs on the blocking pool — the async loop never blocks
+            // (Invariant 1). Save failures are logged and retried on the next
+            // tick, never fatal.
+            tauri::async_runtime::spawn(async move {
+                let mut last = flush_reviews
+                    .revision()
+                    .wrapping_add(flush_projects.revision());
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                    let current = flush_reviews
+                        .revision()
+                        .wrapping_add(flush_projects.revision());
+                    if current == last {
+                        continue;
+                    }
+
+                    let snapshot = cockpit_core::persist::PersistedState {
+                        version: cockpit_core::persist::STATE_VERSION,
+                        reviews: flush_reviews.list(),
+                        projects: flush_projects.list(),
+                    };
+
+                    // Persist off the async runtime — save_atomic is sync IO.
+                    let saved =
+                        tokio::task::spawn_blocking(
+                            move || match cockpit_core::config::cockpit_home() {
+                                Ok(home) => cockpit_core::persist::save_atomic(&home, &snapshot)
+                                    .map_err(|e| e.to_string()),
+                                Err(e) => Err(e.to_string()),
+                            },
+                        )
+                        .await;
+
+                    match saved {
+                        // Only advance the baseline on a durable save, so a
+                        // failed flush is retried rather than silently skipped.
+                        Ok(Ok(())) => last = current,
+                        Ok(Err(msg)) => eprintln!("persist flush: save failed: {msg}"),
+                        Err(e) => eprintln!("persist flush: save task panicked: {e}"),
+                    }
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::get_version,
             commands::list_reviews,
             commands::get_frontier,
             commands::get_review,
             commands::open_review,
             commands::get_review_diff,
+            commands::get_interdiff,
             commands::add_comment,
             commands::request_changes,
             commands::mirror_comments,
+            commands::submit_github_review,
+            commands::kill_agent,
+            commands::ensure_review_worktree,
             commands::fetch_ci_checks,
             commands::list_ci_checks,
             commands::ci_run_logs_by_link,
@@ -183,6 +271,7 @@ pub fn run() {
             commands::plan_open,
             commands::batch_status,
             commands::approve_review,
+            commands::merge_review,
             commands::get_config,
             commands::save_config,
             commands::get_agent_prompt,
@@ -212,19 +301,149 @@ pub fn run() {
         .expect("error running tauri application");
 }
 
-/// Settle a project's plan after a planner (`AgentMode::Plan`) completion.
+/// Sanitize reviews loaded from disk before hydrating the store (D5).
+///
+/// Two fix-ups make persisted state safe to resume:
+///   * The process that owned each agent handle is dead after a restart, so
+///     every `agent` handle is dropped.
+///   * A review left `Dispatched` at shutdown had an in-flight agent that will
+///     never report back, so it is returned to `InReview` via
+///     `mark_agent_failed`, which preserves its comments (Invariant 4) so the
+///     pending rework can be re-dispatched.
+///
+/// The `mark_agent_failed` call is guarded by the `Dispatched` check, so its
+/// only failure mode is unreachable here; the `Result` is ignored deliberately.
+fn sanitize_loaded_reviews(reviews: Vec<Review>) -> Vec<Review> {
+    reviews
+        .into_iter()
+        .map(|mut review| {
+            review.agent = None;
+            if review.gate_state == GateState::Dispatched {
+                let _ = review.mark_agent_failed();
+            }
+            review
+        })
+        .collect()
+}
+
+/// Sanitize projects loaded from disk before hydrating the store (D5).
+///
+/// Mirrors [`sanitize_loaded_reviews`] for each project's optional plan: drop
+/// the dead planner `agent` handle, and return a `Dispatched` plan to
+/// `InReview` (comments preserved) so a pending plan rework can be re-dispatched.
+fn sanitize_loaded_projects(projects: Vec<Project>) -> Vec<Project> {
+    projects
+        .into_iter()
+        .map(|mut project| {
+            if let Some(plan) = project.plan.as_mut() {
+                plan.agent = None;
+                if plan.gate_state == GateState::Dispatched {
+                    let _ = plan.mark_agent_failed();
+                }
+            }
+            project
+        })
+        .collect()
+}
+
+/// Reconcile a Fix/Restack agent completion against git HEAD and return the
+/// outcome label for the `"agent-completed"` payload.
+///
+/// git HEAD — not agent stdout — is authoritative: an agent can report success
+/// while committing nothing. The only trusted signal is whether the worktree
+/// branch HEAD actually advanced.
+///
+/// The lock-across-await rule (CLAUDE.md §2) is honored by construction: the
+/// worktree path is snapshotted out of the store (releasing the lock) before any
+/// blocking git work; the blocking `git2` read runs on the blocking pool via
+/// [`tokio::task::spawn_blocking`] (only the owned worktree path — all `Send` —
+/// crosses the boundary); and the store is only re-locked afterwards to write
+/// the result. [`Review::apply_agent_completion`] preserves comments on a Failed
+/// outcome (Invariant 4).
+async fn reconcile_fix_completion(state: &AppState, object_id: &str) -> &'static str {
+    let pr_ref = PrRef::new(object_id);
+
+    // A completion can arrive for a review that is no longer `Dispatched`: the
+    // agent was killed (kill_agent already reconciled it to InReview) or a
+    // duplicate completion (Stop hook + stream-end) already settled it. Applying
+    // a transition now would be illegal and only log noise, so report the
+    // review's already-settled outcome without touching it.
+    let Some(review) = state.reviews.get(&pr_ref) else {
+        // No stored review resolved for this object id — no rework can have
+        // landed.
+        return "failed";
+    };
+    match review.gate_state {
+        GateState::Dispatched => {}
+        GateState::Reworked => return "reworked",
+        _ => return "failed",
+    }
+
+    // Snapshot the worktree path, dropping the store lock before the blocking
+    // git read and the diff refresh below.
+    let worktree = review.worktree;
+
+    // `git2` reconcile is blocking; run it off the async runtime.
+    let head =
+        tokio::task::spawn_blocking(move || cockpit_core::adapters::git::reconcile(&worktree))
+            .await;
+
+    // Resolve the new HEAD SHA, or `None` (treated as "no progress") when the
+    // reconcile failed or its task panicked. `None` routes to Failed, preserving
+    // comments for re-dispatch.
+    let new_head: Option<String> = match head {
+        Ok(Ok(oid)) => Some(oid.to_string()),
+        Ok(Err(e)) => {
+            eprintln!("reconcile_fix_completion: reconcile failed for {object_id}: {e}");
+            None
+        }
+        Err(e) => {
+            eprintln!("reconcile_fix_completion: reconcile task panicked for {object_id}: {e}");
+            None
+        }
+    };
+
+    // Re-lock only to apply the git-authoritative outcome.
+    let mut applied: Option<Result<AgentOutcome, cockpit_core::gate::Error>> = None;
+    state.reviews.update(&pr_ref, |review| {
+        applied = Some(review.apply_agent_completion(new_head));
+    });
+
+    match applied {
+        Some(Ok(AgentOutcome::Reworked)) => {
+            // Best-effort: re-fetch the diff so users review fresh code.
+            refresh_review_diff(state, &pr_ref).await;
+            "reworked"
+        }
+        Some(Ok(AgentOutcome::Failed)) => "failed",
+        Some(Err(e)) => {
+            eprintln!(
+                "reconcile_fix_completion: apply_agent_completion failed for {object_id}: {e}"
+            );
+            "failed"
+        }
+        // Review vanished between the snapshot and the write-back.
+        None => "failed",
+    }
+}
+
+/// Settle a project's plan after a planner (`AgentMode::Plan`) completion and
+/// return the outcome label for the `"agent-completed"` payload.
 ///
 /// Clears the running agent, ingests the planner's written markdown (when a
 /// `plan_path` is recorded and the file is present and non-empty) by parsing it
 /// into the plan's `doc`, and settles the gate:
-///   * `Dispatched` (rework) -> `Reworked` (also clears ephemeral comments).
-///   * `Pending` (initial artifact-fill) stays `Pending`.
+///   * `Dispatched` (rework) with parsed output -> `Reworked` (clears ephemeral
+///     comments); returns `"reworked"`.
+///   * `Dispatched` (rework) with missing/unparseable output -> `InReview` via
+///     `mark_agent_failed` (comments preserved for re-dispatch); returns
+///     `"failed"`.
+///   * `Pending` (initial artifact-fill) stays `Pending`; returns `"completed"`.
 ///
 /// Keyed by [`ProjectId`] (the completion event's `object_id`) so the correct
 /// project's plan is updated. Read/parse failures are non-fatal (Invariant 1):
 /// the prior doc is kept and the failure is logged rather than blocking the loop.
-fn ingest_plan_output(state: &AppState, project_id: &ProjectId) {
-    use cockpit_core::gate::Gated;
+fn ingest_plan_output(state: &AppState, project_id: &ProjectId) -> &'static str {
     use cockpit_core::model::GateState;
 
     // Read + parse outside the store lock; only touch on-disk state here.
@@ -252,6 +471,8 @@ fn ingest_plan_output(state: &AppState, project_id: &ProjectId) {
         }
     });
 
+    let parsed_ok = parsed.is_some();
+    let mut outcome = "completed";
     state.projects.update_plan(project_id, |slot| {
         let Some(plan) = slot.as_mut() else {
             return;
@@ -260,13 +481,25 @@ fn ingest_plan_output(state: &AppState, project_id: &ProjectId) {
         if let Some(doc) = parsed {
             plan.doc = doc;
         }
+        // Only a rework spawn (Dispatched) settles the gate; initial generation
+        // (Pending) stays Pending as an artifact fill.
         if plan.gate_state == GateState::Dispatched {
-            // `mark_reworked` clears ephemeral comments (Invariant 4). A wrong
-            // starting state cannot occur here (guarded above), so the error is
-            // ignored deliberately.
-            let _ = plan.mark_reworked();
+            if parsed_ok {
+                // `mark_reworked` clears ephemeral comments (Invariant 4). A
+                // wrong starting state cannot occur here (guarded above), so the
+                // error is ignored deliberately.
+                let _ = plan.mark_reworked();
+                outcome = "reworked";
+            } else {
+                // The planner produced no usable output — return the plan to
+                // InReview with its comments preserved (failure-aware rework)
+                // rather than falsely reporting rework. Guarded state as above.
+                let _ = plan.mark_agent_failed();
+                outcome = "failed";
+            }
         }
     });
+    outcome
 }
 
 /// Resolve a review's [`PrRef`] from a completion event's `object_id`.

@@ -2,6 +2,7 @@
 import type { AgentRun } from "./AgentRun";
 import type { Comment } from "./Comment";
 import type { DiffData } from "./DiffData";
+import type { DispatchSnapshot } from "./DispatchSnapshot";
 import type { GateState } from "./GateState";
 import type { IssueRef } from "./IssueRef";
 import type { PrRef } from "./PrRef";
@@ -28,6 +29,14 @@ issue: IssueRef,
  * The GitHub PR opened for this review.
  */
 pr: PrRef, 
+/**
+ * PR title. Empty for legacy data that predates this field.
+ */
+title: string, 
+/**
+ * PR description / body. Empty for legacy data that predates this field.
+ */
+body: string, 
 /**
  * Git branch name (e.g. `alejandro/nex-123-do-thing`).
  */
@@ -93,4 +102,11 @@ repo_slug: string | null,
  * The first-class [`Project`] this review belongs to, if any. `None` for
  * ungrouped reviews (e.g. GitHub-imported PRs with no project attached).
  */
-project: ProjectId | null, };
+project: ProjectId | null, 
+/**
+ * Read-only audit record of the most recent dispatch cycle, if any.
+ *
+ * Overwritten on each dispatch (see [`DispatchSnapshot`]). `None` before
+ * the first dispatch and for legacy data.
+ */
+dispatch_snapshot?: DispatchSnapshot, };

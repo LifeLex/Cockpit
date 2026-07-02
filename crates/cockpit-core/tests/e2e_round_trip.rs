@@ -22,6 +22,8 @@ fn make_test_review(worktree: PathBuf) -> Review {
         id: ReviewId::new("e2e-review-1"),
         issue: IssueRef::new("TEST-1"),
         pr: PrRef::new("owner/repo#1"),
+        title: String::new(),
+        body: String::new(),
         branch: "alejandro/test-1-feature".into(),
         base: "main".into(),
         base_sha: "000".into(),
@@ -39,6 +41,7 @@ fn make_test_review(worktree: PathBuf) -> Review {
         agent: None,
         repo_slug: None,
         project: None,
+        dispatch_snapshot: None,
     }
 }
 
@@ -62,6 +65,7 @@ async fn full_review_loop_round_trip() {
         anchor: Anchor::DiffLine {
             path: PathBuf::from("test.rs"),
             range: (1, 1),
+            side: DiffSide::New,
         },
         body: "Add error handling to this function".into(),
         origin: CommentOrigin::Local,
@@ -258,6 +262,7 @@ async fn agent_failure_preserves_comments() {
         anchor: Anchor::DiffLine {
             path: PathBuf::from("lib.rs"),
             range: (5, 10),
+            side: DiffSide::New,
         },
         body: "Fix the off-by-one error".into(),
         origin: CommentOrigin::Local,
@@ -323,6 +328,7 @@ async fn stale_flag_set_on_parent_dispatch() {
         anchor: Anchor::DiffLine {
             path: PathBuf::from("main.rs"),
             range: (1, 1),
+            side: DiffSide::New,
         },
         body: "Refactor this".into(),
         origin: CommentOrigin::Local,
@@ -348,6 +354,7 @@ async fn stale_flag_set_on_parent_dispatch() {
         anchor: Anchor::DiffLine {
             path: PathBuf::from("child.rs"),
             range: (1, 1),
+            side: DiffSide::New,
         },
         body: "Fix child issue".into(),
         origin: CommentOrigin::Local,

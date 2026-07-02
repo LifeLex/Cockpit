@@ -5,10 +5,11 @@
 //! so cockpit links PR to issue by parsing the head branch. See `SPEC.md` S16.
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use ts_rs::TS;
 
-use crate::model::{Anchor, Comment, CommentId, CommentOrigin, IssueRef, PrRef};
+use crate::model::{Anchor, Comment, CommentId, CommentOrigin, DiffSide, IssueRef, PrRef};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -59,6 +60,9 @@ pub struct PrData {
     pub base_ref_name: String,
     /// PR title.
     pub title: String,
+    /// PR description / body. Absent in legacy field sets, so defaulted.
+    #[serde(default)]
+    pub body: String,
     /// Current PR state (e.g. "OPEN", "MERGED", "CLOSED").
     pub state: String,
     /// Full URL of the PR on GitHub.
@@ -198,7 +202,7 @@ pub async fn list_prs() -> Result<Vec<PrData>, Error> {
             "pr",
             "list",
             "--json",
-            "number,headRefName,baseRefName,title,state,url",
+            "number,headRefName,baseRefName,title,body,state,url",
             "--limit",
             "100",
         ])
@@ -505,9 +509,15 @@ pub enum PrFilter {
 
 /// List open PRs with a filter across all accessible repositories.
 ///
-/// Uses `gh search prs` (cross-repo) to discover PRs, then enriches each
-/// with branch info from `gh pr view --repo`. This way PRs from any repo
-/// the user has access to are returned, not just a single configured repo.
+/// Uses `gh search prs` (cross-repo) to discover PRs, then enriches each with
+/// branch info from `gh pr view --repo`. Enrichment runs with a bounded number
+/// of in-flight `gh` calls ([`ENRICH_CONCURRENCY`]) and the results are
+/// re-sorted so the output order matches the search order. This way PRs from any
+/// repo the user has access to are returned, not just a single configured repo.
+///
+/// A per-PR enrichment failure is non-fatal: that PR falls back to the fields
+/// already known from the search result (with empty branch names) rather than
+/// failing the whole call.
 ///
 /// - [`PrFilter::Authored`] → `gh search prs --author=@me`
 /// - [`PrFilter::ReviewRequested`] → searches both `--review-requested=@me`
@@ -522,7 +532,10 @@ pub async fn list_prs_filtered(
         PrFilter::ReviewRequested => {
             let mut pending = search_prs(&["--review-requested", "@me"]).await?;
             let reviewed = search_prs(&["--reviewed-by", "@me"]).await?;
-            let me = gh_whoami().await.unwrap_or_default();
+            // GitHub logins are case-insensitive; lowercase our identity so the
+            // self-exclusion below compares like-for-like against the likewise
+            // lowercased `author_login`.
+            let me = gh_whoami().await.unwrap_or_default().to_lowercase();
 
             // Merge and deduplicate by URL.
             let mut seen = std::collections::HashSet::new();
@@ -544,30 +557,73 @@ pub async fn list_prs_filtered(
         }
     };
 
-    // Enrich each PR with branch names via `gh pr view --repo`.
-    let mut prs = Vec::with_capacity(search_results.len());
-    for sr in &search_results {
-        let slug = &sr.repository.name_with_owner;
-        match enrich_pr(slug, sr.number).await {
-            Ok(mut pr) => {
-                pr.repo_slug = slug.clone();
-                prs.push(pr);
+    // Enrich each PR with branch names via `gh pr view --repo`, running up to
+    // ENRICH_CONCURRENCY calls at once. Each task is tagged with its search-order
+    // index so the results can be re-sorted below; a task never fails (an enrich
+    // error resolves to a fallback `PrData`), preserving the old semantics where
+    // one PR's failure does not abort the whole listing.
+    let total = search_results.len();
+    let mut slots: Vec<Option<PrData>> = vec![None; total];
+    let mut join_set: tokio::task::JoinSet<(usize, PrData)> = tokio::task::JoinSet::new();
+    let mut pending = search_results.into_iter().enumerate();
+
+    // Prime the initial window of in-flight enrichments.
+    for _ in 0..ENRICH_CONCURRENCY {
+        match pending.next() {
+            Some((index, sr)) => {
+                join_set.spawn(enrich_task(index, sr));
             }
-            Err(_) => {
-                prs.push(PrData {
-                    number: sr.number,
-                    head_ref_name: String::new(),
-                    base_ref_name: String::new(),
-                    title: sr.title.clone(),
-                    state: sr.state.clone(),
-                    url: sr.url.clone(),
-                    repo_slug: slug.clone(),
-                });
-            }
+            None => break,
         }
     }
 
-    Ok(prs)
+    // As each enrichment completes, record it and start the next one.
+    while let Some(joined) = join_set.join_next().await {
+        let (index, pr) =
+            joined.map_err(|e| Error::GhCommand(format!("enrich task failed to join: {e}")))?;
+        if let Some(slot) = slots.get_mut(index) {
+            *slot = Some(pr);
+        }
+        if let Some((index, sr)) = pending.next() {
+            join_set.spawn(enrich_task(index, sr));
+        }
+    }
+
+    Ok(slots.into_iter().flatten().collect())
+}
+
+/// Maximum number of concurrent `gh pr view` enrichment calls in
+/// [`list_prs_filtered`]. Bounds fan-out so a large PR list cannot spawn an
+/// unbounded number of `gh` subprocesses at once.
+const ENRICH_CONCURRENCY: usize = 8;
+
+/// Enrich a single search result into a full [`PrData`], returning its
+/// search-order `index` alongside the result.
+///
+/// On enrichment failure the PR falls back to the fields already known from the
+/// search result (with empty branch names), so the task always resolves — a
+/// per-PR failure never aborts [`list_prs_filtered`].
+async fn enrich_task(index: usize, sr: SearchPrResult) -> (usize, PrData) {
+    let slug = sr.repository.name_with_owner.clone();
+    match enrich_pr(&slug, sr.number).await {
+        Ok(mut pr) => {
+            pr.repo_slug = slug;
+            (index, pr)
+        }
+        Err(_) => (
+            index,
+            PrData {
+                number: sr.number,
+                head_ref_name: String::new(),
+                base_ref_name: String::new(),
+                title: sr.title,
+                body: String::new(),
+                state: sr.state,
+                url: sr.url,
+                repo_slug: slug,
+            },
+        ),
+    }
 }
 
 /// Run `gh search prs --state=open` with the given extra args.
@@ -629,9 +685,12 @@ struct SearchPrResult {
 }
 
 impl SearchPrResult {
-    /// Login of the PR author, lowercased for comparison.
-    fn author_login(&self) -> &str {
-        &self.author.login
+    /// Login of the PR author, lowercased for case-insensitive comparison.
+    ///
+    /// GitHub logins are case-insensitive, so callers compare against a
+    /// likewise-lowercased identity (see [`list_prs_filtered`]).
+    fn author_login(&self) -> String {
+        self.author.login.to_lowercase()
     }
 }
 
@@ -659,7 +718,7 @@ async fn enrich_pr(repo_slug: &str, pr_number: u64) -> Result<PrData, Error> {
             "--repo",
             repo_slug,
             "--json",
-            "number,headRefName,baseRefName,title,state,url",
+            "number,headRefName,baseRefName,title,body,state,url",
         ])
         .output()
         .await?;
@@ -740,6 +799,8 @@ pub fn build_review_from_pr(
         id: ReviewId::new(id_prefix),
         issue,
         pr: PrRef::new(&pr.url),
+        title: pr.title.clone(),
+        body: pr.body.clone(),
         branch: pr.head_ref_name.clone(),
         base: pr.base_ref_name.clone(),
         base_sha: String::new(),
@@ -755,6 +816,7 @@ pub fn build_review_from_pr(
         agent: None,
         repo_slug: slug,
         project: None,
+        dispatch_snapshot: None,
     }
 }
 
@@ -770,6 +832,73 @@ pub fn link_prs_to_issues(prs: &[PrData]) -> Vec<(PrRef, Option<IssueRef>)> {
             (pr_ref, issue_ref)
         })
         .collect()
+}
+
+/// Wire stack `parents`/`children` edges across GitHub-imported reviews by
+/// matching each review's `base` branch against another review's head `branch`.
+///
+/// A review whose `base` is another review's `branch` is stacked on top of it:
+/// the base review becomes the parent and this review becomes its child. This
+/// mirrors the semantics of `kickoff::wire_children`, but derives the graph from
+/// GitHub branch topology rather than the Linear DAG.
+///
+/// Only reviews sourced from GitHub ([`ReviewSource::Authored`] /
+/// [`ReviewSource::ReviewRequested`]) have their edges cleared and rebuilt.
+/// Reviews created by a project kickoff ([`ReviewSource::Frontier`]) keep the
+/// edges wired from the Linear DAG untouched — a review's `base` matching a
+/// frontier branch may still add the frontier review as a parent, but the
+/// frontier review's own edges are never cleared.
+pub fn wire_stack_edges(reviews: &mut [crate::model::Review]) {
+    use crate::model::ReviewSource;
+
+    // GitHub-imported reviews derive their stack purely from branch topology, so
+    // their edges are safe to clear and rebuild. Frontier reviews carry
+    // kickoff-wired edges that must be preserved.
+    fn is_github_sourced(source: ReviewSource) -> bool {
+        matches!(
+            source,
+            ReviewSource::Authored | ReviewSource::ReviewRequested
+        )
+    }
+
+    // Clear existing edges only on the reviews we own the topology for.
+    for review in reviews.iter_mut() {
+        if is_github_sourced(review.source) {
+            review.parents.clear();
+            review.children.clear();
+        }
+    }
+
+    // Map head branch -> review id so a base branch can be resolved to a parent.
+    let branch_to_id: std::collections::HashMap<String, crate::model::ReviewId> = reviews
+        .iter()
+        .map(|r| (r.branch.clone(), r.id.clone()))
+        .collect();
+
+    // Derive parent edges from base==branch, collecting the (parent, child)
+    // pairs to wire children in a second pass (avoids a mutable-borrow conflict).
+    let mut edges: Vec<(crate::model::ReviewId, crate::model::ReviewId)> = Vec::new();
+    for review in reviews.iter_mut() {
+        if !is_github_sourced(review.source) {
+            continue;
+        }
+        if let Some(parent_id) = branch_to_id.get(&review.base) {
+            // A review can never be its own parent (guards a self-referential
+            // base branch).
+            if parent_id != &review.id {
+                review.parents.push(parent_id.clone());
+                edges.push((parent_id.clone(), review.id.clone()));
+            }
+        }
+    }
+
+    for (parent_id, child_id) in edges {
+        if let Some(parent) = reviews.iter_mut().find(|r| r.id == parent_id)
+            && !parent.children.contains(&child_id)
+        {
+            parent.children.push(child_id);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -797,7 +926,7 @@ pub fn format_comment_body(comment: &Comment) -> String {
     let anchor_label = match &comment.anchor {
         Anchor::PlanStep(idx) => format!("**Plan step {idx}**"),
         Anchor::PlanFile(path) => format!("**Plan file:** `{}`", path.display()),
-        Anchor::DiffLine { path, range } => {
+        Anchor::DiffLine { path, range, .. } => {
             if range.0 == range.1 {
                 format!("**{}** line {}", path.display(), range.0)
             } else {
@@ -860,6 +989,367 @@ pub async fn mirror_comments(pr_ref: &PrRef, comments: &[Comment]) -> Result<Mir
 }
 
 // ---------------------------------------------------------------------------
+// Merge
+// ---------------------------------------------------------------------------
+
+/// How GitHub should combine a PR's commits when merging.
+///
+/// Mirrors `gh pr merge`'s mutually-exclusive strategy flags. Defaults to
+/// [`MergeMethod::Squash`], the common single-commit-per-PR workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub enum MergeMethod {
+    /// Squash all commits into one, then merge (`--squash`). The default.
+    #[default]
+    Squash,
+    /// Create a merge commit (`--merge`).
+    Merge,
+    /// Rebase the commits onto the base (`--rebase`).
+    Rebase,
+}
+
+/// Merge a PR via `gh pr merge`, deleting the head branch on success.
+///
+/// When `repo_slug` is `Some`, targets that repository with `--repo` so the
+/// call works cross-repo without a `current_dir`. `method` selects the merge
+/// strategy flag.
+///
+/// This is a guarded side effect (Invariant 5): it must only be invoked after an
+/// explicit human confirmation in the UI, never automatically or from agent
+/// output. A non-zero `gh` exit captures stderr into [`Error::GhCommand`].
+pub async fn merge_pr(
+    repo_slug: Option<&str>,
+    pr_number: u64,
+    method: MergeMethod,
+) -> Result<(), Error> {
+    let pr = pr_number.to_string();
+    let method_flag = match method {
+        MergeMethod::Squash => "--squash",
+        MergeMethod::Merge => "--merge",
+        MergeMethod::Rebase => "--rebase",
+    };
+    let mut args: Vec<&str> = vec!["pr", "merge", &pr, method_flag, "--delete-branch"];
+    if let Some(slug) = repo_slug {
+        args.push("--repo");
+        args.push(slug);
+    }
+
+    let output = Command::new("gh").args(&args).output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Compare
+// ---------------------------------------------------------------------------
+
+/// Fetch a unified diff between two commits via the GitHub compare API.
+///
+/// Runs `gh api repos/<slug>/compare/<base>...<head>` with the
+/// `application/vnd.github.v3.diff` media type so the response body IS a unified
+/// diff (rather than the default JSON summary). Used to diff arbitrary commit
+/// ranges (e.g. a review's `base_sha`..`head_sha`) without a local checkout.
+pub async fn compare(repo_slug: &str, base_sha: &str, head_sha: &str) -> Result<String, Error> {
+    let endpoint = format!("repos/{repo_slug}/compare/{base_sha}...{head_sha}");
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &endpoint,
+            "-H",
+            "Accept: application/vnd.github.v3.diff",
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Reviews (inline review comments)
+// ---------------------------------------------------------------------------
+
+/// The kind of review to submit to GitHub, matching the API's `event` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub enum ReviewEvent {
+    /// Approve the pull request (`APPROVE`).
+    Approve,
+    /// Request changes on the pull request (`REQUEST_CHANGES`).
+    RequestChanges,
+    /// Leave a review without approving or requesting changes (`COMMENT`).
+    Comment,
+}
+
+/// Result of submitting a review to a GitHub PR.
+///
+/// `submitted` counts the inline comments actually included in the review;
+/// `skipped` lists the comments that were left out with a human-readable reason
+/// (e.g. their anchored line is not part of the PR's diff), so the caller can
+/// report partial success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct SubmitReviewResult {
+    /// Number of inline comments included in the submitted review.
+    pub submitted: usize,
+    /// Comments left out of the review: `(comment_id, reason)`.
+    pub skipped: Vec<(CommentId, String)>,
+}
+
+/// Convert a cockpit [`Comment`] into a GitHub review-comment JSON object.
+///
+/// Only [`Anchor::DiffLine`] anchors map to an inline review comment; every
+/// other anchor kind returns `None`. The GitHub side string is `"RIGHT"` for the
+/// new side and `"LEFT"` for the old side. A multi-line range additionally
+/// carries `start_line`/`start_side`, matching GitHub's multi-line comment shape.
+fn review_comment_payload(comment: &Comment) -> Option<serde_json::Value> {
+    let Anchor::DiffLine { path, range, side } = &comment.anchor else {
+        return None;
+    };
+    let (start, end) = *range;
+    let side_str = diff_side_label(*side);
+
+    let mut payload = serde_json::json!({
+        "path": path.display().to_string(),
+        "line": end,
+        "side": side_str,
+        "body": comment.body,
+    });
+    if start != end {
+        payload["start_line"] = serde_json::json!(start);
+        payload["start_side"] = serde_json::json!(side_str);
+    }
+    Some(payload)
+}
+
+/// GitHub's side label for a [`DiffSide`].
+fn diff_side_label(side: DiffSide) -> &'static str {
+    match side {
+        DiffSide::New => "RIGHT",
+        DiffSide::Old => "LEFT",
+    }
+}
+
+/// A parsed unified-diff hunk header: `@@ -old_start,old_len +new_start,new_len @@`.
+#[derive(Debug, Clone, Copy)]
+struct HunkHeader {
+    old_start: u32,
+    old_len: u32,
+    new_start: u32,
+    new_len: u32,
+}
+
+/// Parse a hunk header line (`@@ -a,b +c,d @@`) into its four numbers.
+///
+/// The count is optional in unified diffs (`@@ -a +c @@` means a count of 1),
+/// so a missing `,len` defaults to 1. Returns `None` for any non-hunk line.
+fn parse_hunk_header(line: &str) -> Option<HunkHeader> {
+    let rest = line.strip_prefix("@@ ")?;
+    let close = rest.find(" @@")?;
+    let spec = &rest[..close];
+
+    let mut parts = spec.split_whitespace();
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    let (old_start, old_len) = parse_hunk_range(old)?;
+    let (new_start, new_len) = parse_hunk_range(new)?;
+
+    Some(HunkHeader {
+        old_start,
+        old_len,
+        new_start,
+        new_len,
+    })
+}
+
+/// Parse a hunk range component (`a,b` or `a`) into `(start, len)`.
+fn parse_hunk_range(s: &str) -> Option<(u32, u32)> {
+    match s.split_once(',') {
+        Some((start, len)) => Some((start.parse().ok()?, len.parse().ok()?)),
+        None => Some((s.parse().ok()?, 1)),
+    }
+}
+
+/// Extract the repo-relative path from a `---`/`+++` file header value.
+///
+/// Strips the `a/` or `b/` prefix and any trailing tab-delimited metadata.
+/// Returns `None` for `/dev/null` (an added or deleted file has no counterpart).
+fn parse_file_header_path(value: &str) -> Option<String> {
+    let token = value.split('\t').next().unwrap_or(value).trim();
+    if token == "/dev/null" {
+        return None;
+    }
+    let stripped = token
+        .strip_prefix("a/")
+        .or_else(|| token.strip_prefix("b/"))
+        .unwrap_or(token);
+    Some(stripped.to_string())
+}
+
+/// Validate that a comment's anchored line range is part of a PR's diff.
+///
+/// GitHub rejects (422) review comments whose line is not in the diff, so this
+/// pre-flights each comment. It walks the unified diff, tracking the current
+/// file's old/new paths and each hunk header. A [`Anchor::DiffLine`] is valid
+/// when some hunk on its side covers the whole `range` for the matching path,
+/// where a header `@@ -a,b +c,d @@` covers old lines `[a, a+b)` and new lines
+/// `[c, c+d)`. Non-`DiffLine` anchors cannot be inline comments and are rejected.
+fn validate_comment_in_diff(comment: &Comment, diff: &str) -> Result<(), String> {
+    let Anchor::DiffLine { path, range, side } = &comment.anchor else {
+        return Err("comment is not anchored to a diff line".to_string());
+    };
+    let (start, end) = *range;
+    let target = path.display().to_string();
+    let side = *side;
+
+    let mut old_path: Option<String> = None;
+    let mut new_path: Option<String> = None;
+
+    for line in diff.lines() {
+        if let Some(value) = line.strip_prefix("--- ") {
+            old_path = parse_file_header_path(value);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("+++ ") {
+            new_path = parse_file_header_path(value);
+            continue;
+        }
+        let Some(hunk) = parse_hunk_header(line) else {
+            continue;
+        };
+
+        let path_matches = match side {
+            DiffSide::New => new_path.as_deref() == Some(target.as_str()),
+            DiffSide::Old => old_path.as_deref() == Some(target.as_str()),
+        };
+        if !path_matches {
+            continue;
+        }
+
+        let (lo, len) = match side {
+            DiffSide::New => (hunk.new_start, hunk.new_len),
+            DiffSide::Old => (hunk.old_start, hunk.old_len),
+        };
+        // Covered lines are [lo, lo + len); the inclusive range [start, end] fits
+        // when start >= lo and end < lo + len.
+        if len > 0 && start >= lo && end < lo + len {
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "line {end} on the {} side of {target} is not part of the diff",
+        match side {
+            DiffSide::New => "new",
+            DiffSide::Old => "old",
+        }
+    ))
+}
+
+/// Assemble the review payload posted to `POST /pulls/<n>/reviews`.
+fn build_review_payload(
+    event: ReviewEvent,
+    body: &str,
+    comments: &[serde_json::Value],
+) -> serde_json::Value {
+    let event_str = match event {
+        ReviewEvent::Approve => "APPROVE",
+        ReviewEvent::RequestChanges => "REQUEST_CHANGES",
+        ReviewEvent::Comment => "COMMENT",
+    };
+    serde_json::json!({
+        "body": body,
+        "event": event_str,
+        "comments": comments,
+    })
+}
+
+/// Submit a review with inline comments to a GitHub PR via the reviews API.
+///
+/// Only [`CommentOrigin::Local`] comments are submitted (the same rule as
+/// [`mirror_comments`]): comments mirrored from GitHub are skipped to avoid
+/// duplicates. Each local comment is pre-validated against `diff` with
+/// [`validate_comment_in_diff`]; invalid comments are recorded in
+/// [`SubmitReviewResult::skipped`] rather than failing the whole review, because
+/// GitHub returns a 422 for the entire request if any line is out of range.
+///
+/// The assembled payload is POSTed with
+/// `gh api --method POST repos/<slug>/pulls/<n>/reviews --input -`, streaming the
+/// JSON to the child's stdin. A non-zero `gh` exit captures stderr into
+/// [`Error::GhCommand`].
+///
+/// This is a guarded side effect (Invariant 5): it is never called automatically
+/// or from agent output.
+pub async fn submit_review(
+    repo_slug: &str,
+    pr_number: u64,
+    event: ReviewEvent,
+    comments: &[Comment],
+    body: &str,
+    diff: &str,
+) -> Result<SubmitReviewResult, Error> {
+    let mut payloads: Vec<serde_json::Value> = Vec::new();
+    let mut skipped: Vec<(CommentId, String)> = Vec::new();
+
+    for comment in comments {
+        // Only locally-authored comments are submitted; GitHub-mirrored ones
+        // would duplicate existing threads.
+        if comment.origin != CommentOrigin::Local {
+            continue;
+        }
+        match validate_comment_in_diff(comment, diff) {
+            Ok(()) => match review_comment_payload(comment) {
+                Some(payload) => payloads.push(payload),
+                None => skipped.push((
+                    comment.id.clone(),
+                    "comment is not anchored to a diff line".to_string(),
+                )),
+            },
+            Err(reason) => skipped.push((comment.id.clone(), reason)),
+        }
+    }
+
+    let submitted = payloads.len();
+    let payload = build_review_payload(event, body, &payloads);
+    let body_bytes = serde_json::to_vec(&payload).map_err(|e| Error::ParseOutput(e.to_string()))?;
+
+    let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}/reviews");
+    let mut child = Command::new("gh")
+        .args(["api", "--method", "POST", &endpoint, "--input", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    // Stream the JSON body to stdin, then drop the handle to signal EOF so `gh`
+    // proceeds. Scoped so the borrow ends before `wait_with_output`.
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::GhCommand("failed to open stdin for gh api".to_string()))?;
+        stdin.write_all(&body_bytes).await?;
+    }
+
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::GhCommand(stderr.into_owned()));
+    }
+
+    Ok(SubmitReviewResult { submitted, skipped })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -868,6 +1358,45 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::model::{DiffData, DiffSide, GateState, Review, ReviewId, ReviewSource};
+
+    // -- author_login (self-exclusion) tests --
+
+    /// Build a minimal search result authored by `login`.
+    fn search_result_by(login: &str) -> SearchPrResult {
+        SearchPrResult {
+            number: 1,
+            title: String::new(),
+            state: "open".into(),
+            url: "https://example/pr/1".into(),
+            repository: SearchRepo {
+                name_with_owner: "owner/repo".into(),
+            },
+            author: SearchAuthor {
+                login: login.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn author_login_lowercases_for_comparison() {
+        let sr = search_result_by("Alejandro");
+        assert_eq!(
+            sr.author_login(),
+            "alejandro",
+            "author_login must lowercase so self-exclusion is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn author_login_matches_differently_cased_identity() {
+        // Mirrors the self-exclusion comparison in `list_prs_filtered`: the
+        // authenticated identity is lowercased too, so a case mismatch between
+        // the search result and `gh_whoami` must still count as "self".
+        let sr = search_result_by("AlejandroPerez");
+        let me = "alejandroperez".to_string();
+        assert_eq!(sr.author_login(), me, "case-insensitive self-match");
+    }
 
     // -- parse_issue_from_branch tests --
 
@@ -1016,6 +1545,7 @@ mod tests {
                 head_ref_name: "alejandro/NEX-100-thing".into(),
                 base_ref_name: "main".into(),
                 title: "Thing".into(),
+                body: String::new(),
                 state: "OPEN".into(),
                 url: "https://github.com/o/r/pull/1".into(),
                 repo_slug: String::new(),
@@ -1025,6 +1555,7 @@ mod tests {
                 head_ref_name: "feature/no-id-here".into(),
                 base_ref_name: "main".into(),
                 title: "No ID".into(),
+                body: String::new(),
                 state: "OPEN".into(),
                 url: "https://github.com/o/r/pull/2".into(),
                 repo_slug: String::new(),
@@ -1034,6 +1565,7 @@ mod tests {
                 head_ref_name: "alejandro/ab-7-short".into(),
                 base_ref_name: "develop".into(),
                 title: "Short".into(),
+                body: String::new(),
                 state: "MERGED".into(),
                 url: "https://github.com/o/r/pull/3".into(),
                 repo_slug: String::new(),
@@ -1093,6 +1625,7 @@ mod tests {
             anchor: Anchor::DiffLine {
                 path: PathBuf::from("src/main.rs"),
                 range: (42, 42),
+                side: DiffSide::New,
             },
             body: "This variable is unused.".into(),
             origin: CommentOrigin::Local,
@@ -1113,6 +1646,7 @@ mod tests {
             anchor: Anchor::DiffLine {
                 path: PathBuf::from("lib/util.rs"),
                 range: (10, 20),
+                side: DiffSide::New,
             },
             body: "Refactor this block.".into(),
             origin: CommentOrigin::Local,
@@ -1172,6 +1706,7 @@ mod tests {
                 anchor: Anchor::DiffLine {
                     path: PathBuf::from("a.rs"),
                     range: (1, 1),
+                    side: DiffSide::New,
                 },
                 body: "fix this".into(),
                 origin: CommentOrigin::Local,
@@ -1181,6 +1716,7 @@ mod tests {
                 anchor: Anchor::DiffLine {
                     path: PathBuf::from("b.rs"),
                     range: (5, 10),
+                    side: DiffSide::New,
                 },
                 body: "from github".into(),
                 origin: CommentOrigin::GitHubMirror,
@@ -1190,6 +1726,7 @@ mod tests {
                 anchor: Anchor::DiffLine {
                     path: PathBuf::from("c.rs"),
                     range: (3, 3),
+                    side: DiffSide::New,
                 },
                 body: "also fix this".into(),
                 origin: CommentOrigin::Local,
@@ -1307,5 +1844,249 @@ mod tests {
         assert_eq!(parsed.failed.len(), 1);
         assert_eq!(parsed.failed[0].0, CommentId::new("c-5"));
         assert_eq!(parsed.failed[0].1, "timeout");
+    }
+
+    // -- review_comment_payload --
+
+    /// Build a diff-line comment for payload/validation tests.
+    fn diff_comment(id: &str, path: &str, range: (u32, u32), side: DiffSide) -> Comment {
+        Comment {
+            id: CommentId::new(id),
+            anchor: Anchor::DiffLine {
+                path: PathBuf::from(path),
+                range,
+                side,
+            },
+            body: "please fix".into(),
+            origin: CommentOrigin::Local,
+        }
+    }
+
+    #[test]
+    fn payload_single_line_new_is_right() {
+        let comment = diff_comment("c-1", "src/main.rs", (42, 42), DiffSide::New);
+        let payload = review_comment_payload(&comment).expect("diff-line yields a payload");
+
+        assert_eq!(payload["path"], "src/main.rs");
+        assert_eq!(payload["line"], 42);
+        assert_eq!(payload["side"], "RIGHT");
+        assert_eq!(payload["body"], "please fix");
+        // Single-line comment carries no multi-line start fields.
+        assert!(payload.get("start_line").is_none());
+        assert!(payload.get("start_side").is_none());
+    }
+
+    #[test]
+    fn payload_range_carries_start_fields() {
+        let comment = diff_comment("c-2", "lib/util.rs", (10, 20), DiffSide::New);
+        let payload = review_comment_payload(&comment).expect("diff-line yields a payload");
+
+        assert_eq!(payload["line"], 20);
+        assert_eq!(payload["side"], "RIGHT");
+        assert_eq!(payload["start_line"], 10);
+        assert_eq!(payload["start_side"], "RIGHT");
+    }
+
+    #[test]
+    fn payload_old_side_is_left() {
+        let comment = diff_comment("c-3", "src/main.rs", (7, 7), DiffSide::Old);
+        let payload = review_comment_payload(&comment).expect("diff-line yields a payload");
+
+        assert_eq!(payload["side"], "LEFT");
+        assert_eq!(payload["line"], 7);
+    }
+
+    #[test]
+    fn payload_plan_step_is_none() {
+        let comment = Comment {
+            id: CommentId::new("c-4"),
+            anchor: Anchor::PlanStep(1),
+            body: "vague".into(),
+            origin: CommentOrigin::Local,
+        };
+        assert!(
+            review_comment_payload(&comment).is_none(),
+            "non-diff-line anchors have no inline payload"
+        );
+    }
+
+    // -- validate_comment_in_diff --
+
+    /// A diff touching `src/main.rs`: old lines [10,13), new lines [10,14).
+    const SAMPLE_DIFF: &str = "\
+diff --git a/src/main.rs b/src/main.rs
+index 1111111..2222222 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,3 +10,4 @@ fn main() {
+ let a = 1;
+-let b = 2;
++let b = 3;
++let c = 4;
+ let d = 5;
+";
+
+    #[test]
+    fn validate_new_line_inside_hunk_ok() {
+        let comment = diff_comment("v-1", "src/main.rs", (12, 12), DiffSide::New);
+        assert!(validate_comment_in_diff(&comment, SAMPLE_DIFF).is_ok());
+    }
+
+    #[test]
+    fn validate_new_line_outside_hunk_err() {
+        let comment = diff_comment("v-2", "src/main.rs", (50, 50), DiffSide::New);
+        let err = validate_comment_in_diff(&comment, SAMPLE_DIFF)
+            .expect_err("line 50 is not part of the diff");
+        assert!(err.contains("50"), "reason names the offending line: {err}");
+    }
+
+    #[test]
+    fn validate_old_line_in_deletion_hunk_ok() {
+        // Old line 11 is the deleted `let b = 2;`, within old range [10,13).
+        let comment = diff_comment("v-3", "src/main.rs", (11, 11), DiffSide::Old);
+        assert!(validate_comment_in_diff(&comment, SAMPLE_DIFF).is_ok());
+    }
+
+    #[test]
+    fn validate_wrong_path_err() {
+        let comment = diff_comment("v-4", "other/file.rs", (11, 11), DiffSide::New);
+        assert!(
+            validate_comment_in_diff(&comment, SAMPLE_DIFF).is_err(),
+            "a path not present in the diff must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_non_diff_line_err() {
+        let comment = Comment {
+            id: CommentId::new("v-5"),
+            anchor: Anchor::PlanFile(PathBuf::from("src/lib.rs")),
+            body: "x".into(),
+            origin: CommentOrigin::Local,
+        };
+        assert!(validate_comment_in_diff(&comment, SAMPLE_DIFF).is_err());
+    }
+
+    // -- build_review_payload --
+
+    #[test]
+    fn review_payload_event_strings() {
+        let cases = [
+            (ReviewEvent::Approve, "APPROVE"),
+            (ReviewEvent::RequestChanges, "REQUEST_CHANGES"),
+            (ReviewEvent::Comment, "COMMENT"),
+        ];
+        for (event, expected) in cases {
+            let payload = build_review_payload(event, "looks good", &[]);
+            assert_eq!(payload["event"], expected);
+            assert_eq!(payload["body"], "looks good");
+            assert_eq!(payload["comments"], serde_json::json!([]));
+        }
+    }
+
+    // -- wire_stack_edges --
+
+    /// Build a minimal [`Review`] for stack-edge tests.
+    fn stack_review(id: &str, branch: &str, base: &str, source: ReviewSource) -> Review {
+        Review {
+            id: ReviewId::new(id),
+            issue: IssueRef::new(format!("ISSUE-{id}")),
+            pr: PrRef::new(format!("owner/repo#{id}")),
+            title: String::new(),
+            body: String::new(),
+            branch: branch.into(),
+            base: base.into(),
+            base_sha: "000".into(),
+            source,
+            worktree: PathBuf::from(format!("/tmp/wt-{id}")),
+            gate_state: GateState::Pending,
+            diff: DiffData { raw: String::new() },
+            head_sha: "aaa".into(),
+            comments: vec![],
+            parents: vec![],
+            children: vec![],
+            stale: false,
+            agent: None,
+            repo_slug: None,
+            project: None,
+            dispatch_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn wire_stack_edges_linear_chain() {
+        let mut reviews = vec![
+            stack_review("a", "fa", "main", ReviewSource::Authored),
+            stack_review("b", "fb", "fa", ReviewSource::Authored),
+            stack_review("c", "fc", "fb", ReviewSource::Authored),
+        ];
+        wire_stack_edges(&mut reviews);
+
+        assert!(reviews[0].parents.is_empty());
+        assert_eq!(reviews[0].children, vec![ReviewId::new("b")]);
+        assert_eq!(reviews[1].parents, vec![ReviewId::new("a")]);
+        assert_eq!(reviews[1].children, vec![ReviewId::new("c")]);
+        assert_eq!(reviews[2].parents, vec![ReviewId::new("b")]);
+        assert!(reviews[2].children.is_empty());
+    }
+
+    #[test]
+    fn wire_stack_edges_diamond_fan_out() {
+        // A is the root; B and C both stack on A; D stacks on B.
+        let mut reviews = vec![
+            stack_review("a", "fa", "main", ReviewSource::Authored),
+            stack_review("b", "fb", "fa", ReviewSource::Authored),
+            stack_review("c", "fc", "fa", ReviewSource::ReviewRequested),
+            stack_review("d", "fd", "fb", ReviewSource::Authored),
+        ];
+        wire_stack_edges(&mut reviews);
+
+        assert!(reviews[0].parents.is_empty());
+        assert_eq!(
+            reviews[0].children,
+            vec![ReviewId::new("b"), ReviewId::new("c")]
+        );
+        assert_eq!(reviews[1].parents, vec![ReviewId::new("a")]);
+        assert_eq!(reviews[1].children, vec![ReviewId::new("d")]);
+        assert_eq!(reviews[2].parents, vec![ReviewId::new("a")]);
+        assert!(reviews[2].children.is_empty());
+        assert_eq!(reviews[3].parents, vec![ReviewId::new("b")]);
+        assert!(reviews[3].children.is_empty());
+    }
+
+    #[test]
+    fn wire_stack_edges_orphan_on_main() {
+        let mut reviews = vec![stack_review(
+            "solo",
+            "fsolo",
+            "main",
+            ReviewSource::Authored,
+        )];
+        wire_stack_edges(&mut reviews);
+        assert!(reviews[0].parents.is_empty());
+        assert!(reviews[0].children.is_empty());
+    }
+
+    #[test]
+    fn wire_stack_edges_preserves_frontier() {
+        // A Frontier review carries kickoff-wired edges; even though its base
+        // matches another review's branch, those edges must be left untouched.
+        let mut frontier = stack_review("f", "ff", "fbase", ReviewSource::Frontier);
+        frontier.parents = vec![ReviewId::new("pre-parent")];
+        frontier.children = vec![ReviewId::new("pre-child")];
+
+        let mut reviews = vec![
+            frontier,
+            stack_review("p", "fbase", "main", ReviewSource::Authored),
+        ];
+        wire_stack_edges(&mut reviews);
+
+        // Frontier edges untouched.
+        assert_eq!(reviews[0].parents, vec![ReviewId::new("pre-parent")]);
+        assert_eq!(reviews[0].children, vec![ReviewId::new("pre-child")]);
+        // The authored review's edges were rebuilt: base=main, no parent; and the
+        // frontier review was NOT added as its child.
+        assert!(reviews[1].parents.is_empty());
+        assert!(reviews[1].children.is_empty());
     }
 }

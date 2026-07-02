@@ -10,6 +10,7 @@ import { SHORTCUTS } from "./lib/shortcuts";
 import type { ShortcutId } from "./lib/shortcuts";
 import { Sidebar } from "./components/Sidebar";
 import { ReviewCard } from "./components/ReviewCard";
+import { StackContainer } from "./components/StackContainer";
 import { ProjectCard } from "./components/ProjectCard";
 import { ReviewWorkspace } from "./components/ReviewWorkspace";
 import { PlanView } from "./components/PlanView";
@@ -36,7 +37,7 @@ import {
   FolderOpen,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { sortByAttention } from "./lib/attention";
+import { buildBoardItems } from "./lib/stack-tree";
 import type { CardDensity } from "./components/ReviewCard";
 import type { GateState } from "./bindings/GateState";
 import type { Review } from "./bindings/Review";
@@ -48,6 +49,13 @@ interface CompletionEventPayload {
   readonly session_id: string;
   readonly object_id: string;
   readonly mode: AgentMode;
+  /**
+   * git-HEAD-authoritative outcome of the completed run: `"reworked"` when a
+   * commit landed, `"failed"` for a no-op/failed run, `"completed"` for a
+   * non-gate-advancing artifact fill. Optional — hand-typed, tolerant of older
+   * payloads.
+   */
+  readonly outcome?: "reworked" | "failed" | "completed";
 }
 
 type ReviewTab = "my-prs" | "review-requests" | "all";
@@ -66,35 +74,70 @@ function assertNever(x: never): never {
   throw new Error(`unreachable: ${String(x)}`);
 }
 
-/** Build a desktop notification title from the agent mode. */
-function notificationTitleForMode(mode: AgentMode): string {
+/** The git-HEAD-authoritative outcome label carried on a completion event. */
+type CompletionOutcome = CompletionEventPayload["outcome"];
+
+/**
+ * Build an outcome-aware desktop notification for a completed agent run.
+ *
+ * The diff-gate rework loop (Fix/Restack) distinguishes a run that actually
+ * landed a commit (`"reworked"` — ready to re-review) from a no-op/failed run
+ * (`"failed"` — comments are preserved for another cycle), since those demand
+ * very different follow-up from the reviewer.
+ */
+function completionNotification(
+  mode: AgentMode,
+  outcome: CompletionOutcome,
+  branch: string,
+): { readonly title: string; readonly body: string } {
   switch (mode) {
     case "Fix":
     case "Restack":
-      return "Rework Complete";
-    case "Plan":
-      return "Plan Rework Complete";
+      return outcome === "failed"
+        ? {
+            title: "Agent Failed",
+            body: `Agent failed on ${branch} — comments preserved`,
+          }
+        : {
+            title: "Rework Complete",
+            body: `PR reworked on ${branch} — ready to re-review`,
+          };
     case "Implement":
-      return "Implementation Complete";
+      return {
+        title: "Implementation Complete",
+        body: `Implementation agent finished on ${branch}`,
+      };
+    case "Plan":
+      return {
+        title: "Plan Rework Complete",
+        body: "Plan agent finished reworking",
+      };
     default:
       return assertNever(mode);
   }
 }
 
-/** Build a desktop notification body from the agent mode and branch name. */
-function notificationBodyForMode(mode: AgentMode, branch: string): string {
-  switch (mode) {
-    case "Fix":
-      return `Fix agent finished on ${branch}`;
-    case "Restack":
-      return `Restack agent finished on ${branch}`;
-    case "Plan":
-      return `Plan agent finished reworking`;
-    case "Implement":
-      return `Implementation agent finished on ${branch}`;
-    default:
-      return assertNever(mode);
-  }
+/** Whether a mode's completion is keyed by a review's PR ref (not a project). */
+function isReviewMode(mode: AgentMode): boolean {
+  return mode === "Fix" || mode === "Restack" || mode === "Implement";
+}
+
+/**
+ * Whether a review-mode completion was already reconciled locally before the
+ * event arrived — i.e. the user stopped the agent (`killAgent` cleared the
+ * review's `agent` handle) or a duplicate stream-end already settled it.
+ *
+ * The frontend store is only refreshed asynchronously, so a *genuine*
+ * completion still shows the agent attached at event time; a stopped one shows
+ * it already cleared. Used to suppress a double-toast after a user Stop.
+ */
+function alreadySettledLocally(objectId: string): boolean {
+  const s = useAppStore.getState();
+  const review =
+    [...s.reviews, ...s.authoredPrs, ...s.reviewRequests].find(
+      (r) => r.pr === objectId,
+    ) ?? (s.activeReview?.pr === objectId ? s.activeReview : null);
+  return review !== null && review !== undefined && review.agent === null;
 }
 
 /** A named group of reviews for the grouped-by-project PRs list. */
@@ -142,7 +185,6 @@ function App() {
   const fetchAuthoredPrs = useAppStore((s) => s.fetchAuthoredPrs);
   const fetchReviewRequests = useAppStore((s) => s.fetchReviewRequests);
   const fetchReviews = useAppStore((s) => s.fetchReviews);
-  const fetchFrontier = useAppStore((s) => s.fetchFrontier);
   const fetchPlan = useAppStore((s) => s.fetchPlan);
   const fetchConfig = useAppStore((s) => s.fetchConfig);
   const listProjects = useAppStore((s) => s.listProjects);
@@ -217,7 +259,6 @@ function App() {
       },
       refresh: () => {
         void fetchReviews();
-        void fetchFrontier();
         void fetchAuthoredPrs();
       },
       "toggle-sidebar": () => {
@@ -246,7 +287,6 @@ function App() {
       navigateToAgents,
       navigateToSettings,
       fetchReviews,
-      fetchFrontier,
       fetchAuthoredPrs,
       toggleSidebar,
       view.kind,
@@ -266,14 +306,20 @@ function App() {
 
   useEffect(() => {
     void fetchReviews();
-    void fetchFrontier();
     void fetchConfig();
     void fetchAuthoredPrs();
     void listProjects();
 
     const unlisten = listen<CompletionEventPayload>("agent-completed", (event) => {
+      const { object_id, mode, outcome } = event.payload;
+
+      // Snapshot BEFORE the async refreshes so a genuine completion (agent still
+      // attached) is distinguished from one the user already stopped (agent
+      // cleared by killAgent). The refreshes below then reconcile local state.
+      const settledLocally =
+        isReviewMode(mode) && alreadySettledLocally(object_id);
+
       void fetchReviews();
-      void fetchFrontier();
       void listProjects();
       // Refresh the open plan (if any) so a completed Plan agent updates it.
       const currentView = useAppStore.getState().view;
@@ -282,15 +328,16 @@ function App() {
       }
       void refreshActiveReview();
 
-      // Best-effort desktop notification. Use the event payload's mode
-      // to differentiate the notification title and body.
-      const { mode } = event.payload;
+      // Suppress the notification for a run the user already stopped — otherwise
+      // the killed process's straggler completion would double-toast.
+      if (settledLocally) return;
+
+      // Best-effort desktop notification, outcome-aware so a failed rework reads
+      // differently from one that landed a commit.
       const current = useAppStore.getState().activeReview;
       const branch = current !== null ? current.branch : "a review";
-      void sendNotification({
-        title: notificationTitleForMode(mode),
-        body: notificationBodyForMode(mode, branch),
-      });
+      const { title, body } = completionNotification(mode, outcome, branch);
+      void sendNotification({ title, body });
     });
 
     return () => {
@@ -300,7 +347,6 @@ function App() {
     };
   }, [
     fetchReviews,
-    fetchFrontier,
     fetchPlan,
     fetchConfig,
     fetchAuthoredPrs,
@@ -359,6 +405,7 @@ function App() {
         case "InReview":
         case "Dispatched":
         case "Approved":
+        case "Merged":
           void navigateToDiff(pr);
           break;
         default:
@@ -472,15 +519,26 @@ function App() {
           </span>
         </h2>
         <div className={prsDensity === "compact" ? "space-y-1.5" : "space-y-3"}>
-          {sortByAttention(group.reviews).map((review) => (
-            <ReviewCard
-              key={review.id}
-              review={review}
-              density={prsDensity}
-              onAction={handleReviewAction}
-              onRestack={handleRestack}
-            />
-          ))}
+          {buildBoardItems(group.reviews).map((item) =>
+            item.kind === "single" ? (
+              <ReviewCard
+                key={item.review.id}
+                review={item.review}
+                density={prsDensity}
+                onAction={handleReviewAction}
+                onRestack={handleRestack}
+              />
+            ) : (
+              <StackContainer
+                key={item.root.review.id}
+                root={item.root}
+                nodes={item.nodes}
+                density={prsDensity}
+                onAction={handleReviewAction}
+                onRestack={handleRestack}
+              />
+            ),
+          )}
         </div>
       </section>
     ));

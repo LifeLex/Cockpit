@@ -5,32 +5,27 @@
 
 pub mod shell;
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::State;
 
 use cockpit_core::adapters::agent::SpawnConfig;
-use cockpit_core::adapters::github::{self, MirrorResult};
+use cockpit_core::adapters::github::{self, MirrorResult, ReviewEvent, SubmitReviewResult};
 use cockpit_core::adapters::linear;
 use cockpit_core::config::Config;
 use cockpit_core::gate::Gated;
 use cockpit_core::kickoff::{self, KickoffResult};
 use cockpit_core::model::{
-    AgentMode, Anchor, Artifact, Comment, CommentId, CommentOrigin, DiffData, GateState, PrRef,
-    Project, ProjectId, ProjectPlan, ProjectRef, Review,
+    AgentMode, Anchor, Artifact, Comment, CommentId, CommentOrigin, DiffData, DiffSide, GateState,
+    PlanDoc, PrRef, Project, ProjectId, ProjectPlan, ProjectRef, Review, ReviewSource,
 };
 use cockpit_core::plan_parser;
 use cockpit_core::restack;
 
 use crate::error::CommandError;
 use crate::state::AppState;
-
-/// Return the cockpit-core crate version — trivial command to prove IPC round-trip.
-#[tauri::command]
-pub fn get_version() -> String {
-    cockpit_core::VERSION.to_string()
-}
 
 /// List all reviews currently in the store.
 #[tauri::command]
@@ -45,7 +40,9 @@ pub fn get_frontier(state: State<'_, Arc<AppState>>) -> Result<Vec<Review>, Comm
         .reviews
         .list()
         .into_iter()
-        .filter(|r| !r.stale && r.gate_state != GateState::Approved)
+        .filter(|r| {
+            !r.stale && r.gate_state != GateState::Approved && r.gate_state != GateState::Merged
+        })
         .collect();
     Ok(frontier)
 }
@@ -87,10 +84,74 @@ pub fn get_review_diff(
     Ok(review.diff.clone())
 }
 
+/// Return the interdiff for a review: the changes since the last dispatch (D10).
+///
+/// Diffs the review's [`DispatchSnapshot::reviewed_sha`] against the current
+/// HEAD so a re-reviewer sees only what the rework changed, not the whole PR
+/// again. Requires a recorded dispatch snapshot (typed error otherwise).
+///
+/// When the review has a cockpit-managed worktree present on disk, the diff is
+/// computed locally with
+/// [`git::diff_range`](cockpit_core::adapters::git::diff_range) (off the async
+/// runtime, since `git2` is blocking). Otherwise it falls back to the GitHub
+/// compare API between the snapshot SHA and the review's `head_sha` (requiring a
+/// `repo_slug`). Returned in the same [`DiffData`] shape as
+/// [`get_review_diff`].
+#[tauri::command]
+pub async fn get_interdiff(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+) -> Result<DiffData, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    let snapshot = review.dispatch_snapshot.clone().ok_or_else(|| CommandError {
+        message: format!(
+            "Review {pr} has no dispatch snapshot; request changes first to establish an interdiff baseline"
+        ),
+    })?;
+
+    let config = Config::load()?;
+    let repo_path = config
+        .repo_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Prefer a truthful local diff when a managed worktree exists on disk.
+    if is_managed_worktree(&review.worktree, &repo_path) && review.worktree.exists() {
+        let worktree = review.worktree.clone();
+        let from = snapshot.reviewed_sha.clone();
+        let raw = tokio::task::spawn_blocking(move || {
+            cockpit_core::adapters::git::diff_range(&worktree, &from, "HEAD")
+        })
+        .await
+        .map_err(|e| CommandError {
+            message: format!("interdiff task panicked: {e}"),
+        })?
+        .map_err(|e| CommandError {
+            message: format!("interdiff failed: {e}"),
+        })?;
+        return Ok(DiffData { raw });
+    }
+
+    // Fall back to GitHub compare for imported PRs with no local worktree.
+    let repo_slug = review.repo_slug.clone().ok_or_else(|| CommandError {
+        message: format!(
+            "Review {pr} has no local worktree and no repo slug; cannot compute an interdiff"
+        ),
+    })?;
+    let raw = github::compare(&repo_slug, &snapshot.reviewed_sha, &review.head_sha).await?;
+    Ok(DiffData { raw })
+}
+
 /// Add an anchored comment to a review at the diff gate.
 ///
 /// Creates an ephemeral [`Comment`] with a `DiffLine` anchor and
-/// appends it to the review's comment list.
+/// appends it to the review's comment list. `side` selects which side of the
+/// diff the range refers to; `None` defaults to [`DiffSide::New`] so existing
+/// callers keep commenting on the post-change side unchanged (D12).
 #[tauri::command]
 pub fn add_comment(
     state: State<'_, Arc<AppState>>,
@@ -99,6 +160,7 @@ pub fn add_comment(
     line_start: u32,
     line_end: u32,
     body: String,
+    side: Option<DiffSide>,
 ) -> Result<Review, CommandError> {
     let pr_ref = PrRef::new(&pr);
 
@@ -108,6 +170,7 @@ pub fn add_comment(
         anchor: Anchor::DiffLine {
             path: PathBuf::from(&file),
             range: (line_start, line_end),
+            side: side.unwrap_or(DiffSide::New),
         },
         body,
         origin: CommentOrigin::Local,
@@ -144,6 +207,13 @@ pub async fn request_changes(
 
     let mut transition_err: Option<cockpit_core::gate::Error> = None;
     let found = state.reviews.update(&pr_ref, |review| {
+        // D10: snapshot the pre-rework head + the comments being dispatched
+        // *before* advancing the gate, so the audit record reflects exactly
+        // what this cycle asked for. Guarded to the states where the transition
+        // will succeed so a rejected transition never leaves a bogus snapshot.
+        if review.gate_state == GateState::InReview && !review.comments.is_empty() {
+            review.snapshot_dispatch();
+        }
         if let Err(e) = review.request_changes() {
             transition_err = Some(e);
         }
@@ -159,6 +229,13 @@ pub async fn request_changes(
         return Err(CommandError::from(e));
     }
 
+    // D7: dispatching rework makes this review's descendants stale — once its
+    // HEAD advances they sit on an old base and need a restack. Mark them at
+    // dispatch time (SPEC §7), immediately after the successful transition.
+    if let Some(id) = state.reviews.get(&pr_ref).map(|r| r.id) {
+        state.reviews.mark_descendants_stale(&id);
+    }
+
     // Spawn the fixer agent via the shared Fix-loop path (no CI logs here).
     // Spawn failure is non-fatal — the gate transition already succeeded so we
     // return the Dispatched review regardless and log the spawn error.
@@ -167,6 +244,50 @@ pub async fn request_changes(
     state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
         message: format!("Review not found: {pr}"),
     })
+}
+
+/// Maximum number of PR-body characters carried into a rework intent.
+///
+/// A very long PR description would otherwise dominate the prompt; truncating
+/// keeps the fixer focused while still giving it the leading context.
+const MAX_INTENT_BODY_CHARS: usize = 8000;
+
+/// Compose the rework intent from a review's PR title, body, and issue ref.
+///
+/// Lays out the parts as `<title>` / `<body>` / `Issue: <ref>` separated by
+/// blank lines, skipping any empty part so there are no stray blank lines. The
+/// body is truncated to [`MAX_INTENT_BODY_CHARS`] characters on a `char`
+/// boundary (D4).
+fn compose_fix_intent(title: &str, body: &str, issue: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let title = title.trim();
+    if !title.is_empty() {
+        parts.push(title.to_string());
+    }
+
+    let body = truncate_on_char_boundary(body.trim(), MAX_INTENT_BODY_CHARS);
+    if !body.is_empty() {
+        parts.push(body.to_string());
+    }
+
+    let issue = issue.trim();
+    if !issue.is_empty() {
+        parts.push(format!("Issue: {issue}"));
+    }
+
+    parts.join("\n\n")
+}
+
+/// Return the prefix of `s` holding at most `max_chars` characters.
+///
+/// Slices on a `char` boundary (never mid-codepoint), so the result is always
+/// valid UTF-8.
+fn truncate_on_char_boundary(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
 }
 
 /// Dispatch the diff-gate Fix loop for a review already transitioned to
@@ -189,6 +310,23 @@ async fn dispatch_fix_agent(
         return;
     };
 
+    // D12: ensure a usable worktree before spawning. An imported same-repo PR
+    // points at the user's shared checkout; materialize a dedicated branch
+    // worktree so the fixer commits on the PR branch and the HEAD-based outcome
+    // detection is truthful. Failure is non-fatal (Invariant 1): surface it and
+    // bail rather than spawning against the wrong tree.
+    let worktree = match ensure_worktree_for_review(state, pr_ref).await {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("dispatch_fix_agent: ensure worktree failed: {e}");
+            let error_event = cockpit_core::adapters::agent_stream::Event::Error {
+                message: format!("Preparing worktree failed: {e}"),
+            };
+            crate::streaming::emit_agent_event(app_handle, pr, error_event);
+            return;
+        }
+    };
+
     // Load config once so the per-mode custom preamble and agent command are
     // both honored. A load failure is non-fatal — fall back to defaults (no
     // preamble, builtin command) so rework still dispatches.
@@ -200,10 +338,22 @@ async fn dispatch_fix_agent(
     // (fall back to no skills — never block the loop).
     let skills = cockpit_core::skills::relevant_for_diff(&review.diff.raw);
     let artifact = Artifact::Diff(review.diff.clone());
+    // Compose the rework intent from the PR title/body/issue so the fixer has
+    // the full context, not just the bare issue ref (D4).
+    let intent = compose_fix_intent(&review.title, &review.body, review.issue.as_str());
+    // D8/SPEC §9: thread the project's approved plan into the rework prompt as
+    // the contract, but only for reviews whose project has an approved plan.
+    let approved_plan = review.project.as_ref().and_then(|pid| {
+        state
+            .projects
+            .plan(pid)
+            .filter(|p| p.gate_state == GateState::Approved)
+            .map(|p| p.doc)
+    });
     let rework_input = cockpit_core::prompt::ReworkInput {
-        intent: review.issue.as_str(),
+        intent: &intent,
         custom_preamble: preamble.as_deref(),
-        approved_plan: None,
+        approved_plan: approved_plan.as_ref(),
         artifact: &artifact,
         comments: &review.comments,
         ci_failures,
@@ -211,7 +361,7 @@ async fn dispatch_fix_agent(
     };
     let assembled = cockpit_core::prompt::assemble_rework(&rework_input);
 
-    match try_spawn_agent(state, app_handle, pr, pr_ref, &review.worktree, &assembled).await {
+    match try_spawn_agent(state, app_handle, pr, pr_ref, &worktree, &assembled).await {
         Ok(agent_run) => {
             state.reviews.update(pr_ref, |r| {
                 r.agent = Some(agent_run);
@@ -219,11 +369,12 @@ async fn dispatch_fix_agent(
         }
         Err(e) => {
             eprintln!("dispatch_fix_agent: agent spawn failed: {e}");
-            use tauri::Emitter;
+            // Surface the spawn failure to the agent panel, keyed by the
+            // review's PR ref so the frontend attributes it to the right object.
             let error_event = cockpit_core::adapters::agent_stream::Event::Error {
                 message: format!("Agent spawn failed: {e}"),
             };
-            let _ = app_handle.emit("agent-event", &error_event);
+            crate::streaming::emit_agent_event(app_handle, pr, error_event);
         }
     }
 }
@@ -267,6 +418,90 @@ async fn try_spawn_agent(
 }
 
 // ---------------------------------------------------------------------------
+// Worktree materialization
+// ---------------------------------------------------------------------------
+
+/// Whether `worktree` is a cockpit-managed worktree rather than the user's
+/// shared repo checkout at `repo_path`.
+///
+/// Managed worktrees live under the cockpit worktrees dir (kickoff reviews) or a
+/// per-repo clone (cross-repo fix worktrees); either way they are never the
+/// configured `repo_path`, which is where imported same-repo PRs point until a
+/// fix materializes a dedicated worktree.
+fn is_managed_worktree(worktree: &Path, repo_path: &Path) -> bool {
+    worktree != repo_path
+}
+
+/// Ensure a review has a usable worktree on disk, materializing one for imported
+/// PRs, and return its path (D12).
+///
+/// Kickoff reviews (and previously-materialized ones) already live in a
+/// cockpit-managed worktree — this returns it unchanged. A GitHub-imported
+/// same-repo PR instead points at the user's shared repo checkout; its PR branch
+/// is checked out into a dedicated worktree via
+/// [`git::ensure_branch_checkout`](cockpit_core::adapters::git::ensure_branch_checkout),
+/// recorded on the review, so rework and interdiff operate on the PR branch and
+/// HEAD-based outcome detection is truthful.
+///
+/// Shared by the [`ensure_review_worktree`] command and [`dispatch_fix_agent`].
+async fn ensure_worktree_for_review(
+    state: &AppState,
+    pr_ref: &PrRef,
+) -> Result<PathBuf, CommandError> {
+    let review = state.reviews.get(pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr_ref}"),
+    })?;
+
+    let config = Config::load()?;
+    let repo_path = config
+        .repo_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Already a managed worktree: use it as-is.
+    if is_managed_worktree(&review.worktree, &repo_path) {
+        return Ok(review.worktree.clone());
+    }
+
+    // Imported same-repo PR pointing at the shared checkout: materialize a
+    // dedicated branch worktree and record it on the review.
+    let new_path = cockpit_core::adapters::git::ensure_branch_checkout(
+        &repo_path,
+        &review.branch,
+        review.repo_slug.as_deref(),
+    )
+    .await
+    .map_err(|e| CommandError {
+        message: format!(
+            "failed to check out branch `{}` for {pr_ref}: {e}",
+            review.branch
+        ),
+    })?;
+
+    state.reviews.update(pr_ref, |r| {
+        r.worktree = new_path.clone();
+    });
+
+    Ok(new_path)
+}
+
+/// Ensure a review has a checked-out worktree on disk, returning its path (D12).
+///
+/// A no-op returning the existing path for kickoff reviews; for a GitHub-imported
+/// same-repo PR it checks the PR branch out into a dedicated worktree (recorded
+/// on the review) so rework and interdiff operate on the PR branch rather than
+/// the user's shared checkout. This is an explicit, idempotent user action.
+#[tauri::command]
+pub async fn ensure_review_worktree(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+) -> Result<String, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let path = ensure_worktree_for_review(&state, &pr_ref).await?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+// ---------------------------------------------------------------------------
 // Comment mirroring
 // ---------------------------------------------------------------------------
 
@@ -291,6 +526,86 @@ pub async fn mirror_comments(
         .map_err(|e| CommandError {
             message: e.to_string(),
         })?;
+
+    Ok(result)
+}
+
+/// Submit a GitHub PR review (approve / request changes / comment) carrying the
+/// review's inline Local comments (D9).
+///
+/// This is a guarded outward side effect (Invariant 5): it publishes to a public
+/// GitHub thread and must only ever be invoked from an explicit user action in
+/// the UI, never automatically or from agent output.
+///
+/// Requires a `repo_slug` (typed error otherwise). The review's Local-origin
+/// comments are submitted inline; [`github::submit_review`] pre-validates each
+/// against the PR diff, recording any whose anchored line is not part of the
+/// diff in [`SubmitReviewResult::skipped`] rather than failing the whole review.
+///
+/// On success:
+/// - `Approve` on a review-requested PR also advances the local gate to
+///   `Approved` (opening from `Pending`/`Reworked` first, like [`approve_review`]).
+///   No local agent is ever dispatched here.
+/// - `RequestChanges`/`Comment` clear the Local comments that were actually
+///   submitted (they now live on GitHub; keeping local copies would
+///   double-report), leaving skipped ones in place so the user can fix and retry.
+#[tauri::command]
+pub async fn submit_github_review(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+    event: ReviewEvent,
+    body: Option<String>,
+) -> Result<SubmitReviewResult, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    let repo_slug = review.repo_slug.clone().ok_or_else(|| CommandError {
+        message: format!("Review {pr} has no repo slug; cannot submit a GitHub review"),
+    })?;
+    let pr_number = pr_number_from_ref(&pr).ok_or_else(|| CommandError {
+        message: format!("Could not parse a PR number from: {pr}"),
+    })?;
+
+    // `submit_review` filters to Local-origin comments and validates each against
+    // the diff, so pass the full comment list plus the review's diff.
+    let result = github::submit_review(
+        &repo_slug,
+        pr_number,
+        event,
+        &review.comments,
+        &body.unwrap_or_default(),
+        &review.diff.raw,
+    )
+    .await?;
+
+    match event {
+        ReviewEvent::Approve => {
+            // Mirror the GitHub approval locally only for review-requested PRs
+            // (cockpit's own authored PRs use approve_review + merge). Best-effort:
+            // the GitHub review already succeeded, so a local transition error is
+            // ignored rather than surfaced.
+            if review.source == ReviewSource::ReviewRequested {
+                state.reviews.update(&pr_ref, |r| {
+                    if matches!(r.gate_state, GateState::Pending | GateState::Reworked) {
+                        let _ = r.open();
+                    }
+                    let _ = r.approve();
+                });
+            }
+        }
+        ReviewEvent::RequestChanges | ReviewEvent::Comment => {
+            // Clear the Local comments that were submitted; keep skipped ones so
+            // the user can fix and retry. Non-Local (GitHub-mirrored) comments
+            // are always kept.
+            let skipped: Vec<CommentId> = result.skipped.iter().map(|(id, _)| id.clone()).collect();
+            state.reviews.update(&pr_ref, |r| {
+                r.comments
+                    .retain(|c| c.origin != CommentOrigin::Local || skipped.contains(&c.id));
+            });
+        }
+    }
 
     Ok(result)
 }
@@ -474,16 +789,24 @@ pub async fn fix_ci(
     // as a transition error below.
     let mut transition_err: Option<cockpit_core::gate::Error> = None;
     state.reviews.update(&pr_ref, |r| {
-        if r.gate_state == GateState::Reworked
+        // Auto-open from Pending/Reworked so the gate can dispatch. A failing
+        // open bails before we touch comments.
+        if matches!(r.gate_state, GateState::Pending | GateState::Reworked)
             && let Err(e) = r.open()
         {
             transition_err = Some(e);
             return;
         }
-        if r.gate_state == GateState::Pending
-            && let Err(e) = r.open()
-        {
-            transition_err = Some(e);
+
+        // Guard: only mutate the review when it is in a state `request_changes`
+        // will accept (InReview). Pushing the synthetic comment first and only
+        // then discovering the transition is illegal would leave a stray CI
+        // comment behind, so bail here without mutating.
+        if r.gate_state != GateState::InReview {
+            transition_err = Some(cockpit_core::gate::Error::IllegalTransition {
+                from: r.gate_state,
+                event: "request_changes",
+            });
             return;
         }
 
@@ -496,23 +819,38 @@ pub async fn fix_ci(
              job logs; fix the failing checks."
                 .to_string()
         };
+        let comment_id = CommentId::new(format!("ci-{}", uuid::Uuid::new_v4()));
         r.comments.push(Comment {
-            id: CommentId::new(format!("ci-{}", uuid::Uuid::new_v4())),
+            id: comment_id.clone(),
             anchor: Anchor::DiffLine {
                 path: PathBuf::from("CI"),
                 range: (0, 0),
+                side: DiffSide::New,
             },
             body: summary,
             origin: CommentOrigin::Local,
         });
 
+        // D10: snapshot the pre-rework head + the synthetic CI comment being
+        // dispatched, before the gate advances to Dispatched. State is InReview
+        // by the guard above.
+        r.snapshot_dispatch();
+
         if let Err(e) = r.request_changes() {
+            // Roll back the synthetic comment so a rejected transition never
+            // leaves a stray CI comment on the review.
+            r.comments.retain(|c| c.id != comment_id);
             transition_err = Some(e);
         }
     });
 
     if let Some(e) = transition_err {
         return Err(CommandError::from(e));
+    }
+
+    // D7: same as request_changes — dispatching rework staled the descendants.
+    if let Some(id) = state.reviews.get(&pr_ref).map(|r| r.id) {
+        state.reviews.mark_descendants_stale(&id);
     }
 
     // Reuse the shared Fix-loop spawn path, carrying the CI logs into the
@@ -759,11 +1097,12 @@ pub async fn plan_request_changes(
         }
         Err(e) => {
             eprintln!("plan_request_changes: planner spawn failed: {e}");
-            use tauri::Emitter;
+            // Surface the spawn failure to the agent panel, keyed by the
+            // project id so the frontend attributes it to the right plan.
             let error_event = cockpit_core::adapters::agent_stream::Event::Error {
                 message: format!("Planner spawn failed: {e}"),
             };
-            let _ = app_handle.emit("agent-event", &error_event);
+            crate::streaming::emit_agent_event(&app_handle, &project_id, error_event);
         }
     }
 
@@ -828,6 +1167,7 @@ async fn spawn_plan_agent(
 #[tauri::command]
 pub async fn plan_approve(
     state: State<'_, Arc<AppState>>,
+    app_handle: tauri::AppHandle,
     project_id: String,
 ) -> Result<ProjectPlan, CommandError> {
     let id = ProjectId::new(&project_id);
@@ -839,88 +1179,268 @@ pub async fn plan_approve(
         *slot = Some(approved);
     });
 
-    // Fan out implementers for THIS project's frontier reviews only, scoped by
-    // the first-class ProjectId. The approval stands regardless; a fan-out
-    // failure is surfaced to the caller but does not roll back the
-    // (authoritative) gate transition.
-    fan_out_implementers(&state, &plan.project, &id).await?;
+    // D8: prepare worktrees synchronously (git2 is not `Send`), then fan out
+    // implementers on a background task so this command returns the Approved
+    // plan immediately instead of blocking until every implementer finishes.
+    // The approval already stands; a fan-out failure is surfaced only via the
+    // agent-event streams and never rolls back the (authoritative) gate
+    // transition (Invariant 1/5).
+    let state_arc: Arc<AppState> = state.inner().clone();
+    spawn_background_fan_out(state_arc, &app_handle, &plan.project, &id, plan.doc.clone());
 
     plan_for(&state, &id)
 }
 
-/// Spawn implementer agents for a project's frontier reviews after approval.
+/// Prepare worktrees and launch the background implementer fan-out for a
+/// project's frontier reviews after plan approval (D8).
 ///
-/// Loads the project's reviews from the store, selects the frontier (roots of
-/// the stack), and runs [`kickoff::spawn_batch`] with the configured
-/// concurrency bound. Updates each spawned review's `base_sha` and `agent` in
-/// the store; the reviews stay `Pending`.
-async fn fan_out_implementers(
-    state: &AppState,
+/// Worktree creation needs the non-`Send` `git2::Repository`, so it runs
+/// synchronously here (the repo is dropped before the task spawn). The bounded
+/// agent fan-out then runs on a background task ([`run_fan_out`]) so the calling
+/// command does not block. Every failure mode is non-fatal: the plan approval is
+/// authoritative and already applied, so a prep failure is logged and surfaced
+/// as a per-project agent-event rather than rolled back (Invariant 1/5).
+fn spawn_background_fan_out(
+    state: Arc<AppState>,
+    app_handle: &tauri::AppHandle,
     project: &ProjectRef,
     project_id: &ProjectId,
-) -> Result<(), CommandError> {
-    let config = Config::load()?;
+    approved_plan: PlanDoc,
+) {
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("plan_approve fan-out: config load failed: {e}");
+            emit_fan_out_error(app_handle, project_id, &format!("config load failed: {e}"));
+            return;
+        }
+    };
     let repo_path = config
         .repo_path
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
-
-    // Collect this project's reviews, then narrow to the frontier (roots).
-    let mut reviews = cockpit_core::store::reviews_by_project(&state.reviews, Some(project_id));
-    let frontier_ids = kickoff::select_frontier_reviews(&reviews);
-    reviews.retain(|r| frontier_ids.contains(&r.id));
-
-    if reviews.is_empty() {
-        // Nothing to build (e.g. plan-only project); approval already stands.
-        return Ok(());
-    }
-
-    // Phase 1 (synchronous): prepare worktrees. `git2::Repository` is not
-    // `Send`, so it must not live across the `.await` below — scope it here so
-    // it is dropped before spawning.
     // Implement-mode custom preamble, injected verbatim into every implementer
     // prompt (builtin fallback when unset).
     let implement_preamble = config
         .agent_prompts
         .for_mode(AgentMode::Implement)
         .map(str::to_owned);
-    let prepared = {
-        let repo = git2::Repository::discover(&repo_path).map_err(|e| CommandError {
-            message: format!("could not open git repo at {}: {e}", repo_path.display()),
-        })?;
-        kickoff::prepare_batch_worktrees(
+
+    // Collect this project's reviews, then narrow to the frontier (roots).
+    let mut reviews = cockpit_core::store::reviews_by_project(&state.reviews, Some(project_id));
+    let frontier_ids = kickoff::select_frontier_reviews(&reviews);
+    reviews.retain(|r| frontier_ids.contains(&r.id));
+    if reviews.is_empty() {
+        // Nothing to build (e.g. a plan-only project); approval already stands.
+        return;
+    }
+
+    // Phase 1 (synchronous, non-Send git2): create the worktrees and record each
+    // review's base_sha. The prompts `prepare_batch_worktrees` builds carry no
+    // plan, so they are discarded — the per-review prompts are rebuilt below to
+    // thread the approved plan in.
+    {
+        let repo = match git2::Repository::discover(&repo_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("plan_approve fan-out: could not open git repo: {e}");
+                emit_fan_out_error(
+                    app_handle,
+                    project_id,
+                    &format!("could not open git repo: {e}"),
+                );
+                return;
+            }
+        };
+        if let Err(e) = kickoff::prepare_batch_worktrees(
             &mut reviews,
             &repo,
             project,
             implement_preamble.as_deref(),
-        )
-        .map_err(CommandError::from)?
-    };
+        ) {
+            eprintln!("plan_approve fan-out: prepare worktrees failed: {e}");
+            emit_fan_out_error(
+                app_handle,
+                project_id,
+                &format!("prepare worktrees failed: {e}"),
+            );
+            return;
+        }
+    }
 
-    let spawn_config = SpawnConfig::from_config(&config);
-    let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
-
-    let kickoff_config = kickoff::KickoffConfig {
-        session_map: &state.sessions,
-        hook_url: &hook_url,
-        spawn_config: &spawn_config,
-        max_parallel_agents: config.max_parallel_agents,
-    };
-
-    // Phase 2 (async): bounded agent fan-out. No repo handle in scope.
-    kickoff::spawn_batch(&mut reviews, &prepared, &kickoff_config)
-        .await
-        .map_err(CommandError::from)?;
-
-    // Persist the spawned agents + base SHAs back into the store.
+    // Persist each review's base_sha now that its worktree exists.
     for review in &reviews {
         state.reviews.update(&review.pr, |r| {
             r.base_sha = review.base_sha.clone();
-            r.agent = review.agent.clone();
         });
     }
 
-    Ok(())
+    // Build the per-review implement prompt + spawn job, threading the approved
+    // plan into each (SPEC §9). Reuses kickoff's exact prompt text.
+    let jobs: Vec<(Review, cockpit_core::prompt::AssembledPrompt)> = reviews
+        .iter()
+        .map(|review| {
+            let prompt = kickoff::assemble_implement_prompt(
+                review,
+                project,
+                Some(&approved_plan),
+                implement_preamble.as_deref(),
+            );
+            (review.clone(), prompt)
+        })
+        .collect();
+
+    let spawn_config = SpawnConfig::from_config(&config);
+    let hook_url = format!("http://127.0.0.1:{}/hook/stop", config.hook_port);
+    let max_parallel = config.max_parallel_agents.max(1) as usize;
+    let app_handle = app_handle.clone();
+
+    // Phase 2 (async, no repo handle in scope): bounded agent fan-out.
+    tauri::async_runtime::spawn(async move {
+        run_fan_out(
+            state,
+            app_handle,
+            jobs,
+            max_parallel,
+            spawn_config,
+            hook_url,
+        )
+        .await;
+    });
+}
+
+/// Run the bounded implementer fan-out in waves of at most `max_parallel` agents.
+///
+/// Each review is spawned via the same streaming path the diff-gate Fix loop
+/// uses (`spawn_agent` + `start_stream_forwarding`), keyed by its PR ref, with
+/// its running agent recorded in the store as it spawns. A wave is not started
+/// until the previous wave's agents have completed — completions arrive on the
+/// broadcast channel that `start_stream_forwarding` fires when each process
+/// exits — which is the concurrency bound. A spawn failure is surfaced as a
+/// per-review agent-event and simply not awaited (Invariant 1). The reviews stay
+/// `Pending`; nothing auto-advances (Invariant 5).
+async fn run_fan_out(
+    state: Arc<AppState>,
+    app_handle: tauri::AppHandle,
+    jobs: Vec<(Review, cockpit_core::prompt::AssembledPrompt)>,
+    max_parallel: usize,
+    spawn_config: SpawnConfig,
+    hook_url: String,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    // Subscribe before spawning so no completion can be missed.
+    let mut completions = state.completion_tx.subscribe();
+
+    for wave in jobs.chunks(max_parallel) {
+        // PR refs we must see complete before starting the next wave.
+        let mut pending: HashSet<String> = HashSet::new();
+
+        for (review, prompt) in wave {
+            let spawn_result = cockpit_core::adapters::agent::spawn_agent(
+                &review.worktree,
+                prompt,
+                AgentMode::Implement,
+                review.pr.as_str(),
+                &state.sessions,
+                &hook_url,
+                &spawn_config,
+            )
+            .await;
+
+            match spawn_result {
+                Ok(spawn_result) => {
+                    let stream_ctx = crate::streaming::StreamContext {
+                        object_id: review.pr.as_str().to_string(),
+                        mode: AgentMode::Implement,
+                        completion_tx: state.completion_tx.clone(),
+                    };
+                    let run = crate::streaming::start_stream_forwarding(
+                        spawn_result,
+                        app_handle.clone(),
+                        stream_ctx,
+                    );
+                    state.reviews.update(&review.pr, |r| {
+                        r.agent = Some(run);
+                    });
+                    pending.insert(review.pr.as_str().to_string());
+                }
+                Err(e) => {
+                    eprintln!("plan_approve fan-out: spawn failed for {}: {e}", review.pr);
+                    let error_event = cockpit_core::adapters::agent_stream::Event::Error {
+                        message: format!("Implementer spawn failed: {e}"),
+                    };
+                    crate::streaming::emit_agent_event(
+                        &app_handle,
+                        review.pr.as_str(),
+                        error_event,
+                    );
+                }
+            }
+        }
+
+        // Wait for this wave's implementers to finish before starting the next.
+        //
+        // Completions arrive on a shared, bounded broadcast that can drop
+        // messages: a `Lagged` error means we already missed at least one, and a
+        // completion can even be missed with no detected lag (another subscriber
+        // drains its slot first). Either way a PR could sit in `pending` forever
+        // and stall every later wave. The store — not the channel — is the
+        // durable source of truth for "still building": the global completion
+        // consumer clears a review's `agent` handle once it applies the
+        // completion. So on detected lag reconcile `pending` against the store,
+        // and add a periodic safety tick so even a silently-missed completion
+        // eventually unblocks the wave.
+        let mut safety_tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        // The first tick fires immediately; skip it so we do not reconcile before
+        // any agent has had a chance to run.
+        safety_tick.tick().await;
+
+        while !pending.is_empty() {
+            tokio::select! {
+                recv = completions.recv() => match recv {
+                    Ok(event) => {
+                        if event.mode == AgentMode::Implement {
+                            pending.remove(&event.object_id);
+                        }
+                    }
+                    // Detected lag: at least one completion was dropped.
+                    // Reconcile so a lost completion cannot pin a PR in `pending`.
+                    Err(RecvError::Lagged(_)) => reconcile_pending(&state, &mut pending),
+                    // Channel closed (app shutting down): stop the fan-out.
+                    Err(RecvError::Closed) => return,
+                },
+                // Safety tick: catch completions missed without a detected lag.
+                _ = safety_tick.tick() => reconcile_pending(&state, &mut pending),
+            }
+        }
+    }
+}
+
+/// Drop from `pending` any PR whose review no longer has a running agent (or no
+/// longer exists), reconciling the wave gate against the store.
+///
+/// [`run_fan_out`] waits on a shared, bounded completion broadcast that can drop
+/// messages, so it cannot rely on seeing every completion. The store's `agent`
+/// handle — cleared by the global completion consumer once a completion is
+/// applied — is the durable signal for whether an implementer is still running,
+/// so it is what the wave gate reconciles against.
+fn reconcile_pending(state: &AppState, pending: &mut HashSet<String>) {
+    pending.retain(|pr| {
+        state
+            .reviews
+            .get(&PrRef::new(pr.as_str()))
+            .is_some_and(|review| review.agent.is_some())
+    });
+}
+
+/// Surface an implementer fan-out preparation failure to the project's agent
+/// panel, keyed by the project id so the frontend attributes it correctly.
+fn emit_fan_out_error(app_handle: &tauri::AppHandle, project_id: &ProjectId, message: &str) {
+    let event = cockpit_core::adapters::agent_stream::Event::Error {
+        message: format!("Implementer fan-out failed: {message}"),
+    };
+    crate::streaming::emit_agent_event(app_handle, project_id.as_str(), event);
 }
 
 /// Return the [`BatchStatus`] for a project's reviews.
@@ -987,6 +1507,188 @@ pub fn approve_review(state: State<'_, Arc<AppState>>, pr: String) -> Result<Rev
     if let Some(e) = transition_err {
         return Err(CommandError::from(e));
     }
+
+    state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })
+}
+
+/// Merge an approved review's PR (`Approved` -> `Merged`) and GC its worktree.
+///
+/// This is a guarded side effect (Invariant 5 / `SPEC.md` §9): it only ever
+/// runs from this explicit user command, never automatically or from agent
+/// output. It requires the review to be [`GateState::Approved`] and refuses
+/// [`ReviewSource::ReviewRequested`] PRs — cockpit merges the user's own work,
+/// not teammates' review requests.
+///
+/// On a successful `gh pr merge` (squash) it advances the gate to `Merged`,
+/// marks the review's descendants stale (they now sit on an old base and need a
+/// restack), then GCs the worktree — but only when it lives under the
+/// cockpit-managed worktrees directory, never the user's main checkout. The
+/// prune is best-effort: a failure is logged, not surfaced as an error
+/// (Invariant 1).
+#[tauri::command]
+pub async fn merge_review(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+) -> Result<Review, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    // Guard: only an approved review may merge.
+    if review.gate_state != GateState::Approved {
+        return Err(CommandError {
+            message: format!(
+                "Review {pr} is not approved (state: {:?}); approve it before merging",
+                review.gate_state
+            ),
+        });
+    }
+
+    // Guard: never merge a teammate's review-requested PR.
+    if review.source == ReviewSource::ReviewRequested {
+        return Err(CommandError {
+            message: format!(
+                "Review {pr} is a review-requested PR; cockpit does not merge teammates' PRs"
+            ),
+        });
+    }
+
+    let Some(pr_number) = pr_number_from_ref(&pr) else {
+        return Err(CommandError {
+            message: format!("Could not parse a PR number from: {pr}"),
+        });
+    };
+
+    // Guarded side effect: merge via `gh` (squash). A failure here leaves the
+    // review Approved and is surfaced to the caller.
+    github::merge_pr(
+        review.repo_slug.as_deref(),
+        pr_number,
+        github::MergeMethod::Squash,
+    )
+    .await?;
+
+    // Advance the gate to Merged (Approved -> Merged is the only legal edge).
+    let mut transition_err: Option<cockpit_core::gate::Error> = None;
+    state.reviews.update(&pr_ref, |r| {
+        if let Err(e) = r.mark_merged() {
+            transition_err = Some(e);
+        }
+    });
+    if let Some(e) = transition_err {
+        return Err(CommandError::from(e));
+    }
+
+    // Descendants now sit on an old base — mark them stale so the UI prompts a
+    // restack.
+    state.reviews.mark_descendants_stale(&review.id);
+
+    // Worktree GC: prune the merged review's worktree, but ONLY when it lives
+    // under the cockpit-managed worktrees dir (never the user's main checkout).
+    // Best-effort (Invariant 1): any failure is logged, never surfaced.
+    prune_merged_worktree(&pr, &review.worktree, &review.branch);
+
+    state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })
+}
+
+/// Best-effort GC of a merged review's git worktree.
+///
+/// Only prunes when `worktree` is under [`cockpit_core::config::worktrees_dir`]
+/// so the user's main checkout is never touched. `git2::Repository` is not
+/// `Send`; this helper is synchronous and holds no handle across an `.await`,
+/// so callers must invoke it outside any await span. Every failure mode (no
+/// worktrees dir, worktree outside it, repo won't open, prune errors) is logged
+/// and swallowed — merge already succeeded, so GC must never fail the command.
+fn prune_merged_worktree(pr: &str, worktree: &std::path::Path, branch: &str) {
+    let Ok(worktrees_dir) = cockpit_core::config::worktrees_dir() else {
+        eprintln!("merge_review: could not resolve worktrees dir; skipping prune for {pr}");
+        return;
+    };
+    if !worktree.starts_with(&worktrees_dir) {
+        // Not a cockpit-managed worktree (e.g. an imported PR pointing at the
+        // main checkout) — leave it alone.
+        return;
+    }
+
+    let repo_path = Config::load()
+        .ok()
+        .and_then(|c| c.repo_path)
+        .unwrap_or_else(|| PathBuf::from("."));
+    match git2::Repository::discover(&repo_path) {
+        Ok(repo) => {
+            if let Err(e) = cockpit_core::adapters::git::prune_worktree(&repo, branch) {
+                eprintln!("merge_review: prune_worktree failed for {pr}: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "merge_review: could not open repo at {} for prune: {e}",
+                repo_path.display()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent control
+// ---------------------------------------------------------------------------
+
+/// Kill the running agent attached to a review (D11).
+///
+/// Sends SIGTERM to the agent process, removes its session from the session map
+/// so a straggling Stop-hook / stream-end completion cannot double-fire, then
+/// applies a no-progress completion: the review returns to `InReview` with its
+/// comments preserved and the agent handle cleared (git HEAD, not the killed
+/// agent, is authoritative — Invariant 4). This is an explicit user action.
+///
+/// The killed process still emits a stream-end completion when it exits; the
+/// completion handler tolerates the review already being non-`Dispatched` and
+/// settles it without an illegal transition (see `reconcile_fix_completion`).
+#[tauri::command]
+pub async fn kill_agent(
+    state: State<'_, Arc<AppState>>,
+    pr: String,
+) -> Result<Review, CommandError> {
+    let pr_ref = PrRef::new(&pr);
+    let review = state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
+        message: format!("Review not found: {pr}"),
+    })?;
+
+    let pid = review
+        .agent
+        .as_ref()
+        .map(|a| a.pid)
+        .ok_or_else(|| CommandError {
+            message: format!("Review {pr} has no running agent to kill"),
+        })?;
+
+    // Send SIGTERM to the agent process.
+    cockpit_core::adapters::agent::kill_agent(pid).await?;
+
+    // Remove the session so a straggling completion cannot double-fire against a
+    // review we are about to return to InReview. The fix path keys sessions by
+    // PR ref; fall back to the review id for defensiveness.
+    let session_id = state
+        .sessions
+        .find_by_object(pr_ref.as_str())
+        .or_else(|| state.sessions.find_by_object(review.id.as_str()));
+    if let Some(sid) = session_id {
+        state.sessions.remove(&sid);
+    }
+
+    // Apply a no-progress completion. On a Dispatched review this returns it to
+    // InReview (comments preserved, agent cleared); for a non-Dispatched agent
+    // (e.g. a Pending implementer) the transition is a no-op but the agent handle
+    // is still cleared, which is what the UI needs — so the transition error is
+    // ignored deliberately.
+    state.reviews.update(&pr_ref, |r| {
+        let _ = r.apply_agent_completion(None);
+    });
 
     state.reviews.get(&pr_ref).ok_or_else(|| CommandError {
         message: format!("Review not found: {pr}"),
@@ -1326,11 +2028,15 @@ pub async fn restack_pr(
             .map(str::to_owned);
         let prompt =
             restack::assemble_conflict_prompt(&review, &parent_branch, preamble.as_deref());
+        // Key the session + stream by the PR ref (not the ReviewId): the
+        // Restack completion handler resolves reviews by PrRef, so keying by
+        // ReviewId here would leave restack completions unmatched. Mirrors the
+        // Fix path (see `try_spawn_agent`).
         let spawn_result = cockpit_core::adapters::agent::spawn_agent(
             &worktree_path,
             &prompt,
             cockpit_core::model::AgentMode::Restack,
-            review.id.as_str(),
+            review.pr.as_str(),
             &state.sessions,
             &hook_url,
             &spawn_config,
@@ -1342,7 +2048,7 @@ pub async fn restack_pr(
 
         // Start streaming agent stdout to the frontend.
         let stream_ctx = crate::streaming::StreamContext {
-            object_id: review.id.as_str().to_string(),
+            object_id: review.pr.as_str().to_string(),
             mode: cockpit_core::model::AgentMode::Restack,
             completion_tx: state.completion_tx.clone(),
         };

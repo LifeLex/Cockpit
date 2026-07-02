@@ -17,12 +17,12 @@ pub mod adapters;
 pub mod dag;
 pub mod gate;
 pub mod kickoff;
+pub mod persist;
 pub mod plan_parser;
 pub mod prompt;
 pub mod restack;
 pub mod skills;
 pub mod store;
-pub mod workflow;
 
 pub mod hook_server;
 

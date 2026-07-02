@@ -4,4 +4,4 @@
  * The shared gate state that drives the review loop for both [`ProjectPlan`]
  * and [`Review`]. See `SPEC.md` §7 for the transition table.
  */
-export type GateState = "Pending" | "InReview" | "Dispatched" | "Reworked" | "Approved";
+export type GateState = "Pending" | "InReview" | "Dispatched" | "Reworked" | "Approved" | "Merged";

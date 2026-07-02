@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Review } from "./bindings/Review";
 import type { DiffData } from "./bindings/DiffData";
 import type { MirrorResult } from "./bindings/MirrorResult";
+import type { SubmitReviewResult } from "./bindings/SubmitReviewResult";
+import type { ReviewEvent } from "./bindings/ReviewEvent";
 import type { ProjectPlan } from "./bindings/ProjectPlan";
 import type { Config } from "./bindings/Config";
 import type { KickoffResult } from "./bindings/KickoffResult";
@@ -13,6 +15,7 @@ import type { Skill } from "./bindings/Skill";
 import type { SyncReport } from "./bindings/SyncReport";
 import type { AgentMode } from "./bindings/AgentMode";
 import type { CiCheck } from "./bindings/CiCheck";
+import type { DiffSide } from "./bindings/DiffSide";
 
 /**
  * Navigation state discriminated union.
@@ -33,7 +36,6 @@ type ViewState =
 
 interface AppStore {
   readonly reviews: readonly Review[];
-  readonly frontier: readonly Review[];
   readonly plan: ProjectPlan | null;
   readonly loading: boolean;
   readonly error: string | null;
@@ -51,7 +53,6 @@ interface AppStore {
   readonly activeDiff: DiffData | null;
 
   fetchReviews: () => Promise<void>;
-  fetchFrontier: () => Promise<void>;
   openReview: (pr: string) => Promise<void>;
 
   /** Navigate to the diff view for a specific PR. */
@@ -78,12 +79,16 @@ interface AppStore {
   /** Navigate to the settings view. */
   navigateToSettings: () => void;
 
-  /** Add an anchored comment to the active review. */
+  /**
+   * Add an anchored comment to the active review. `side` selects which side of
+   * the diff the line refers to (D12).
+   */
   addComment: (
     file: string,
     lineStart: number,
     lineEnd: number,
     body: string,
+    side: DiffSide,
   ) => Promise<void>;
 
   /** Request changes on the active review (InReview -> Dispatched). */
@@ -117,8 +122,38 @@ interface AppStore {
   /** Generate the plan document via the plan agent for a project. */
   generatePlan: (projectId: ProjectId) => Promise<void>;
 
-  /** Approve a single review by PR ref (explicit user action). */
+  /** Approve a single review by PR ref (explicit user action; `InReview` -> `Approved`). */
   approveReview: (pr: string) => Promise<void>;
+
+  /**
+   * Merge an approved review's PR (explicit, confirmed user action; Invariant 5).
+   *
+   * Squash-merges on GitHub and deletes the branch, advancing the local gate to
+   * `Merged`. Failure is surfaced via the store `error` and never blocks the loop.
+   */
+  mergeReview: (pr: string) => Promise<void>;
+
+  /**
+   * Submit a real GitHub PR review (approve / request changes / comment) carrying
+   * the review's inline Local comments (explicit, confirmed user action;
+   * Invariant 5 / §9). Returns the [`SubmitReviewResult`] so the caller can show
+   * the submitted count; on partial success (non-empty `skipped`) the store
+   * `error` is set listing the skipped comments' reasons. Returns `null` on
+   * failure (also surfaced via `error`).
+   */
+  submitGithubReview: (
+    pr: string,
+    event: ReviewEvent,
+    body: string,
+  ) => Promise<SubmitReviewResult | null>;
+
+  /**
+   * Fetch the interdiff (changes since the last review dispatch) for a PR.
+   *
+   * Returns `null` on failure, setting the store `error`; the caller then falls
+   * back to the full diff (D10). Requires a dispatch snapshot server-side.
+   */
+  fetchInterdiff: (pr: string) => Promise<DiffData | null>;
 
   /**
    * Restack a stale review onto its parent's new head (explicit user action).
@@ -128,6 +163,24 @@ interface AppStore {
    * Failure is non-fatal: it sets the store `error` and never blocks the loop.
    */
   restackPr: (pr: string) => Promise<void>;
+
+  /**
+   * Kill the agent running on a review (explicit user action; D11/D12).
+   *
+   * Applies the returned reconciled [`Review`] (comments preserved, agent
+   * cleared, back to `InReview`). Failure is non-fatal: it sets the store
+   * `error` and never blocks the loop.
+   */
+  killAgent: (pr: string) => Promise<void>;
+
+  /**
+   * Ensure a review has a checked-out worktree on disk and return its path
+   * (D12). Materializes a dedicated branch worktree for an imported same-repo
+   * PR; a no-op for cockpit-managed worktrees. Returns `null` on failure
+   * (also surfaced via `error`) so callers can fall back to the review's
+   * recorded worktree.
+   */
+  ensureReviewWorktree: (pr: string) => Promise<string | null>;
 
   // -------------------------------------------------------------------------
   // Config
@@ -268,7 +321,6 @@ interface AppStore {
 
 export const useAppStore = create<AppStore>((set, get) => ({
   reviews: [],
-  frontier: [],
   plan: null,
   loading: false,
   error: null,
@@ -302,15 +354,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  fetchFrontier: async () => {
-    try {
-      const frontier = await invoke<Review[]>("get_frontier");
-      set({ frontier });
-    } catch (e: unknown) {
-      set({ error: String(e) });
-    }
-  },
-
   openReview: async (pr: string) => {
     set({ loading: true, error: null });
     try {
@@ -324,7 +367,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
         loading: false,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -347,7 +389,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
         loading: false,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -367,7 +408,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
       activeDiff: null,
     });
     void get().fetchReviews();
-    void get().fetchFrontier();
     void get().fetchAuthoredPrs();
   },
 
@@ -399,6 +439,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     lineStart: number,
     lineEnd: number,
     body: string,
+    side: DiffSide,
   ) => {
     const { view } = get();
     if (view.kind !== "diff") return;
@@ -409,13 +450,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
       lineStart,
       lineEnd,
       body,
+      side,
     });
     const replace = (r: Review) => (r.pr === review.pr ? review : r);
     set({
       activeReview: review,
       authoredPrs: get().authoredPrs.map(replace),
       reviewRequests: get().reviewRequests.map(replace),
-      frontier: get().frontier.map(replace),
       reviews: get().reviews.map(replace),
     });
   },
@@ -433,7 +474,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
         activeReview: review,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -469,7 +509,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
         activeDiff: diff,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -542,11 +581,75 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   approveReview: async (pr: string) => {
     try {
-      await invoke<Review>("approve_review", { pr });
-      await get().fetchFrontier();
-      await get().fetchReviews();
+      const review = await invoke<Review>("approve_review", { pr });
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      set({
+        activeReview:
+          get().activeReview?.pr === review.pr ? review : get().activeReview,
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        reviews: get().reviews.map(replace),
+      });
     } catch (e: unknown) {
       set({ error: String(e) });
+    }
+  },
+
+  mergeReview: async (pr: string) => {
+    try {
+      const review = await invoke<Review>("merge_review", { pr });
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      set({
+        activeReview:
+          get().activeReview?.pr === review.pr ? review : get().activeReview,
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        reviews: get().reviews.map(replace),
+      });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  submitGithubReview: async (
+    pr: string,
+    event: ReviewEvent,
+    body: string,
+  ): Promise<SubmitReviewResult | null> => {
+    try {
+      const result = await invoke<SubmitReviewResult>("submit_github_review", {
+        pr,
+        event,
+        // The command takes `Option<String>`; an empty body maps to `None`.
+        body: body.trim() === "" ? null : body,
+      });
+      // The backend may clear submitted Local comments and/or advance the local
+      // gate (Approve on a review-requested PR), so refresh the active review to
+      // reflect that. Best-effort: a refresh failure is non-fatal.
+      await get().refreshActiveReview();
+      if (result.skipped.length > 0) {
+        const reasons = result.skipped
+          .map(([, reason]) => reason)
+          .join("; ");
+        set({
+          error: `${String(result.skipped.length)} comment${
+            result.skipped.length === 1 ? "" : "s"
+          } skipped: ${reasons}`,
+        });
+      }
+      return result;
+    } catch (e: unknown) {
+      set({ error: String(e) });
+      return null;
+    }
+  },
+
+  fetchInterdiff: async (pr: string): Promise<DiffData | null> => {
+    try {
+      return await invoke<DiffData>("get_interdiff", { pr });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+      return null;
     }
   },
 
@@ -559,11 +662,35 @@ export const useAppStore = create<AppStore>((set, get) => ({
           get().activeReview?.pr === review.pr ? review : get().activeReview,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
       set({ error: String(e) });
+    }
+  },
+
+  killAgent: async (pr: string) => {
+    try {
+      const review = await invoke<Review>("kill_agent", { pr });
+      const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      set({
+        activeReview:
+          get().activeReview?.pr === review.pr ? review : get().activeReview,
+        authoredPrs: get().authoredPrs.map(replace),
+        reviewRequests: get().reviewRequests.map(replace),
+        reviews: get().reviews.map(replace),
+      });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+    }
+  },
+
+  ensureReviewWorktree: async (pr: string): Promise<string | null> => {
+    try {
+      return await invoke<string>("ensure_review_worktree", { pr });
+    } catch (e: unknown) {
+      set({ error: String(e) });
+      return null;
     }
   },
 
@@ -641,7 +768,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
       });
       set({ kickoffLoading: false, kickoffResult: result });
       void get().fetchReviews();
-      void get().fetchFrontier();
       void get().listProjects();
     } catch (e: unknown) {
       set({ error: String(e), kickoffLoading: false });
@@ -658,7 +784,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
       set({
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {
@@ -785,11 +910,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
     try {
       const review = await invoke<Review>("fix_ci", { pr });
       const replace = (r: Review) => (r.pr === review.pr ? review : r);
+      const active = get().activeReview;
       set({
-        activeReview: review,
+        activeReview: active?.pr === review.pr ? review : active,
         authoredPrs: get().authoredPrs.map(replace),
         reviewRequests: get().reviewRequests.map(replace),
-        frontier: get().frontier.map(replace),
         reviews: get().reviews.map(replace),
       });
     } catch (e: unknown) {

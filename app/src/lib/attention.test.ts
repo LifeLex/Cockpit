@@ -20,6 +20,7 @@ describe("sortByAttention", () => {
       "Pending",
       "Dispatched",
       "Approved",
+      "Merged",
     ]);
   });
 

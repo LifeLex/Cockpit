@@ -56,6 +56,7 @@ describe("ReviewCard", () => {
       Dispatched: "Watch",
       Reworked: "Re-review",
       Approved: "View",
+      Merged: "View",
     };
     for (const state of ALL_GATE_STATES) {
       const { unmount } = render(

@@ -15,11 +15,13 @@ import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import type { ShortcutMap } from "../hooks/useKeyboardShortcuts";
 import type { Review } from "../bindings/Review";
 import type { DiffData } from "../bindings/DiffData";
+import type { DiffSide } from "../bindings/DiffSide";
 import type { MirrorResult } from "../bindings/MirrorResult";
 import { DiffView } from "./DiffView";
 import { CiPanel } from "./CiPanel";
 import { AgentPanel } from "./AgentPanel";
 import { Terminal } from "./Terminal";
+import { Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -38,6 +40,7 @@ interface ReviewWorkspaceProps {
     lineStart: number,
     lineEnd: number,
     body: string,
+    side: DiffSide,
   ) => Promise<void>;
   readonly onRequestChanges: () => Promise<void>;
   readonly onMirrorComments: () => Promise<MirrorResult | null>;
@@ -108,6 +111,7 @@ export function ReviewWorkspace({
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("diff");
   const error = useAppStore((s) => s.error);
   const clearError = useAppStore((s) => s.clearError);
+  const ensureReviewWorktree = useAppStore((s) => s.ensureReviewWorktree);
 
   const toggleAgentTab = useCallback(() => {
     setActiveTab((prev) => (prev === "agent" ? "diff" : "agent"));
@@ -165,6 +169,30 @@ export function ReviewWorkspace({
     [review.pr],
   );
 
+  // -- Shell worktree materialization --
+  // The Shell tab must root the terminal at a real checked-out worktree. For an
+  // imported same-repo PR that means checking the branch out on first use, which
+  // can take a moment (and may clone), so we resolve the cwd lazily when the tab
+  // is first opened for a review and show a preparing state until it lands. A
+  // failure falls back to the review's recorded worktree (store surfaces error).
+  const [shellCwd, setShellCwd] = useState<string | null>(null);
+  const preparedShellPrRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (activeTab !== "shell") return;
+    if (preparedShellPrRef.current === review.pr) return;
+    preparedShellPrRef.current = review.pr;
+    setShellCwd(null);
+    let cancelled = false;
+    void (async () => {
+      const path = await ensureReviewWorktree(review.pr);
+      if (cancelled) return;
+      setShellCwd(path ?? review.worktree);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, review.pr, review.worktree, ensureReviewWorktree]);
+
   return (
     <div className="flex h-full flex-col">
       <WorkspaceTabBar active={activeTab} onSelect={setActiveTab} />
@@ -201,13 +229,24 @@ export function ReviewWorkspace({
         )}
         {mountedTabs.has("agent") && (
           <div className={cn("flex min-h-0 flex-1 flex-col", activeTab !== "agent" && "hidden")}>
-            <AgentPanel visible onClose={() => { setActiveTab("diff"); }} />
+            <AgentPanel
+              visible
+              objectId={review.pr}
+              onClose={() => { setActiveTab("diff"); }}
+            />
           </div>
         )}
         {mountedTabs.has("shell") && (
           <div className={cn("flex min-h-0 flex-1 flex-col", activeTab !== "shell" && "hidden")}>
             <div className="flex-1 min-h-0">
-              <Terminal id={shellSessionId} cwd={review.worktree} />
+              {shellCwd !== null ? (
+                <Terminal id={shellSessionId} cwd={shellCwd} />
+              ) : (
+                <div className="flex h-full items-center justify-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  Preparing worktree…
+                </div>
+              )}
             </div>
           </div>
         )}

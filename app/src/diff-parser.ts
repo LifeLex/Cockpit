@@ -274,6 +274,29 @@ function diffStats(raw: string): DiffStats {
 }
 
 /**
+ * Build an identity {@link LineMap} for full-file content, where the fragment
+ * (editor) line equals the real file line on each side.
+ *
+ * Used by the diff gate's full-file view (B4): when Monaco is fed the complete
+ * `original`/`modified` file text there is no hunk collapsing, so fragment and
+ * real lines coincide. Returning a real {@link LineMap} lets the comment/zone
+ * machinery keep using {@link fragmentToReal} / {@link realToFragment} unchanged.
+ */
+function identityLineMap(original: string, modified: string): LineMap {
+  const build = (text: string): SideLineMap => {
+    const count = text === "" ? 0 : text.split("\n").length;
+    const toReal: number[] = [];
+    const toFragment = new Map<number, number>();
+    for (let line = 1; line <= count; line += 1) {
+      toReal.push(line);
+      toFragment.set(line, line);
+    }
+    return { toReal, toFragment };
+  };
+  return { Old: build(original), New: build(modified) };
+}
+
+/**
  * Extract the list of changed file paths from a raw unified diff.
  */
 function extractFilePaths(raw: string): readonly string[] {
@@ -295,5 +318,6 @@ export {
   diffStats,
   fragmentToReal,
   realToFragment,
+  identityLineMap,
 };
 export type { FileDiff, DiffStats, LineMap, SideLineMap };

@@ -416,6 +416,24 @@ pub struct ReviewFinding {
     pub rationale: String,
 }
 
+/// The full text of a single file on both sides of a review's diff.
+///
+/// Feeds the diff gate's optional full-file view (Monaco). `full` is `true` only
+/// when the pair was resolved: a side that is legitimately absent (an added or
+/// deleted file) is an empty string but still counts as resolved. `full` is
+/// `false` when the content could not be determined on either side, signalling
+/// the frontend to fall back to the diff fragments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct FilePair {
+    /// File text at the base revision (empty when absent on that side).
+    pub original: String,
+    /// File text at the head revision (empty when absent on that side).
+    pub modified: String,
+    /// Whether the pair resolved (so the full-file view can be shown).
+    pub full: bool,
+}
+
 /// A read-only GitHub conversation item shown alongside a review for context.
 ///
 /// This is deliberately **not** a [`Comment`]: it is external context pulled

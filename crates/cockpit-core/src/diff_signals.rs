@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::model::DiffSide;
+use crate::model::{CiSummary, DiffSide};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -138,6 +138,37 @@ pub struct DiffSignals {
     pub risk_paths: Vec<RiskPath>,
     /// Suspected test-weakening flags.
     pub weakening: Vec<WeakeningFlag>,
+}
+
+/// A single command an agent ran during its work, paired with its outcome.
+///
+/// Defined here in the evidence module so [`EvidenceSummary`] can carry it now;
+/// Phase D's trajectory module reuses this type to summarize what an agent
+/// executed (there is no separate trajectory module yet).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct CommandRun {
+    /// The command line the agent ran.
+    pub command: String,
+    /// Whether the command exited successfully.
+    pub ok: bool,
+}
+
+/// The review-time evidence bundle: deterministic diff signals, the CI rollup,
+/// and the commands the agent ran.
+///
+/// Assembled per review so the diff gate can show, in one place, what changed
+/// (the [`DiffSignals`]), whether CI is green (the [`CiSummary`]), and what the
+/// agent actually executed (the [`CommandRun`]s).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../app/src/bindings/")]
+pub struct EvidenceSummary {
+    /// Deterministic diff-derived signals for the review.
+    pub signals: DiffSignals,
+    /// Rolled-up CI status, when a CI check has populated it.
+    pub ci: Option<CiSummary>,
+    /// Commands the agent ran; empty until Phase D fills it from the trajectory.
+    pub agent_ran: Vec<CommandRun>,
 }
 
 // ---------------------------------------------------------------------------

@@ -71,4 +71,10 @@ skills_github: SkillsGithub | null,
  *
  * Controls whether the bridge runs and which binaries back each language.
  */
-lsp_servers: LspServers, };
+lsp_servers: LspServers, 
+/**
+ * Seconds between background board polls for review-request changes.
+ *
+ * `None` or `0` disables background board polling. The UI default is 90.
+ */
+notify_poll_secs: number | null, };

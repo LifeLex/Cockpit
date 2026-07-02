@@ -198,6 +198,10 @@ fn build_review(
         repo_slug: None,
         project: project.cloned(),
         dispatch_snapshot: None,
+        ci_summary: None,
+        review_findings: vec![],
+        conversation: vec![],
+        last_reviewed_sha: None,
     }
 }
 
@@ -779,6 +783,10 @@ mod tests {
             repo_slug: None,
             project: None,
             dispatch_snapshot: None,
+            ci_summary: None,
+            review_findings: vec![],
+            conversation: vec![],
+            last_reviewed_sha: None,
         }];
 
         wire_children(&mut reviews);
@@ -809,6 +817,10 @@ mod tests {
             repo_slug: None,
             project: None,
             dispatch_snapshot: None,
+            ci_summary: None,
+            review_findings: vec![],
+            conversation: vec![],
+            last_reviewed_sha: None,
         };
 
         let prompt = assemble_implement_prompt(&review, &ProjectRef::new("proj-1"), None, None);

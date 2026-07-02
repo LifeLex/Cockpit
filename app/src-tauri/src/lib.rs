@@ -167,6 +167,12 @@ pub fn run() {
                             }
                             "completed"
                         }
+                        AgentMode::Review => {
+                            // Advisory pre-pass reviewer finished. Findings
+                            // ingest lands in W1; for now this is a no-op stub
+                            // that keeps the match exhaustive.
+                            "completed"
+                        }
                     };
 
                     // Best-effort: if no frontend window is listening, the

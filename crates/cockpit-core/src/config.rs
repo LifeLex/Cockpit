@@ -71,6 +71,9 @@ pub struct AgentPrompts {
     /// Override for [`AgentMode::Restack`].
     #[serde(default)]
     pub restack: Option<String>,
+    /// Override for [`AgentMode::Review`].
+    #[serde(default)]
+    pub review: Option<String>,
 }
 
 impl AgentPrompts {
@@ -85,6 +88,7 @@ impl AgentPrompts {
             AgentMode::Plan => self.plan.as_deref(),
             AgentMode::Fix => self.fix.as_deref(),
             AgentMode::Restack => self.restack.as_deref(),
+            AgentMode::Review => self.review.as_deref(),
         };
         value.filter(|s| !s.trim().is_empty())
     }
@@ -100,6 +104,7 @@ impl AgentPrompts {
             AgentMode::Plan => self.plan = value,
             AgentMode::Fix => self.fix = value,
             AgentMode::Restack => self.restack = value,
+            AgentMode::Review => self.review = value,
         }
     }
 }
@@ -306,6 +311,13 @@ pub struct Config {
     /// Controls whether the bridge runs and which binaries back each language.
     #[serde(default)]
     pub lsp_servers: LspServers,
+
+    // ----- Notifications -----
+    /// Seconds between background board polls for review-request changes.
+    ///
+    /// `None` or `0` disables background board polling. The UI default is 90.
+    #[serde(default)]
+    pub notify_poll_secs: Option<u16>,
 }
 
 /// Default agent command value for serde deserialization.
@@ -338,6 +350,7 @@ impl Default for Config {
             agent_prompts: AgentPrompts::default(),
             skills_github: None,
             lsp_servers: LspServers::default(),
+            notify_poll_secs: None,
         }
     }
 }
@@ -475,6 +488,7 @@ mod tests {
         assert!(config.ide_command.is_none());
         assert!(config.app_theme.is_none());
         assert!(config.editor_theme.is_none());
+        assert!(config.notify_poll_secs.is_none());
     }
 
     #[test]
@@ -494,6 +508,7 @@ mod tests {
                 plan: None,
                 fix: Some("custom fix".into()),
                 restack: None,
+                review: Some("custom review".into()),
             },
             skills_github: Some(SkillsGithub {
                 owner: "acme".into(),
@@ -507,6 +522,7 @@ mod tests {
                 pyright_command: Some("pyright-langserver".into()),
                 typescript_command: None,
             },
+            notify_poll_secs: Some(90),
         };
 
         let serialized = toml::to_string_pretty(&config).expect("serialize should succeed");
@@ -531,8 +547,13 @@ mod tests {
             deserialized.agent_prompts.restack,
             config.agent_prompts.restack
         );
+        assert_eq!(
+            deserialized.agent_prompts.review,
+            config.agent_prompts.review
+        );
         assert_eq!(deserialized.skills_github, config.skills_github);
         assert_eq!(deserialized.lsp_servers, config.lsp_servers);
+        assert_eq!(deserialized.notify_poll_secs, config.notify_poll_secs);
     }
 
     #[test]
@@ -563,6 +584,7 @@ mod tests {
             agent_prompts: AgentPrompts::default(),
             skills_github: None,
             lsp_servers: LspServers::default(),
+            notify_poll_secs: None,
         };
 
         // Save to a specific path (test helper).
@@ -629,8 +651,11 @@ hook_port = 19876
                 .is_none()
         );
         assert!(config.agent_prompts.for_mode(AgentMode::Restack).is_none());
+        assert!(config.agent_prompts.for_mode(AgentMode::Review).is_none());
         // skills_github must default to None when absent (migration).
         assert!(config.skills_github.is_none());
+        // notify_poll_secs must default to None when absent (migration).
+        assert!(config.notify_poll_secs.is_none());
     }
 
     #[test]
@@ -695,11 +720,13 @@ path = "skills"
             plan: None,
             fix: Some("fix it".into()),
             restack: None,
+            review: Some("review it".into()),
         };
         assert_eq!(prompts.for_mode(AgentMode::Implement), Some("build it"));
         assert_eq!(prompts.for_mode(AgentMode::Fix), Some("fix it"));
         assert_eq!(prompts.for_mode(AgentMode::Plan), None);
         assert_eq!(prompts.for_mode(AgentMode::Restack), None);
+        assert_eq!(prompts.for_mode(AgentMode::Review), Some("review it"));
     }
 
     #[test]
@@ -709,6 +736,7 @@ path = "skills"
             plan: Some(String::new()),
             fix: None,
             restack: None,
+            review: None,
         };
         // Whitespace-only and empty overrides fall back to builtin (None).
         assert_eq!(prompts.for_mode(AgentMode::Implement), None);
@@ -888,6 +916,7 @@ hook_port = 19876
             plan: Some("plan preamble".into()),
             fix: None,
             restack: Some("restack preamble".into()),
+            review: Some("review preamble".into()),
         };
         let serialized = toml::to_string_pretty(&prompts).expect("serialize");
         let deserialized: AgentPrompts = toml::from_str(&serialized).expect("deserialize");
@@ -895,5 +924,6 @@ hook_port = 19876
         assert_eq!(deserialized.plan, prompts.plan);
         assert_eq!(deserialized.fix, prompts.fix);
         assert_eq!(deserialized.restack, prompts.restack);
+        assert_eq!(deserialized.review, prompts.review);
     }
 }

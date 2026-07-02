@@ -42,6 +42,10 @@ fn make_test_review(worktree: PathBuf) -> Review {
         repo_slug: None,
         project: None,
         dispatch_snapshot: None,
+        ci_summary: None,
+        review_findings: vec![],
+        conversation: vec![],
+        last_reviewed_sha: None,
     }
 }
 

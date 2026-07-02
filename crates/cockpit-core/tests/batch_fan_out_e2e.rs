@@ -141,6 +141,10 @@ fn make_review(id: &str, branch: &str, worktree: PathBuf, project: &ProjectId) -
         repo_slug: None,
         project: Some(project.clone()),
         dispatch_snapshot: None,
+        ci_summary: None,
+        review_findings: vec![],
+        conversation: vec![],
+        last_reviewed_sha: None,
     }
 }
 

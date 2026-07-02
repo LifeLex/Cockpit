@@ -41,6 +41,7 @@ pub fn builtin_intent(mode: AgentMode) -> &'static str {
         AgentMode::Implement => IMPLEMENT_INSTRUCTION,
         AgentMode::Fix => SCOPE_GUARD,
         AgentMode::Restack => RESTACK_INSTRUCTION,
+        AgentMode::Review => REVIEW_INSTRUCTION,
     }
 }
 
@@ -61,6 +62,17 @@ Resolve the rebase conflicts in this worktree. \
 Preserve the intent of both sides. \
 Don't refactor unrelated code and don't weaken or delete tests. \
 If a conflict is ambiguous, stop and say so.";
+
+/// The builtin advisory-reviewer instruction, verbatim.
+///
+/// Guides the read-only pre-pass reviewer ([`AgentMode::Review`]): it inspects
+/// the diff against the intent and emits findings only — it never edits code
+/// and never advances the gate.
+const REVIEW_INSTRUCTION: &str = "\
+Review the diff above against the stated intent. \
+Output ONLY a JSON array of findings to the output path, in this shape: \
+[{\"severity\":\"Info|Warning|Critical\",\"path\":\"...\",\"line_start\":N,\"line_end\":N,\"side\":\"Old|New\",\"title\":\"...\",\"rationale\":\"...\"}]. \
+Do NOT edit any code; this pass is advisory only.";
 
 /// Input bundle for rework prompt assembly.
 ///
@@ -976,6 +988,7 @@ mod tests {
             AgentMode::Implement,
             AgentMode::Fix,
             AgentMode::Restack,
+            AgentMode::Review,
         ] {
             assert!(
                 !builtin_intent(mode).is_empty(),

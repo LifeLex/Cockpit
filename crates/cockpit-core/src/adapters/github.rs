@@ -9,7 +9,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use ts_rs::TS;
 
-use crate::model::{Anchor, Comment, CommentId, CommentOrigin, DiffSide, IssueRef, PrRef};
+use crate::model::{
+    Anchor, CiSummary, Comment, CommentId, CommentOrigin, DiffSide, IssueRef, PrRef,
+};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -103,23 +105,6 @@ pub struct CiCheck {
     /// Workflow name the check belongs to, when available.
     #[serde(default)]
     pub workflow: String,
-}
-
-/// Rollup of a set of [`CiCheck`]s into pass/fail/pending counts.
-///
-/// Drives the diff-gate CI badge. Neutral and skipped checks count as passing:
-/// they do not indicate a failure and should not block or alarm the reviewer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../app/src/bindings/")]
-pub struct CiSummary {
-    /// Checks that passed (includes neutral/skipped/cancelled).
-    pub passed: u32,
-    /// Total number of checks.
-    pub total: u32,
-    /// Checks that failed.
-    pub failed: u32,
-    /// Checks still pending (queued or in progress).
-    pub pending: u32,
 }
 
 /// Classification of a single check's outcome, derived from its bucket/state.
@@ -817,6 +802,10 @@ pub fn build_review_from_pr(
         repo_slug: slug,
         project: None,
         dispatch_snapshot: None,
+        ci_summary: None,
+        review_findings: vec![],
+        conversation: vec![],
+        last_reviewed_sha: None,
     }
 }
 
@@ -2010,6 +1999,10 @@ index 1111111..2222222 100644
             repo_slug: None,
             project: None,
             dispatch_snapshot: None,
+            ci_summary: None,
+            review_findings: vec![],
+            conversation: vec![],
+            last_reviewed_sha: None,
         }
     }
 

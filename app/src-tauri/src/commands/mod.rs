@@ -18,8 +18,8 @@ use cockpit_core::config::Config;
 use cockpit_core::gate::Gated;
 use cockpit_core::kickoff::{self, KickoffResult};
 use cockpit_core::model::{
-    AgentMode, Anchor, Artifact, Comment, CommentId, CommentOrigin, DiffData, DiffSide, GateState,
-    PlanDoc, PrRef, Project, ProjectId, ProjectPlan, ProjectRef, Review, ReviewSource,
+    AgentMode, Anchor, Artifact, CiSummary, Comment, CommentId, CommentOrigin, DiffData, DiffSide,
+    GateState, PlanDoc, PrRef, Project, ProjectId, ProjectPlan, ProjectRef, Review, ReviewSource,
 };
 use cockpit_core::plan_parser;
 use cockpit_core::restack;
@@ -647,13 +647,13 @@ pub async fn fetch_ci_checks(
     state: State<'_, Arc<AppState>>,
     app_handle: tauri::AppHandle,
     pr: String,
-) -> Result<github::CiSummary, CommandError> {
+) -> Result<CiSummary, CommandError> {
     use tauri::Emitter;
 
     let pr_ref = PrRef::new(&pr);
     let repo_slug = state.reviews.get(&pr_ref).and_then(|r| r.repo_slug.clone());
 
-    let empty = github::CiSummary {
+    let empty = CiSummary {
         passed: 0,
         total: 0,
         failed: 0,
